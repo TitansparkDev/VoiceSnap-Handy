@@ -2,7 +2,7 @@
 
 This is the implementation plan for the VoiceSnap fork of Handy.
 
-Repository: `Titanspark21/VoiceSnap-Handy`
+Repository: `TitansparkDev/VoiceSnap-Handy`
 Upstream: `cjpais/Handy`
 Base: upstream `main` at the time this plan was created
 
