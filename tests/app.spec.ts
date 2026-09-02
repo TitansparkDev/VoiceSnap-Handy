@@ -15,4 +15,23 @@ test.describe("Handy App", () => {
     expect(html).toContain("<html");
     expect(html).toContain("<body");
   });
+
+  test("committed and tentative overlay text render distinctly", async ({ page }) => {
+    await page.setContent(`
+      <link rel="stylesheet" href="http://localhost:1420/src/overlay/RecordingOverlay.css" />
+      <div class="stext-cap">
+        <p>
+          <span class="committed">Stable transcript</span>
+          <span class="tentative">Provisional transcript</span>
+        </p>
+      </div>
+    `);
+
+    const committed = page.locator(".committed");
+    const tentative = page.locator(".tentative");
+
+    await expect(committed).toHaveCSS("font-style", "normal");
+    await expect(tentative).toHaveCSS("font-style", "italic");
+    await expect(tentative).toHaveCSS("opacity", "0.72");
+  });
 });
