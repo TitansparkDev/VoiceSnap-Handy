@@ -263,8 +263,15 @@
      justify-content:flex-end overflow bug that makes the top unscrollable. */
   margin: auto 0 0;
 }
+.stext-cap .committed {
+  color: var(--color-text);
+  font-style: normal;
+  font-weight: 500;
+}
 .stext-cap .tentative {
-  color: inherit;
+  color: var(--s-muted);
+  font-style: italic;
+  opacity: 0.72;
 }
 .scaret {
   display: inline-block;
