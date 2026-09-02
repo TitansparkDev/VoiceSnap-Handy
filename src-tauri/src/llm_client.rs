@@ -7,6 +7,8 @@ use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::sync::{Mutex, OnceLock};
 
+const CLEANUP_MAX_TOKENS: u32 = 512;
+
 #[derive(Debug, Serialize)]
 struct ChatMessage {
     role: String,
@@ -114,6 +116,7 @@ struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessage>,
     stream: bool,
+    max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
     #[serde(flatten)]
@@ -383,6 +386,7 @@ pub async fn send_chat_completion_with_schema(
         model: model.to_string(),
         messages,
         stream: false,
+        max_tokens: CLEANUP_MAX_TOKENS,
         response_format,
         reasoning,
     };
@@ -572,6 +576,7 @@ mod tests {
                 content: "hi".to_string(),
             }],
             stream: false,
+            max_tokens: CLEANUP_MAX_TOKENS,
             response_format: None,
             reasoning,
         };
@@ -666,6 +671,12 @@ mod tests {
     fn requests_explicitly_disable_streaming() {
         let json = request_json(ReasoningParams::default());
         assert_eq!(json["stream"], false);
+    }
+
+    #[test]
+    fn requests_constrain_cleanup_output_length() {
+        let json = request_json(ReasoningParams::default());
+        assert_eq!(json["max_tokens"], CLEANUP_MAX_TOKENS);
     }
 
     #[test]
