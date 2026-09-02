@@ -490,6 +490,15 @@
         "lineCount": "{{count}} lines",
         "empty": "Waiting for logs… Entries appear here as the app emits them."
       },
+      "cleanupLatency": {
+        "title": "Cleanup Latency",
+        "description": "Measures completed AI cleanup runs while Diagnostics is open and reports the latest latency plus p50/p95 across the last 100 samples.",
+        "latest": "Latest",
+        "p50": "p50",
+        "p95": "p95",
+        "samples": "Samples",
+        "empty": "Run AI cleanup to collect latency samples."
+      },
       "updateChecks": {
         "label": "Check for Updates",
         "description": "Automatically check for new versions of Handy",

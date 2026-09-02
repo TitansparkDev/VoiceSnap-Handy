@@ -289,7 +289,7 @@ Acceptance:
 - A normal dictation with cleanup disabled is not slower than the Handy baseline.
 - Local AI cleanup works with networking disabled.
 - Cleanup failure never loses the raw transcript.
-- A 1–2 sentence dictation has a measured cleanup p50/p95 visible in Diagnostics.
+- [x] A 1–2 sentence dictation has a measured cleanup p50/p95 visible in Diagnostics.
 - The local model never receives audio, clipboard content, window titles, or
   unrelated application data.
 
