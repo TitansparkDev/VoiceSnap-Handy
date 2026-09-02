@@ -61,6 +61,11 @@ struct TranscribeAction {
 /// Field name for structured output JSON schema
 const TRANSCRIPTION_FIELD: &str = "transcription";
 
+/// Non-negotiable cleanup-output contract shared by structured and legacy
+/// providers. Provider-specific prompts may add style guidance, but they may not
+/// relax these requirements.
+const CLEANUP_OUTPUT_CONTRACT: &str = "Return only the cleaned transcript text. Do not add explanations, headings, surrounding quotes, markdown fences, answers, facts, or other content that was not present in the transcript.";
+
 /// Strip invisible Unicode characters that some LLMs may insert
 fn strip_invisible_chars(s: &str) -> String {
     s.replace(['\u{200B}', '\u{200C}', '\u{200D}', '\u{FEFF}'], "")
@@ -82,7 +87,8 @@ fn strip_think_block(s: &str) -> &str {
 /// Build a system prompt from the user's prompt template.
 /// Removes `${output}` placeholder since the transcription is sent as the user message.
 fn build_system_prompt(prompt_template: &str) -> String {
-    prompt_template.replace("${output}", "").trim().to_string()
+    let prompt = prompt_template.replace("${output}", "").trim().to_string();
+    format!("{prompt}\n\n{CLEANUP_OUTPUT_CONTRACT}")
 }
 
 /// Returns `true` when a transcription has no meaningful content to
@@ -92,6 +98,58 @@ fn build_system_prompt(prompt_template: &str) -> String {
 /// transcription".
 fn is_blank_transcription(transcription: &str) -> bool {
     transcription.trim().is_empty()
+}
+
+/// Enforce the app-level cleanup contract before cleaned text can replace the
+/// raw transcript. Invalid model output fails open by returning `None`, leaving
+/// the caller's raw transcript untouched.
+fn validate_cleanup_output(original: &str, candidate: &str) -> Option<String> {
+    let candidate = strip_invisible_chars(strip_think_block(candidate));
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+
+    let original = original.trim();
+    let candidate_lower = candidate.to_ascii_lowercase();
+    let original_lower = original.to_ascii_lowercase();
+
+    let markdown_fenced = candidate.starts_with("```") || candidate.ends_with("```");
+    if markdown_fenced && !(original.starts_with("```") || original.ends_with("```")) {
+        return None;
+    }
+
+    let wrapped_in_quotes = (candidate.starts_with('"') && candidate.ends_with('"'))
+        || (candidate.starts_with('\'') && candidate.ends_with('\''));
+    let original_wrapped_in_quotes = (original.starts_with('"') && original.ends_with('"'))
+        || (original.starts_with('\'') && original.ends_with('\''));
+    if wrapped_in_quotes && !original_wrapped_in_quotes {
+        return None;
+    }
+
+    const EXPLANATION_PREFIXES: &[&str] = &[
+        "cleaned transcription:",
+        "cleaned text:",
+        "here is the cleaned",
+        "here's the cleaned",
+    ];
+    if EXPLANATION_PREFIXES
+        .iter()
+        .any(|prefix| candidate_lower.starts_with(prefix) && !original_lower.starts_with(prefix))
+    {
+        return None;
+    }
+
+    // Cleanup should be a bounded rewrite, not a second generation task. The
+    // fixed allowance covers punctuation/casing expansion on short utterances;
+    // the 2x term catches runaway or explanatory output on longer dictation.
+    let original_chars = original.chars().count();
+    let max_chars = original_chars.saturating_mul(2).saturating_add(64);
+    if candidate.chars().count() > max_chars {
+        return None;
+    }
+
+    Some(candidate.to_string())
 }
 
 async fn complete_unless_cancelled<F, C>(operation: F, is_cancelled: C) -> Option<F::Output>
@@ -213,19 +271,19 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                     &user_content,
                     token_limit,
                 ) {
-                    Ok(result) => {
-                        if result.trim().is_empty() {
-                            debug!("Apple Intelligence returned an empty response");
-                            None
-                        } else {
-                            let result = strip_invisible_chars(&result);
+                    Ok(result) => match validate_cleanup_output(transcription, &result) {
+                        Some(result) => {
                             debug!(
                                 "Apple Intelligence post-processing succeeded. Output length: {} chars",
                                 result.len()
                             );
                             Some(result)
                         }
-                    }
+                        None => {
+                            warn!("Apple Intelligence returned output that violated the cleanup contract; preserving raw transcription");
+                            None
+                        }
+                    },
                     Err(err) => {
                         error!("Apple Intelligence post-processing failed: {}", err);
                         None
@@ -272,24 +330,31 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                         if let Some(transcription_value) =
                             json.get(TRANSCRIPTION_FIELD).and_then(|t| t.as_str())
                         {
-                            let result = strip_invisible_chars(transcription_value);
-                            debug!(
-                                "Structured output post-processing succeeded for provider '{}'. Output length: {} chars",
-                                provider.id,
-                                result.len()
-                            );
-                            return Some(result);
+                            match validate_cleanup_output(transcription, transcription_value) {
+                                Some(result) => {
+                                    debug!(
+                                        "Structured output post-processing succeeded for provider '{}'. Output length: {} chars",
+                                        provider.id,
+                                        result.len()
+                                    );
+                                    return Some(result);
+                                }
+                                None => {
+                                    warn!("Structured output violated the cleanup contract for provider '{}'; preserving raw transcription", provider.id);
+                                    return None;
+                                }
+                            }
                         } else {
-                            error!("Structured output response missing 'transcription' field");
-                            return Some(strip_invisible_chars(content));
+                            error!("Structured output response missing 'transcription' field; preserving raw transcription");
+                            return None;
                         }
                     }
                     Err(e) => {
                         error!(
-                            "Failed to parse structured output JSON: {}. Returning raw content.",
+                            "Failed to parse structured output JSON: {}. Preserving raw transcription.",
                             e
                         );
-                        return Some(strip_invisible_chars(content));
+                        return None;
                     }
                 }
             }
@@ -308,7 +373,12 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
     }
 
     // Legacy mode: Replace ${output} variable in the prompt with the actual text
-    let processed_prompt = prompt.replace("${output}", transcription);
+    // and append the same non-negotiable output contract used by structured mode.
+    let processed_prompt = format!(
+        "{}\n\n{}",
+        prompt.replace("${output}", transcription),
+        CLEANUP_OUTPUT_CONTRACT
+    );
     debug!("Processed prompt length: {} chars", processed_prompt.len());
 
     match crate::llm_client::send_chat_completion(
@@ -320,15 +390,23 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
     )
     .await
     {
-        Ok(Some(content)) => {
-            let content = strip_invisible_chars(strip_think_block(&content));
-            debug!(
-                "LLM post-processing succeeded for provider '{}'. Output length: {} chars",
-                provider.id,
-                content.len()
-            );
-            Some(content)
-        }
+        Ok(Some(content)) => match validate_cleanup_output(transcription, &content) {
+            Some(content) => {
+                debug!(
+                    "LLM post-processing succeeded for provider '{}'. Output length: {} chars",
+                    provider.id,
+                    content.len()
+                );
+                Some(content)
+            }
+            None => {
+                warn!(
+                    "LLM post-processing output violated the cleanup contract for provider '{}'; preserving raw transcription",
+                    provider.id
+                );
+                None
+            }
+        },
         Ok(None) => {
             error!("LLM API response has no content");
             None
@@ -952,8 +1030,9 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_unless_cancelled, is_blank_transcription, should_use_streaming_overlay,
-        strip_think_block,
+        build_system_prompt, complete_unless_cancelled, is_blank_transcription,
+        should_use_streaming_overlay, strip_think_block, validate_cleanup_output,
+        CLEANUP_OUTPUT_CONTRACT,
     };
     use crate::settings::OverlayStyle;
     use std::future;
@@ -1027,6 +1106,40 @@ mod tests {
             strip_think_block("<think>never closed"),
             "<think>never closed"
         );
+    }
+
+    #[test]
+    fn cleanup_output_contract_accepts_plain_bounded_text() {
+        assert_eq!(
+            validate_cleanup_output("hello world", "  Hello, world.  ").as_deref(),
+            Some("Hello, world.")
+        );
+        assert_eq!(
+            validate_cleanup_output(
+                "hello world",
+                "<think>reasoning</think>\u{200B}Hello, world."
+            )
+            .as_deref(),
+            Some("Hello, world.")
+        );
+    }
+
+    #[test]
+    fn cleanup_output_contract_rejects_wrappers_explanations_and_runaway_text() {
+        assert!(validate_cleanup_output("hello world", "```text\nHello, world.\n```").is_none());
+        assert!(validate_cleanup_output("hello world", "\"Hello, world.\"").is_none());
+        assert!(
+            validate_cleanup_output("hello world", "Cleaned transcription: Hello, world.")
+                .is_none()
+        );
+        assert!(validate_cleanup_output("short", &"invented ".repeat(20)).is_none());
+    }
+
+    #[test]
+    fn cleanup_system_prompt_always_appends_strict_contract() {
+        let prompt = build_system_prompt("Fix ${output} carefully.");
+        assert!(!prompt.contains("${output}"));
+        assert!(prompt.ends_with(CLEANUP_OUTPUT_CONTRACT));
     }
 
     #[test]
