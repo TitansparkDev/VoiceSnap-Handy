@@ -1,7 +1,15 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { readFile } from "@tauri-apps/plugin-fs";
-import { Check, Copy, FolderOpen, RotateCcw, Star, Trash2 } from "lucide-react";
+import {
+  Check,
+  Copy,
+  FolderOpen,
+  RotateCcw,
+  Sparkles,
+  Star,
+  Trash2,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import {
@@ -14,6 +22,7 @@ import { useOsType } from "@/hooks/useOsType";
 import { formatDateTime } from "@/utils/dateFormat";
 import { AudioPlayer, AudioPlayerGroup } from "../../ui/AudioPlayer";
 import { Button } from "../../ui/Button";
+import { getHistoryComparison } from "./historyComparison";
 
 const IconButton: React.FC<{
   onClick: () => void;
@@ -316,6 +325,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   const [retrying, setRetrying] = useState(false);
 
   const hasTranscription = entry.transcription_text.trim().length > 0;
+  const comparison = getHistoryComparison(entry);
 
   const handleLoadAudio = useCallback(
     () => getAudioUrl(entry.file_name),
@@ -412,34 +422,47 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
         </div>
       </div>
 
-      <p
-        className={`italic text-sm pb-2 ${
-          retrying
-            ? ""
-            : hasTranscription
-              ? "text-text/90 select-text cursor-text whitespace-pre-wrap break-words"
-              : "text-text/40"
-        }`}
-        style={
-          retrying
-            ? { animation: "transcribe-pulse 3s ease-in-out infinite" }
-            : undefined
-        }
-      >
-        {retrying && (
+      {retrying ? (
+        <p
+          className="italic text-sm pb-2"
+          style={{ animation: "transcribe-pulse 3s ease-in-out infinite" }}
+        >
           <style>{`
             @keyframes transcribe-pulse {
               0%, 100% { color: color-mix(in srgb, var(--color-text) 40%, transparent); }
               50% { color: color-mix(in srgb, var(--color-text) 90%, transparent); }
             }
           `}</style>
-        )}
-        {retrying
-          ? t("settings.history.transcribing")
-          : hasTranscription
+          {t("settings.history.transcribing")}
+        </p>
+      ) : comparison ? (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pb-2">
+          <p className="italic text-sm text-text/90 select-text cursor-text whitespace-pre-wrap break-words">
+            {comparison.raw}
+          </p>
+          <div className="rounded-md border border-logo-primary/20 bg-logo-primary/5 px-3 py-2">
+            <div className="mb-1 flex items-center gap-1.5 text-xs font-medium text-logo-primary">
+              <Sparkles width={13} height={13} />
+              <span>{t("sidebar.postProcessing")}</span>
+            </div>
+            <p className="text-sm text-text/90 select-text cursor-text whitespace-pre-wrap break-words">
+              {comparison.final}
+            </p>
+          </div>
+        </div>
+      ) : (
+        <p
+          className={`italic text-sm pb-2 ${
+            hasTranscription
+              ? "text-text/90 select-text cursor-text whitespace-pre-wrap break-words"
+              : "text-text/40"
+          }`}
+        >
+          {hasTranscription
             ? entry.transcription_text
             : t("settings.history.transcriptionFailed")}
-      </p>
+        </p>
+      )}
 
       <AudioPlayer onLoadRequest={handleLoadAudio} className="w-full" />
     </div>
