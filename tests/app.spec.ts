@@ -15,4 +15,35 @@ test.describe("Handy App", () => {
     expect(html).toContain("<html");
     expect(html).toContain("<body");
   });
+
+  test("committed and tentative overlay text use distinct rendered styles", async ({
+    page,
+  }) => {
+    await page.goto("/src/overlay/index.html");
+
+    await page.evaluate(() => {
+      document.body.innerHTML = `
+        <div class="stext-cap">
+          <p>
+            <span class="committed">Committed words</span>
+            <span class="tentative">Tentative words</span>
+          </p>
+        </div>
+      `;
+    });
+
+    const committedStyle = await page.locator(".committed").evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { color: style.color, opacity: style.opacity };
+    });
+    const tentativeStyle = await page.locator(".tentative").evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { color: style.color, opacity: style.opacity };
+    });
+
+    expect(tentativeStyle.color).not.toBe(committedStyle.color);
+    expect(Number(tentativeStyle.opacity)).toBeLessThan(
+      Number(committedStyle.opacity),
+    );
+  });
 });
