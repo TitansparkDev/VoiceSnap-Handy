@@ -313,6 +313,8 @@ Deliverables:
 - Measure first partial, committed text cadence, finalization tail, total time,
   and quality on short/medium/long utterances.
 - Make the overlay's committed/tentative distinction visually obvious.
+  - Completed slice: committed text is visually stronger than provisional text,
+    with a computed-style Playwright regression covering the distinction.
 - Keep the overlay from stealing focus from the target application.
 - Ensure a non-streaming model cleanly falls back to final batch transcription.
 
