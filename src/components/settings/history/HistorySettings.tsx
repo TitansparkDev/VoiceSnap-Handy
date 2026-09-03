@@ -629,6 +629,11 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
       ? t("settings.general.language.auto")
       : entry.language.toUpperCase()
     : null;
+  const insertionModeLabel = entry.insertion_mode
+    ? entry.insertion_mode === "at_stop"
+      ? t("settings.history.insertionModeAtStop", { defaultValue: "At stop" })
+      : entry.insertion_mode
+    : null;
 
   return (
     <div className="px-4 py-2 pb-5 flex flex-col gap-3">
@@ -659,6 +664,16 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
               title={t("settings.general.language.title")}
             >
               {languageLabel}
+            </span>
+          )}
+          {insertionModeLabel && (
+            <span
+              className="rounded bg-mid-gray/10 px-1.5 py-0.5 text-[10px] text-text/50"
+              title={t("settings.history.insertionMode", {
+                defaultValue: "Insertion mode",
+              })}
+            >
+              {insertionModeLabel}
             </span>
           )}
         </div>

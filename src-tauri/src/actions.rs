@@ -25,6 +25,10 @@ use tauri::Manager;
 use tauri::{AppHandle, Emitter};
 
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Until Wave 3 introduces opt-in live insertion, every recording session uses
+/// the existing one-shot final paste at stop. Persist that product truth in
+/// history rather than inferring it later from overlay/streaming behavior.
+const HISTORY_INSERTION_MODE_AT_STOP: &str = "at_stop";
 
 #[derive(Clone, serde::Serialize)]
 struct RecordingErrorEvent {
@@ -895,6 +899,7 @@ impl ShortcutAction for TranscribeAction {
                                     history_model_id,
                                     history_engine_type,
                                     history_language.clone(),
+                                    Some(HISTORY_INSERTION_MODE_AT_STOP.to_string()),
                                     history_duration_ms,
                                 ) {
                                     error!("Failed to save history entry: {}", err);
@@ -966,6 +971,7 @@ impl ShortcutAction for TranscribeAction {
                                     selected_history_model_id,
                                     history_engine_type,
                                     history_language,
+                                    Some(HISTORY_INSERTION_MODE_AT_STOP.to_string()),
                                     history_duration_ms,
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);

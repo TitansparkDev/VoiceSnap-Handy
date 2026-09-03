@@ -35,6 +35,7 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN duration_ms INTEGER;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN language TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN engine_type TEXT;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN insertion_mode TEXT;"),
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -74,6 +75,8 @@ pub struct HistoryEntry {
     /// Effective language mode used for the transcription. `auto` means the
     /// model was allowed to detect the language rather than a forced code.
     pub language: Option<String>,
+    /// Text insertion behavior used by the original recording session.
+    pub insertion_mode: Option<String>,
 }
 
 pub struct HistoryManager {
@@ -222,6 +225,7 @@ impl HistoryManager {
             model_id: row.get("model_id")?,
             engine_type: row.get("engine_type")?,
             language: row.get("language")?,
+            insertion_mode: row.get("insertion_mode")?,
         })
     }
 
@@ -241,6 +245,7 @@ impl HistoryManager {
         model_id: Option<String>,
         engine_type: Option<String>,
         language: Option<String>,
+        insertion_mode: Option<String>,
         duration_ms: i64,
     ) -> Result<HistoryEntry> {
         let timestamp = Utc::now().timestamp();
@@ -260,8 +265,9 @@ impl HistoryManager {
                 model_id,
                 engine_type,
                 language,
+                insertion_mode,
                 duration_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 &file_name,
                 timestamp,
@@ -274,6 +280,7 @@ impl HistoryManager {
                 &model_id,
                 &engine_type,
                 &language,
+                &insertion_mode,
                 duration_ms,
             ],
         )?;
@@ -292,6 +299,7 @@ impl HistoryManager {
             model_id,
             engine_type,
             language,
+            insertion_mode,
         };
 
         debug!("Saved history entry with id {}", entry.id);
@@ -348,7 +356,7 @@ impl HistoryManager {
 
         let entry = conn
             .query_row(
-                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language
+                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode
                  FROM transcription_history WHERE id = ?1",
                 params![id],
                 Self::map_history_entry,
@@ -410,7 +418,7 @@ impl HistoryManager {
         }
 
         conn.query_row(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode
              FROM transcription_history WHERE id = ?1",
             params![id],
             Self::map_history_entry,
@@ -616,7 +624,7 @@ impl HistoryManager {
         };
 
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode
              FROM transcription_history
              WHERE (?1 IS NULL OR id < ?1)
                AND (
@@ -692,7 +700,8 @@ impl HistoryManager {
                 model_id,
                 engine_type,
                 duration_ms,
-                language
+                language,
+                insertion_mode
              FROM transcription_history
              ORDER BY timestamp DESC
              LIMIT 1",
@@ -723,7 +732,8 @@ impl HistoryManager {
                 model_id,
                 engine_type,
                 duration_ms,
-                language
+                language,
+                insertion_mode
              FROM transcription_history
              WHERE transcription_text != ''
              ORDER BY timestamp DESC
@@ -781,7 +791,8 @@ impl HistoryManager {
                 model_id,
                 engine_type,
                 duration_ms,
-                language
+                language,
+                insertion_mode
              FROM transcription_history
              WHERE id = ?1",
         )?;
@@ -854,7 +865,8 @@ mod tests {
                 model_id TEXT,
                 engine_type TEXT,
                 duration_ms INTEGER,
-                language TEXT
+                language TEXT,
+                insertion_mode TEXT
             );",
         )
         .expect("create transcription_history table");
@@ -945,6 +957,7 @@ mod tests {
         assert!(entry.engine_type.is_none());
         assert!(entry.duration_ms.is_none());
         assert!(entry.language.is_none());
+        assert!(entry.insertion_mode.is_none());
     }
 
     #[test]
@@ -977,6 +990,22 @@ mod tests {
             .expect("fetch engine-tagged entry")
             .expect("engine-tagged entry exists");
         assert_eq!(entry.engine_type.as_deref(), Some("transcribe_cpp"));
+    }
+
+    #[test]
+    fn history_entry_preserves_insertion_mode_metadata() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "insertion-tagged recording", None);
+        conn.execute(
+            "UPDATE transcription_history SET insertion_mode = ?1 WHERE timestamp = ?2",
+            params!["at_stop", 100_i64],
+        )
+        .expect("store insertion mode metadata");
+
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch insertion-tagged entry")
+            .expect("insertion-tagged entry exists");
+        assert_eq!(entry.insertion_mode.as_deref(), Some("at_stop"));
     }
 
     #[test]

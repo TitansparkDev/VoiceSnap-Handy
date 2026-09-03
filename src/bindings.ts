@@ -1036,7 +1036,11 @@ engine_type: string | null;
  * Effective language mode used for the transcription. `auto` means the
  * model was allowed to detect the language rather than a forced code.
  */
-language: string | null }
+language: string | null;
+/**
+ * Text insertion behavior used by the original recording session.
+ */
+insertion_mode: string | null }
 export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number }
 /**
  * Result of changing keyboard implementation

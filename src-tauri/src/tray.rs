@@ -686,6 +686,7 @@ mod tests {
             model_id: None,
             engine_type: None,
             language: None,
+            insertion_mode: None,
         }
     }
 
