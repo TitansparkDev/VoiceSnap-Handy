@@ -9,7 +9,7 @@ Use the fixed-fixture cleanup benchmark before choosing a Wave 1 local model. Ca
 - Candidate model assets already present on disk.
 - The runtime must listen on a loopback endpoint. The harness rejects non-loopback endpoints and performs no model downloads.
 
-The benchmark also sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` for the child runtime. It can therefore be run with networking disabled when the runtime binary and candidate assets are already local.
+The benchmark sets `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, and `HF_HUB_DISABLE_TELEMETRY=1` for the child runtime and bypasses proxies. Its own HTTP transport rejects every non-loopback host. It can therefore be run with external networking disabled when the runtime binary and candidate assets are already local.
 
 ## Runtime configuration
 
@@ -63,7 +63,9 @@ The fixed fixture set exercises short cleanup cases for punctuation, number word
 
 Use `--runs N` to change the sample count. `--request-timeout-ms` defaults to 20,000 ms and bounds each cleanup request; `--startup-timeout-ms` defaults to 8,000 ms and bounds runtime readiness.
 
-The JSON result intentionally does **not** contain fixture input text, model output text, transcript history, audio, clipboard contents, window titles, API keys, or full local file paths. The committed fixture text is static test data and is only sent to the loopback runtime during the benchmark.
+The JSON result intentionally does **not** contain fixture input text, model output text, transcript history, audio, clipboard contents, window titles, API keys, or full local file paths. It includes an `offline_contract` block recording that external network dependency is disabled, model assets are local-only, model-hub lookups are disabled, and proxy use is bypassed. The committed fixture text is static test data and is only sent to the loopback runtime during the benchmark.
+
+The automated harness test also inspects the exact completion request shape: the local model receives only the cleanup system instruction plus transcript text and generation controls. No audio, clipboard contents, window title, foreground-application identity, or unrelated application data field exists in the request contract.
 
 A candidate should only be considered after checking both correctness and latency. A lower p50/p95 does not compensate for failed fixtures, malformed cleanup output, or repeated request failures. Linux RSS is sampled after startup and after each request; it is an observation, not a platform-independent peak-memory guarantee.
 

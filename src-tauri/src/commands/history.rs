@@ -33,7 +33,7 @@ fn retry_cleanup_input(raw_text: &str) -> Result<&str, String> {
 
 fn retry_cleanup_update(
     processed: ProcessedTranscription,
-) -> Result<(String, Option<String>, String), String> {
+) -> Result<(String, Option<String>, Option<String>, Option<String>, String), String> {
     let cleaned_text = processed
         .post_processed_text
         .filter(|text| !text.trim().is_empty())
@@ -42,6 +42,8 @@ fn retry_cleanup_update(
     Ok((
         cleaned_text,
         processed.post_process_prompt,
+        processed.cleanup_prompt_id,
+        processed.cleanup_model_id,
         processed.cleanup_mode,
     ))
 }
@@ -215,13 +217,21 @@ pub async fn retry_history_entry_cleanup(
     let cleanup_started = Instant::now();
     let processed = process_transcription_output(&app, raw_text, true).await;
     let cleanup_total_ms = i64::try_from(cleanup_started.elapsed().as_millis()).unwrap_or(i64::MAX);
-    let (cleaned_text, post_process_prompt, cleanup_mode) = retry_cleanup_update(processed)?;
+    let (
+        cleaned_text,
+        post_process_prompt,
+        cleanup_prompt_id,
+        cleanup_model_id,
+        cleanup_mode,
+    ) = retry_cleanup_update(processed)?;
 
     history_manager
         .update_cleanup(
             id,
             cleaned_text,
             post_process_prompt,
+            cleanup_prompt_id,
+            cleanup_model_id,
             Some(cleanup_mode),
             Some(cleanup_total_ms),
         )
@@ -256,6 +266,8 @@ mod tests {
             final_text: text.unwrap_or("raw transcript").to_string(),
             post_processed_text: text.map(str::to_string),
             post_process_prompt: Some("cleanup prompt".to_string()),
+            cleanup_prompt_id: Some("prompt-id".to_string()),
+            cleanup_model_id: Some("cleanup-model".to_string()),
             cleanup_mode: "provider:openai".to_string(),
         }
     }
@@ -297,10 +309,13 @@ mod tests {
             "Cleanup did not produce updated text"
         );
 
-        let (text, prompt, mode) = retry_cleanup_update(processed_cleanup(Some("cleaned text")))
-            .expect("valid cleanup should be persisted");
+        let (text, prompt, prompt_id, model_id, mode) =
+            retry_cleanup_update(processed_cleanup(Some("cleaned text")))
+                .expect("valid cleanup should be persisted");
         assert_eq!(text, "cleaned text");
         assert_eq!(prompt.as_deref(), Some("cleanup prompt"));
+        assert_eq!(prompt_id.as_deref(), Some("prompt-id"));
+        assert_eq!(model_id.as_deref(), Some("cleanup-model"));
         assert_eq!(mode, "provider:openai");
     }
 }

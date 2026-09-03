@@ -47,6 +47,8 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN saved_gpu_device TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN recommended_backend TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN recommended_device TEXT;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN cleanup_prompt_id TEXT;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN cleanup_model_id TEXT;"),
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -79,6 +81,12 @@ pub struct HistoryEntry {
     pub transcription_text: String,
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
+    /// Stable cleanup prompt identifier. Kept separate from the prompt body so
+    /// history can identify the exact configured cleanup contract without
+    /// duplicating transcript/application context.
+    pub cleanup_prompt_id: Option<String>,
+    /// Cleanup model identifier; `model_id` below remains the ASR model.
+    pub cleanup_model_id: Option<String>,
     pub post_process_requested: bool,
     pub model_id: Option<String>,
     /// Stable engine family identifier for the model used by this run.
@@ -259,6 +267,8 @@ impl HistoryManager {
             transcription_text: row.get("transcription_text")?,
             post_processed_text: row.get("post_processed_text")?,
             post_process_prompt: row.get("post_process_prompt")?,
+            cleanup_prompt_id: row.get("cleanup_prompt_id")?,
+            cleanup_model_id: row.get("cleanup_model_id")?,
             post_process_requested: row.get("post_process_requested")?,
             model_id: row.get("model_id")?,
             engine_type: row.get("engine_type")?,
@@ -290,6 +300,8 @@ impl HistoryManager {
         post_process_requested: bool,
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
+        cleanup_prompt_id: Option<String>,
+        cleanup_model_id: Option<String>,
         model_id: Option<String>,
         engine_type: Option<String>,
         language: Option<String>,
@@ -319,6 +331,8 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
+                cleanup_prompt_id,
+                cleanup_model_id,
                 post_process_requested,
                 model_id,
                 engine_type,
@@ -335,7 +349,7 @@ impl HistoryManager {
                 transcription_total_ms,
                 cleanup_total_ms,
                 duration_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             params![
                 &file_name,
                 timestamp,
@@ -344,6 +358,8 @@ impl HistoryManager {
                 &transcription_text,
                 &post_processed_text,
                 &post_process_prompt,
+                &cleanup_prompt_id,
+                &cleanup_model_id,
                 post_process_requested,
                 &model_id,
                 &engine_type,
@@ -373,6 +389,8 @@ impl HistoryManager {
             transcription_text,
             post_processed_text,
             post_process_prompt,
+            cleanup_prompt_id,
+            cleanup_model_id,
             post_process_requested,
             model_id,
             engine_type,
@@ -436,6 +454,8 @@ impl HistoryManager {
              SET transcription_text = ?1,
                  post_processed_text = ?2,
                  post_process_prompt = ?3,
+                 cleanup_prompt_id = NULL,
+                 cleanup_model_id = NULL,
                  model_id = ?4,
                  engine_type = ?5,
                  language = ?6,
@@ -476,7 +496,7 @@ impl HistoryManager {
 
         let entry = conn
             .query_row(
-                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms
+                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms
                  FROM transcription_history WHERE id = ?1",
                 params![id],
                 Self::map_history_entry,
@@ -500,6 +520,8 @@ impl HistoryManager {
         id: i64,
         post_processed_text: String,
         post_process_prompt: Option<String>,
+        cleanup_prompt_id: Option<String>,
+        cleanup_model_id: Option<String>,
         cleanup_mode: Option<String>,
         cleanup_total_ms: Option<i64>,
     ) -> Result<HistoryEntry> {
@@ -509,6 +531,8 @@ impl HistoryManager {
             id,
             post_processed_text,
             post_process_prompt,
+            cleanup_prompt_id,
+            cleanup_model_id,
             cleanup_mode,
             cleanup_total_ms,
         )?;
@@ -531,6 +555,8 @@ impl HistoryManager {
         id: i64,
         post_processed_text: String,
         post_process_prompt: Option<String>,
+        cleanup_prompt_id: Option<String>,
+        cleanup_model_id: Option<String>,
         cleanup_mode: Option<String>,
         cleanup_total_ms: Option<i64>,
     ) -> Result<HistoryEntry> {
@@ -538,13 +564,17 @@ impl HistoryManager {
             "UPDATE transcription_history
              SET post_processed_text = ?1,
                  post_process_prompt = ?2,
+                 cleanup_prompt_id = ?3,
+                 cleanup_model_id = ?4,
                  post_process_requested = 1,
-                 cleanup_mode = ?3,
-                 cleanup_total_ms = ?4
-             WHERE id = ?5",
+                 cleanup_mode = ?5,
+                 cleanup_total_ms = ?6
+             WHERE id = ?7",
             params![
                 post_processed_text,
                 post_process_prompt,
+                cleanup_prompt_id,
+                cleanup_model_id,
                 cleanup_mode,
                 cleanup_total_ms,
                 id
@@ -556,7 +586,7 @@ impl HistoryManager {
         }
 
         conn.query_row(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms
              FROM transcription_history WHERE id = ?1",
             params![id],
             Self::map_history_entry,
@@ -838,7 +868,7 @@ impl HistoryManager {
         };
 
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms
              FROM transcription_history
              WHERE (?1 IS NULL OR id < ?1)
                AND (
@@ -912,6 +942,8 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
+                cleanup_prompt_id,
+                cleanup_model_id,
                 post_process_requested,
                 model_id,
                 engine_type,
@@ -954,6 +986,8 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
+                cleanup_prompt_id,
+                cleanup_model_id,
                 post_process_requested,
                 model_id,
                 engine_type,
@@ -1028,6 +1062,8 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
+                cleanup_prompt_id,
+                cleanup_model_id,
                 post_process_requested,
                 model_id,
                 engine_type,
@@ -1132,6 +1168,8 @@ mod tests {
                 transcription_text TEXT NOT NULL,
                 post_processed_text TEXT,
                 post_process_prompt TEXT,
+                cleanup_prompt_id TEXT,
+                cleanup_model_id TEXT,
                 post_process_requested BOOLEAN NOT NULL DEFAULT 0,
                 model_id TEXT,
                 engine_type TEXT,
@@ -1174,11 +1212,13 @@ mod tests {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
+                cleanup_prompt_id,
+                cleanup_model_id,
                 post_process_requested,
                 model_id,
                 language,
                 duration_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 format!("handy-{}.wav", timestamp),
                 timestamp,
@@ -1186,6 +1226,8 @@ mod tests {
                 format!("Recording {}", timestamp),
                 text,
                 post_processed,
+                Option::<String>::None,
+                Option::<String>::None,
                 Option::<String>::None,
                 false,
                 model_id,
@@ -1263,6 +1305,8 @@ mod tests {
         assert!(entry.saved_gpu_device.is_none());
         assert!(entry.recommended_backend.is_none());
         assert!(entry.recommended_device.is_none());
+        assert!(entry.cleanup_prompt_id.is_none());
+        assert!(entry.cleanup_model_id.is_none());
         assert!(entry.cleanup_mode.is_none());
         assert!(entry.outcome.is_none());
         assert!(entry.transcription_total_ms.is_none());
@@ -1455,6 +1499,8 @@ mod tests {
             1,
             "new cleanup".to_string(),
             Some("new prompt".to_string()),
+            Some("prompt-id".to_string()),
+            Some("cleanup-model".to_string()),
             Some("provider:openai".to_string()),
             Some(42),
         )
@@ -1463,6 +1509,8 @@ mod tests {
         assert_eq!(entry.transcription_text, "raw transcript");
         assert_eq!(entry.post_processed_text.as_deref(), Some("new cleanup"));
         assert_eq!(entry.post_process_prompt.as_deref(), Some("new prompt"));
+        assert_eq!(entry.cleanup_prompt_id.as_deref(), Some("prompt-id"));
+        assert_eq!(entry.cleanup_model_id.as_deref(), Some("cleanup-model"));
         assert!(entry.post_process_requested);
         assert_eq!(entry.cleanup_mode.as_deref(), Some("provider:openai"));
         assert_eq!(entry.cleanup_total_ms, Some(42));
@@ -1476,6 +1524,8 @@ mod tests {
             &conn,
             99,
             "new cleanup".to_string(),
+            None,
+            None,
             None,
             Some("provider:openai".to_string()),
             Some(10),

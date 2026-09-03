@@ -1069,7 +1069,7 @@ export type EngineType =
  */
 "TranscribeCpp" | "Parakeet" | "Moonshine" | "MoonshineStreaming" | "SenseVoice" | "GigaAM" | "Canary" | "Cohere"
 export type GpuDeviceOption = { id: string; name: string; total_vram_mb: number }
-export type HistoryEntry = { id: number; file_name: string; timestamp: number; duration_ms: number | null; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean; model_id: string | null; 
+export type HistoryEntry = { id: number; file_name: string; timestamp: number; duration_ms: number | null; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; cleanup_prompt_id: string | null; cleanup_model_id: string | null; post_process_requested: boolean; model_id: string | null; 
 /**
  * Stable engine family identifier for the model used by this run.
  */
