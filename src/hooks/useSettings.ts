@@ -69,7 +69,7 @@ export const useSettings = (): UseSettingsReturn => {
     refreshSettings: store.refreshSettings,
     refreshAudioDevices: store.refreshAudioDevices,
     selectMicrophone: store.selectMicrophone,
-    refreshOutputDevices: store.refreshOutputDevices;
+    refreshOutputDevices: store.refreshOutputDevices,
     updateBinding: store.updateBinding,
     resetBinding: store.resetBinding,
     getSetting: store.getSetting,

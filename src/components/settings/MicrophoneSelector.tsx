@@ -4,6 +4,13 @@ import { Dropdown } from "../ui/Dropdown";
 import { SettingContainer } from "../ui/SettingContainer";
 import { ResetButton } from "../ui/ResetButton";
 import { useSettings } from "../../hooks/useSettings";
+import type { AudioDevice } from "@/bindings";
+
+const microphoneKey = (device: AudioDevice) => {
+  if (device.is_default) return "default";
+  if (device.stable_id) return `id:${device.stable_id}`;
+  return `name:${device.name}:${device.index}`;
+};
 
 interface MicrophoneSelectorProps {
   descriptionMode?: "inline" | "tooltip";
@@ -15,21 +22,37 @@ export const MicrophoneSelector: React.FC<MicrophoneSelectorProps> = React.memo(
     const { t } = useTranslation();
     const {
       getSetting,
-      updateSetting,
       resetSetting,
       isUpdating,
       isLoading,
       audioDevices,
       refreshAudioDevices,
+      selectMicrophone,
     } = useSettings();
 
-    const selectedMicrophone =
+    const selectedMicrophoneName =
       getSetting("selected_microphone") === "default"
         ? "Default"
         : getSetting("selected_microphone") || "Default";
+    const selectedMicrophoneId = getSetting("selected_microphone_id");
+    const selectedDevice = audioDevices.find((device) =>
+      selectedMicrophoneId
+        ? device.stable_id === selectedMicrophoneId
+        : selectedMicrophoneName === "Default"
+          ? device.is_default
+          : device.name === selectedMicrophoneName,
+    );
+    const selectedMicrophone = selectedDevice
+      ? microphoneKey(selectedDevice)
+      : null;
 
-    const handleMicrophoneSelect = async (deviceName: string) => {
-      await updateSetting("selected_microphone", deviceName);
+    const handleMicrophoneSelect = async (deviceKey: string) => {
+      const device = audioDevices.find(
+        (candidate) => microphoneKey(candidate) === deviceKey,
+      );
+      if (device) {
+        await selectMicrophone(device);
+      }
     };
 
     const handleReset = async () => {
@@ -37,7 +60,7 @@ export const MicrophoneSelector: React.FC<MicrophoneSelectorProps> = React.memo(
     };
 
     const microphoneOptions = audioDevices.map((device) => ({
-      value: device.name,
+      value: microphoneKey(device),
       label: device.name,
     }));
 
