@@ -2825,10 +2825,91 @@ mod tests {
     }
 
     #[test]
+    fn no_vulkan_startup_stays_cpu_while_saved_gpu_intent_survives() {
+        let mut settings = AppSettings::default();
+        settings.transcribe_accelerator = TranscribeAcceleratorSetting::Gpu;
+        settings.transcribe_gpu_device = Some("vulkan-device-that-is-currently-absent".to_string());
+        let saved = describe_saved_transcribe_preference(&settings);
+
+        // No registered GPU is the deterministic stand-in for a machine with no
+        // Vulkan runtime/device available at startup.
+        let recommended =
+            select_transcribe_backend_for_topology(settings.transcribe_accelerator, false, false);
+        assert_eq!(recommended, Backend::Cpu);
+        assert!(!should_retry_transcribe_load_on_cpu(None, recommended));
+        assert_eq!(describe_saved_transcribe_preference(&settings), saved);
+        assert_eq!(saved.0, "gpu");
+        assert_eq!(
+            saved.1.as_deref(),
+            Some("vulkan-device-that-is-currently-absent")
+        );
+    }
+
+    #[test]
     fn persisted_accelerated_loads_can_fallback_to_cpu_but_explicit_device_loads_stay_strict() {
         assert!(should_retry_transcribe_load_on_cpu(None, Backend::Auto));
         assert!(!should_retry_transcribe_load_on_cpu(None, Backend::Cpu));
         assert!(!should_retry_transcribe_load_on_cpu(Some(0), Backend::Auto));
+    }
+
+    #[test]
+    fn startup_gpu_failure_falls_back_for_run_without_rewriting_saved_preference() {
+        let mut settings = AppSettings::default();
+        settings.transcribe_accelerator = TranscribeAcceleratorSetting::Gpu;
+        settings.transcribe_gpu_device = Some("stable-discrete-gpu".to_string());
+
+        let saved_before = describe_saved_transcribe_preference(&settings);
+        let requested_backend = Backend::Auto;
+        assert!(should_retry_transcribe_load_on_cpu(None, requested_backend));
+
+        // The retry is a load-time CPU decision, not a settings migration.
+        let fallback_backend = Backend::Cpu;
+        assert_eq!(fallback_backend, Backend::Cpu);
+        assert_eq!(
+            describe_saved_transcribe_preference(&settings),
+            saved_before
+        );
+        assert_eq!(saved_before.0, "gpu");
+        assert_eq!(saved_before.1.as_deref(), Some("stable-discrete-gpu"));
+    }
+
+    #[test]
+    fn runtime_gpu_failure_preserves_saved_and_recommended_diagnostics_for_cpu_reload() {
+        let mut settings = AppSettings::default();
+        settings.transcribe_accelerator = TranscribeAcceleratorSetting::Gpu;
+        settings.transcribe_gpu_device = Some("stable-discrete-gpu".to_string());
+
+        let saved = describe_saved_transcribe_preference(&settings);
+        let recommended_backend = Backend::Auto;
+        let selection_plan = TranscribeSelectionPlanMetadata {
+            saved_accelerator: Some(saved.0.clone()),
+            saved_gpu_device: saved.1.clone(),
+            recommended_backend: transcribe_backend_plan_label(recommended_backend).to_string(),
+            recommended_device: Some("Discrete GPU".to_string()),
+        };
+
+        assert!(runtime_backend_needs_cpu_fallback("vulkan"));
+        assert!(should_force_transcribe_cpu_for_run(
+            true,
+            recommended_backend
+        ));
+        let actual_reload_backend = Backend::Cpu;
+
+        // Diagnostics retain three different facts: persisted intent, Handy's
+        // hardware recommendation, and the runtime backend actually used after
+        // the health latch fired.
+        assert_eq!(selection_plan.saved_accelerator.as_deref(), Some("gpu"));
+        assert_eq!(
+            selection_plan.saved_gpu_device.as_deref(),
+            Some("stable-discrete-gpu")
+        );
+        assert_eq!(selection_plan.recommended_backend, "auto");
+        assert_eq!(
+            selection_plan.recommended_device.as_deref(),
+            Some("Discrete GPU")
+        );
+        assert_eq!(transcribe_backend_plan_label(actual_reload_backend), "cpu");
+        assert_eq!(describe_saved_transcribe_preference(&settings), saved);
     }
 
     #[test]
