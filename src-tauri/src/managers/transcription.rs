@@ -293,6 +293,10 @@ pub struct TranscriptionManager {
     /// Plan-time accelerator metadata for the most recent transcribe.cpp load.
     /// Kept separate from `current_backend`/`current_device`, which are runtime truth.
     selection_plan: Arc<Mutex<Option<TranscribeSelectionPlanMetadata>>>,
+    /// Process-local health latch. Once an accelerated transcribe.cpp session
+    /// fails during inference, later persisted loads use CPU for this app run
+    /// without rewriting the user's saved accelerator preference.
+    force_cpu_for_run: Arc<AtomicBool>,
 }
 
 impl TranscriptionManager {
@@ -314,6 +318,7 @@ impl TranscriptionManager {
             active_stream_worker: Arc::new(AtomicU64::new(0)),
             active_engine_lease: Arc::new(AtomicU64::new(0)),
             selection_plan: Arc::new(Mutex::new(None)),
+            force_cpu_for_run: Arc::new(AtomicBool::new(false)),
         };
 
         // Start the idle watcher
@@ -592,19 +597,36 @@ impl TranscriptionManager {
                     }
                     None => {
                         let settings = get_settings(&self.app_handle);
-                        let (backend, device) = resolve_transcribe_load_plan(&settings);
+                        let (recommended_backend, recommended_device) =
+                            resolve_transcribe_load_plan(&settings);
                         let (saved_accelerator, saved_gpu_device) =
                             describe_saved_transcribe_preference(&settings);
-                        let recommended_device = device.as_ref().map(transcribe_device_label);
+                        let recommended_device_label =
+                            recommended_device.as_ref().map(transcribe_device_label);
+                        let force_cpu = should_force_transcribe_cpu_for_run(
+                            self.force_cpu_for_run.load(Ordering::Acquire),
+                            recommended_backend,
+                        );
+                        let (backend, device) = if force_cpu {
+                            warn!(
+                                "Previous accelerated transcription failed during this app run; loading '{}' on CPU without changing the saved accelerator preference",
+                                model_id
+                            );
+                            (Backend::Cpu, None)
+                        } else {
+                            (recommended_backend, recommended_device)
+                        };
                         (
                             backend,
                             device,
                             TranscribeSelectionPlanMetadata {
                                 saved_accelerator: Some(saved_accelerator),
                                 saved_gpu_device,
-                                recommended_backend: transcribe_backend_plan_label(backend)
-                                    .to_string(),
-                                recommended_device,
+                                recommended_backend: transcribe_backend_plan_label(
+                                    recommended_backend,
+                                )
+                                .to_string(),
+                                recommended_device: recommended_device_label,
                             },
                         )
                     }
@@ -1159,6 +1181,30 @@ impl TranscriptionManager {
         // the engine has been returned to the pool.
     }
 
+    /// Mark an accelerated transcribe.cpp runtime as unhealthy for this app run.
+    /// Returns true when the caller should drop the current engine rather than
+    /// returning it to the pool. Saved settings are never changed.
+    fn arm_runtime_cpu_fallback(&self, model_id: &str, backend: Option<&str>) -> bool {
+        let Some(backend) = backend.filter(|backend| runtime_backend_needs_cpu_fallback(backend))
+        else {
+            return false;
+        };
+
+        self.force_cpu_for_run.store(true, Ordering::Release);
+        let mut current_model = self
+            .current_model_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current_model.as_deref() == Some(model_id) {
+            *current_model = None;
+        }
+        warn!(
+            "Transcription runtime backend '{}' became unhealthy for model '{}'; CPU fallback is armed for the remainder of this app run and the saved accelerator preference is unchanged",
+            backend, model_id
+        );
+        true
+    }
+
     /// Return the leased engine to the mutex, unless the model was switched or
     /// unloaded during transcription (in which case the stale engine is dropped).
     fn return_engine(&self, engine: LoadedEngine, expected_model_id: &str) {
@@ -1368,6 +1414,11 @@ impl TranscriptionManager {
                 );
             }
 
+            let transcribe_cpp_runtime_backend = match &engine {
+                LoadedEngine::TranscribeCpp(session) => Some(session.model().backend().to_string()),
+                _ => None,
+            };
+
             let transcribe_result = catch_unwind(AssertUnwindSafe(|| -> Result<String> {
                 match &mut engine {
                     LoadedEngine::TranscribeCpp(session) => {
@@ -1502,22 +1553,40 @@ impl TranscriptionManager {
             }));
 
             let text = match transcribe_result {
-                Ok(inner_result) => {
-                    // Success or normal error: return the engine unless a model
-                    // switch/unload invalidated it while it was in use.
+                Ok(Ok(text)) => {
+                    // Success: return the engine unless a model switch/unload
+                    // invalidated it while it was in use.
                     self.return_engine(engine, &active_model);
-                    inner_result?
+                    text
+                }
+                Ok(Err(err)) => {
+                    let accelerated_runtime_failed = self.arm_runtime_cpu_fallback(
+                        &active_model,
+                        transcribe_cpp_runtime_backend.as_deref(),
+                    );
+                    if !accelerated_runtime_failed {
+                        // Ordinary model/input errors keep the engine available.
+                        self.return_engine(engine, &active_model);
+                    }
+                    // Accelerated runtime failures deliberately drop the suspect
+                    // engine. The next persisted load is forced to CPU for this
+                    // process, while settings remain untouched.
+                    return Err(err);
                 }
                 Err(panic_payload) => {
                     // Engine panicked — do NOT put it back (it's in an unknown state).
                     // The engine is dropped here, effectively unloading it.
                     let panic_msg = panic_payload_message(panic_payload.as_ref());
+                    self.arm_runtime_cpu_fallback(
+                        &active_model,
+                        transcribe_cpp_runtime_backend.as_deref(),
+                    );
                     error!(
                         "Transcription engine panicked: {}. Model has been unloaded.",
                         panic_msg
                     );
 
-                    // Clear the model ID so it will be reloaded on next attempt
+                    // Clear the model ID so it will be reloaded on next attempt.
                     {
                         let mut current_model = self
                             .current_model_id
@@ -2198,6 +2267,14 @@ fn should_retry_transcribe_load_on_cpu(device_index: Option<usize>, backend: Bac
     device_index.is_none() && !matches!(backend, Backend::Cpu)
 }
 
+fn should_force_transcribe_cpu_for_run(force_cpu_for_run: bool, backend: Backend) -> bool {
+    force_cpu_for_run && !matches!(backend, Backend::Cpu)
+}
+
+fn runtime_backend_needs_cpu_fallback(backend: &str) -> bool {
+    !backend.eq_ignore_ascii_case("cpu")
+}
+
 /// Apply the user's ORT accelerator preference to the transcribe-rs global.
 /// Called on startup and before loading a model.
 ///
@@ -2388,6 +2465,22 @@ mod tests {
         assert!(should_retry_transcribe_load_on_cpu(None, Backend::Auto));
         assert!(!should_retry_transcribe_load_on_cpu(None, Backend::Cpu));
         assert!(!should_retry_transcribe_load_on_cpu(Some(0), Backend::Auto));
+    }
+
+    #[test]
+    fn runtime_health_latch_forces_only_accelerated_persisted_loads_to_cpu() {
+        assert!(should_force_transcribe_cpu_for_run(true, Backend::Auto));
+        assert!(!should_force_transcribe_cpu_for_run(true, Backend::Cpu));
+        assert!(!should_force_transcribe_cpu_for_run(false, Backend::Auto));
+    }
+
+    #[test]
+    fn runtime_health_downgrade_ignores_cpu_failures() {
+        assert!(runtime_backend_needs_cpu_fallback("vulkan"));
+        assert!(runtime_backend_needs_cpu_fallback("cuda"));
+        assert!(runtime_backend_needs_cpu_fallback("metal"));
+        assert!(!runtime_backend_needs_cpu_fallback("cpu"));
+        assert!(!runtime_backend_needs_cpu_fallback("CPU"));
     }
 
     #[test]
