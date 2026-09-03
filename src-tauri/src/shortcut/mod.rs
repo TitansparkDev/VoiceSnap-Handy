@@ -23,7 +23,7 @@ use crate::settings::APPLE_INTELLIGENCE_DEFAULT_MODEL_ID;
 use crate::settings::{
     self, get_settings, AutoSubmitKey, ClipboardHandling, KeyboardImplementation, LLMPrompt,
     OverlayPosition, OverlayStyle, PasteMethod, ShortcutActivation, ShortcutBinding, SoundTheme,
-    Theme, TypingTool, VadBackend, APPLE_INTELLIGENCE_PROVIDER_ID,
+    Theme, TypingTool, VadBackend, APPLE_INTELLIGENCE_PROVIDER_ID, LOCAL_CLEANUP_PROVIDER_ID,
 };
 use crate::tray;
 
@@ -1223,8 +1223,14 @@ pub async fn fetch_post_process_models(
         .cloned()
         .unwrap_or_default();
 
-    // Skip fetching if no API key for providers that typically need one
-    if api_key.trim().is_empty() && provider.id != "custom" {
+    // Skip fetching if no API key for providers that typically need one.
+    // Custom endpoints and the dedicated local cleanup endpoint are explicitly
+    // API-keyless; the latter is loopback-only and will be supervised by the
+    // later local-runtime slice.
+    if api_key.trim().is_empty()
+        && provider.id != "custom"
+        && provider.id != LOCAL_CLEANUP_PROVIDER_ID
+    {
         return Err(format!(
             "API key is required for {}. Please add an API key to list available models.",
             provider.label

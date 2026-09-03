@@ -9,6 +9,7 @@ type PostProcessProviderState = {
   selectedProviderId: string;
   selectedProvider: PostProcessProvider | undefined;
   isCustomProvider: boolean;
+  isLocalProvider: boolean;
   isAppleProvider: boolean;
   appleIntelligenceUnavailable: boolean;
   baseUrl: string;
@@ -29,6 +30,7 @@ type PostProcessProviderState = {
 };
 
 const APPLE_PROVIDER_ID = "apple_intelligence";
+const LOCAL_PROVIDER_ID = "local_ai";
 
 export const usePostProcessProviderState = (): PostProcessProviderState => {
   const {
@@ -102,7 +104,9 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
         const hasBaseUrl = (provider?.base_url ?? "").trim() !== "";
         const hasApiKey = apiKey.trim() !== "";
 
-        if (provider?.id === "custom" ? hasBaseUrl : hasApiKey) {
+        const isApiKeylessProvider =
+          provider?.id === "custom" || provider?.id === LOCAL_PROVIDER_ID;
+        if (isApiKeylessProvider ? hasBaseUrl : hasApiKey) {
           void fetchPostProcessModels(providerId);
         }
       }
@@ -206,6 +210,7 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
   );
 
   const isCustomProvider = selectedProvider?.id === "custom";
+  const isLocalProvider = selectedProvider?.id === LOCAL_PROVIDER_ID;
 
   // No automatic fetching - user must click refresh button
 
@@ -214,6 +219,7 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
     selectedProviderId,
     selectedProvider,
     isCustomProvider,
+    isLocalProvider,
     isAppleProvider,
     appleIntelligenceUnavailable,
     baseUrl,

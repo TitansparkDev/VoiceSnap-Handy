@@ -10,6 +10,11 @@ use tauri_plugin_store::StoreExt;
 
 pub const APPLE_INTELLIGENCE_PROVIDER_ID: &str = "apple_intelligence";
 pub const APPLE_INTELLIGENCE_DEFAULT_MODEL_ID: &str = "Apple Intelligence";
+/// Dedicated loopback provider for the fork's offline cleanup path. The later
+/// runtime/supervisor slice owns starting and warming the local model process;
+/// this entry establishes the existing post-process provider contract it will use.
+pub const LOCAL_CLEANUP_PROVIDER_ID: &str = "local_ai";
+pub const LOCAL_CLEANUP_DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Type)]
 #[serde(rename_all = "lowercase")]
@@ -714,6 +719,19 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             supports_structured_output: true,
         });
     }
+
+    // Dedicated local/offline provider. A later Wave 1 slice owns supervising
+    // the bundled local runtime; keeping the endpoint loopback-only here makes
+    // this provider usable through the existing OpenAI-compatible abstraction
+    // without turning the generic Custom provider into product state.
+    providers.push(PostProcessProvider {
+        id: LOCAL_CLEANUP_PROVIDER_ID.to_string(),
+        label: "Local AI".to_string(),
+        base_url: LOCAL_CLEANUP_DEFAULT_BASE_URL.to_string(),
+        allow_base_url_edit: false,
+        models_endpoint: Some("/models".to_string()),
+        supports_structured_output: false,
+    });
 
     // AWS Bedrock via Mantle (OpenAI-compatible endpoint)
     providers.push(PostProcessProvider {
@@ -1490,6 +1508,33 @@ mod tests {
                 default_settings_json()
             );
         }
+    }
+
+    #[test]
+    fn default_settings_include_dedicated_local_cleanup_provider() {
+        let settings = get_default_settings();
+        let provider = settings
+            .post_process_provider(LOCAL_CLEANUP_PROVIDER_ID)
+            .expect("local cleanup provider should be part of the default provider set");
+
+        assert_eq!(provider.label, "Local AI");
+        assert_eq!(provider.base_url, LOCAL_CLEANUP_DEFAULT_BASE_URL);
+        assert!(!provider.allow_base_url_edit);
+        assert_eq!(provider.models_endpoint.as_deref(), Some("/models"));
+        assert_eq!(
+            settings
+                .post_process_api_keys
+                .get(LOCAL_CLEANUP_PROVIDER_ID)
+                .map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            settings
+                .post_process_models
+                .get(LOCAL_CLEANUP_PROVIDER_ID)
+                .map(String::as_str),
+            Some("")
+        );
     }
 
     #[test]
