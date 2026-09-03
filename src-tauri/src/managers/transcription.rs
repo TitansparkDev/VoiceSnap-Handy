@@ -111,6 +111,28 @@ struct FinalizedStreamText {
     output_language: OutputLanguageEvidence,
     /// The streaming model's supported languages, for text-based detection.
     supported_languages: Vec<String>,
+    benchmark_timing: StreamBenchmarkTiming,
+}
+
+/// Safe timing-only sample for the fixed-WAV stream benchmark. This structure
+/// intentionally contains no transcript, audio, clipboard, window, or path data.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct StreamBenchmarkTiming {
+    pub first_partial_ms: Option<u64>,
+    pub committed_cadence_ms: Vec<u64>,
+    pub finalization_tail_ms: u64,
+    pub total_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct TranscriptionBenchmarkSample {
+    pub mode: String,
+    pub audio_ms: u64,
+    pub first_partial_ms: Option<u64>,
+    pub committed_cadence_ms: Vec<u64>,
+    pub finalization_tail_ms: u64,
+    pub total_ms: u64,
+    pub worker_released: bool,
 }
 
 /// Routes real-time audio frames to the active streaming worker. Shared between
@@ -918,12 +940,18 @@ impl TranscriptionManager {
         }
         let rx = self.router.open();
         self.stream_active.store(false, Ordering::Release);
+        let requested_at = Instant::now();
 
         let manager = self.clone();
-        thread::spawn(move || manager.run_stream_worker(rx, worker_id));
+        thread::spawn(move || manager.run_stream_worker(rx, worker_id, requested_at));
     }
 
-    fn run_stream_worker(&self, rx: mpsc::Receiver<StreamCmd>, worker_id: u64) {
+    fn run_stream_worker(
+        &self,
+        rx: mpsc::Receiver<StreamCmd>,
+        worker_id: u64,
+        requested_at: Instant,
+    ) {
         let _worker = StreamWorkerGuard {
             worker_id,
             active_stream_worker: Arc::clone(&self.active_stream_worker),
@@ -1074,7 +1102,7 @@ impl TranscriptionManager {
                 model_id, backend
             );
 
-            let mut perf = StreamPerf::new();
+            let mut perf = StreamPerf::new(requested_at);
             while let Ok(cmd) = rx.recv() {
                 match cmd {
                     StreamCmd::Feed(pcm) => {
@@ -1092,7 +1120,7 @@ impl TranscriptionManager {
                                 );
                                 if update.committed_changed || update.tentative_changed {
                                     let text = stream.text();
-                                    perf.record_emit();
+                                    perf.record_emit(update.committed_changed);
                                     self.emit_stream_text(&text.committed, &text.tentative);
                                 }
                                 perf.maybe_log();
@@ -1132,6 +1160,8 @@ impl TranscriptionManager {
                                     text: stream.text().full,
                                     output_language,
                                     supported_languages: languages.clone(),
+                                    benchmark_timing: perf
+                                        .snapshot(finalize_start.elapsed(), requested_at.elapsed()),
                                 })
                             }
                             Err(e) => {
@@ -1228,6 +1258,14 @@ impl TranscriptionManager {
     /// A timeout may still leave the worker holding the engine, so callers
     /// should surface it instead of immediately starting a batch fallback.
     pub fn finalize_stream(&self) -> Result<Option<String>> {
+        Ok(self
+            .finalize_stream_with_benchmark_timing()?
+            .map(|(text, _)| text))
+    }
+
+    fn finalize_stream_with_benchmark_timing(
+        &self,
+    ) -> Result<Option<(String, StreamBenchmarkTiming)>> {
         let Some(tx) = self.router.take() else {
             return Ok(None);
         };
@@ -1260,7 +1298,77 @@ impl TranscriptionManager {
         );
 
         self.maybe_unload_immediately("streaming transcription");
-        Ok(Some(filtered))
+        Ok(Some((filtered, finalized.benchmark_timing)))
+    }
+
+    fn wait_for_stream_worker_release(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let released = !self.router.is_open()
+                && self.active_stream_worker.load(Ordering::Acquire) == 0
+                && self.active_engine_lease.load(Ordering::Acquire) == 0;
+            if released {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Feed a fixed 16 kHz WAV buffer through the same streaming route used by
+    /// live capture, paced at real time. Streaming-capable engines report live
+    /// milestones; engines that cannot stream cleanly fall back to one final
+    /// batch decode and intentionally report no partial/cadence samples.
+    pub fn benchmark_fixed_audio(
+        &self,
+        audio: &[f32],
+        frame_ms: u64,
+    ) -> Result<TranscriptionBenchmarkSample> {
+        if audio.is_empty() {
+            return Err(anyhow::anyhow!("benchmark fixture contains no audio"));
+        }
+        let frame_ms = frame_ms.max(1);
+        let frame_samples = ((16_000_u64 * frame_ms) / 1_000).max(1) as usize;
+        let audio_ms = ((audio.len() as u64) * 1_000) / 16_000;
+        let total_started = Instant::now();
+
+        self.start_stream();
+        for chunk in audio.chunks(frame_samples) {
+            self.router.feed(chunk);
+            thread::sleep(Duration::from_secs_f64(chunk.len() as f64 / 16_000.0));
+        }
+
+        let finalize_started = Instant::now();
+        if let Some((_text, mut timing)) = self.finalize_stream_with_benchmark_timing()? {
+            timing.finalization_tail_ms = finalize_started.elapsed().as_millis() as u64;
+            timing.total_ms = total_started.elapsed().as_millis() as u64;
+            let worker_released = self.wait_for_stream_worker_release(Duration::from_secs(1));
+            return Ok(TranscriptionBenchmarkSample {
+                mode: "streaming".to_string(),
+                audio_ms,
+                first_partial_ms: timing.first_partial_ms,
+                committed_cadence_ms: timing.committed_cadence_ms,
+                finalization_tail_ms: timing.finalization_tail_ms,
+                total_ms: timing.total_ms,
+                worker_released,
+            });
+        }
+
+        let batch_started = Instant::now();
+        let _text = self.transcribe(audio.to_vec())?;
+        let batch_ms = batch_started.elapsed().as_millis() as u64;
+        let worker_released = self.wait_for_stream_worker_release(Duration::from_secs(1));
+        Ok(TranscriptionBenchmarkSample {
+            mode: "final_only".to_string(),
+            audio_ms,
+            first_partial_ms: None,
+            committed_cadence_ms: Vec::new(),
+            finalization_tail_ms: batch_ms,
+            total_ms: total_started.elapsed().as_millis() as u64,
+            worker_released,
+        })
     }
 
     /// Abandon any active stream without producing text (e.g. on cancel).
@@ -1674,6 +1782,9 @@ impl TranscriptionManager {
 }
 
 struct StreamPerf {
+    requested_at: Instant,
+    first_partial_ms: Option<u64>,
+    committed_update_ms: Vec<u64>,
     feed_count: u64,
     emit_count: u64,
     streamed_samples: u64,
@@ -1686,8 +1797,11 @@ struct StreamPerf {
 }
 
 impl StreamPerf {
-    fn new() -> Self {
+    fn new(requested_at: Instant) -> Self {
         Self {
+            requested_at,
+            first_partial_ms: None,
+            committed_update_ms: Vec::new(),
             feed_count: 0,
             emit_count: 0,
             streamed_samples: 0,
@@ -1722,8 +1836,27 @@ impl StreamPerf {
         self.latest_buffered_ms = buffered_ms;
     }
 
-    fn record_emit(&mut self) {
+    fn record_emit(&mut self, committed_changed: bool) {
         self.emit_count += 1;
+        let elapsed_ms = self.requested_at.elapsed().as_millis() as u64;
+        self.first_partial_ms.get_or_insert(elapsed_ms);
+        if committed_changed {
+            self.committed_update_ms.push(elapsed_ms);
+        }
+    }
+
+    fn snapshot(&self, finalization_tail: Duration, total: Duration) -> StreamBenchmarkTiming {
+        let committed_cadence_ms = self
+            .committed_update_ms
+            .windows(2)
+            .map(|pair| pair[1].saturating_sub(pair[0]))
+            .collect();
+        StreamBenchmarkTiming {
+            first_partial_ms: self.first_partial_ms,
+            committed_cadence_ms,
+            finalization_tail_ms: finalization_tail.as_millis() as u64,
+            total_ms: total.as_millis() as u64,
+        }
     }
 
     fn maybe_log(&mut self) {
@@ -2419,6 +2552,76 @@ mod tests {
 
     fn languages(codes: &[&str]) -> Vec<String> {
         codes.iter().map(|code| (*code).to_string()).collect()
+    }
+
+    #[test]
+    fn stream_worker_guard_releases_cancelled_worker_state() {
+        let active_stream_worker = Arc::new(AtomicU64::new(7));
+        let active_engine_lease = Arc::new(AtomicU64::new(7));
+        let stream_active = Arc::new(AtomicBool::new(true));
+        {
+            let _guard = StreamWorkerGuard {
+                worker_id: 7,
+                active_stream_worker: Arc::clone(&active_stream_worker),
+                active_engine_lease: Arc::clone(&active_engine_lease),
+                stream_active: Arc::clone(&stream_active),
+            };
+        }
+
+        assert_eq!(active_stream_worker.load(Ordering::Acquire), 0);
+        assert_eq!(active_engine_lease.load(Ordering::Acquire), 0);
+        assert!(!stream_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn stale_stream_worker_cannot_clear_new_model_switch_worker() {
+        let active_stream_worker = Arc::new(AtomicU64::new(2));
+        let active_engine_lease = Arc::new(AtomicU64::new(2));
+        let stream_active = Arc::new(AtomicBool::new(true));
+        {
+            let _stale_guard = StreamWorkerGuard {
+                worker_id: 1,
+                active_stream_worker: Arc::clone(&active_stream_worker),
+                active_engine_lease: Arc::clone(&active_engine_lease),
+                stream_active: Arc::clone(&stream_active),
+            };
+        }
+
+        assert_eq!(active_stream_worker.load(Ordering::Acquire), 2);
+        assert_eq!(active_engine_lease.load(Ordering::Acquire), 2);
+        assert!(stream_active.load(Ordering::Acquire));
+
+        {
+            let _current_guard = StreamWorkerGuard {
+                worker_id: 2,
+                active_stream_worker: Arc::clone(&active_stream_worker),
+                active_engine_lease: Arc::clone(&active_engine_lease),
+                stream_active: Arc::clone(&stream_active),
+            };
+        }
+        assert_eq!(active_stream_worker.load(Ordering::Acquire), 0);
+        assert_eq!(active_engine_lease.load(Ordering::Acquire), 0);
+        assert!(!stream_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn stream_perf_records_timing_only_and_committed_cadence() {
+        let started = Instant::now();
+        let mut perf = StreamPerf::new(started);
+        perf.record_emit(false);
+        std::thread::sleep(Duration::from_millis(1));
+        perf.record_emit(true);
+        std::thread::sleep(Duration::from_millis(1));
+        perf.record_emit(true);
+        let timing = perf.snapshot(Duration::from_millis(4), started.elapsed());
+
+        assert!(timing.first_partial_ms.is_some());
+        assert_eq!(timing.committed_cadence_ms.len(), 1);
+        assert_eq!(timing.finalization_tail_ms, 4);
+        let serialized = serde_json::to_string(&timing).unwrap();
+        assert!(!serialized.contains("transcript"));
+        assert!(!serialized.contains("audio"));
+        assert!(!serialized.contains("clipboard"));
     }
 
     #[test]

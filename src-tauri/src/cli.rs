@@ -57,6 +57,18 @@ pub struct CliArgs {
     #[arg(long, value_name = "N")]
     pub repeat: Option<usize>,
 
+    /// Benchmark the live-stream path with --transcribe-file. The WAV is fed in
+    /// real-time-sized chunks; streaming models report first partial, committed
+    /// cadence, finalization tail, and total time. Non-streaming models report a
+    /// final-only batch fallback. No transcript text is emitted in benchmark JSON.
+    #[arg(long)]
+    pub benchmark_stream: bool,
+
+    /// Stream benchmark frame size in milliseconds (default: 100). Only used
+    /// with --benchmark-stream.
+    #[arg(long, value_name = "MS", default_value_t = 100)]
+    pub benchmark_frame_ms: u64,
+
     /// Emit --transcribe-file results as JSON.
     #[arg(long)]
     pub json: bool,
