@@ -38,6 +38,7 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN insertion_mode TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN backend TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN device TEXT;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN outcome TEXT;"),
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -83,6 +84,8 @@ pub struct HistoryEntry {
     pub backend: Option<String>,
     /// Actual runtime compute device used by the transcription engine.
     pub device: Option<String>,
+    /// Persisted session result. Current recording sessions use `success` or `failure`.
+    pub outcome: Option<String>,
 }
 
 pub struct HistoryManager {
@@ -234,6 +237,7 @@ impl HistoryManager {
             insertion_mode: row.get("insertion_mode")?,
             backend: row.get("backend")?,
             device: row.get("device")?,
+            outcome: row.get("outcome")?,
         })
     }
 
@@ -256,6 +260,7 @@ impl HistoryManager {
         insertion_mode: Option<String>,
         backend: Option<String>,
         device: Option<String>,
+        outcome: Option<String>,
         duration_ms: i64,
     ) -> Result<HistoryEntry> {
         let timestamp = Utc::now().timestamp();
@@ -278,8 +283,9 @@ impl HistoryManager {
                 insertion_mode,
                 backend,
                 device,
+                outcome,
                 duration_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 &file_name,
                 timestamp,
@@ -295,6 +301,7 @@ impl HistoryManager {
                 &insertion_mode,
                 &backend,
                 &device,
+                &outcome,
                 duration_ms,
             ],
         )?;
@@ -316,6 +323,7 @@ impl HistoryManager {
             insertion_mode,
             backend,
             device,
+            outcome,
         };
 
         debug!("Saved history entry with id {}", entry.id);
@@ -357,7 +365,8 @@ impl HistoryManager {
                  engine_type = ?5,
                  language = ?6,
                  backend = ?7,
-                 device = ?8
+                 device = ?8,
+                 outcome = 'success'
              WHERE id = ?9",
             params![
                 transcription_text,
@@ -378,7 +387,7 @@ impl HistoryManager {
 
         let entry = conn
             .query_row(
-                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device
+                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, outcome
                  FROM transcription_history WHERE id = ?1",
                 params![id],
                 Self::map_history_entry,
@@ -440,7 +449,7 @@ impl HistoryManager {
         }
 
         conn.query_row(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, outcome
              FROM transcription_history WHERE id = ?1",
             params![id],
             Self::map_history_entry,
@@ -634,8 +643,8 @@ impl HistoryManager {
         let search_pattern = Self::history_search_pattern(search);
         let outcome_filter = match outcome_filter {
             None => None,
-            Some("success") => Some(true),
-            Some("failure") => Some(false),
+            Some("success") => Some("success"),
+            Some("failure") => Some("failure"),
             Some(value) => return Err(anyhow!("Invalid history outcome filter: {value}")),
         };
         let cleanup_filter = match cleanup_filter {
@@ -646,7 +655,7 @@ impl HistoryManager {
         };
 
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, outcome
              FROM transcription_history
              WHERE (?1 IS NULL OR id < ?1)
                AND (
@@ -659,8 +668,10 @@ impl HistoryManager {
                AND (?5 IS NULL OR model_id = ?5)
                AND (
                     ?6 IS NULL
-                    OR (?6 = 1 AND transcription_text != '')
-                    OR (?6 = 0 AND transcription_text = '')
+                    OR COALESCE(
+                        outcome,
+                        CASE WHEN transcription_text != '' THEN 'success' ELSE 'failure' END
+                    ) = ?6
                )
                AND (?7 IS NULL OR post_process_requested = ?7)
              ORDER BY id DESC
@@ -725,7 +736,8 @@ impl HistoryManager {
                 language,
                 insertion_mode,
                 backend,
-                device
+                device,
+                outcome
              FROM transcription_history
              ORDER BY timestamp DESC
              LIMIT 1",
@@ -759,7 +771,8 @@ impl HistoryManager {
                 language,
                 insertion_mode,
                 backend,
-                device
+                device,
+                outcome
              FROM transcription_history
              WHERE transcription_text != ''
              ORDER BY timestamp DESC
@@ -820,7 +833,8 @@ impl HistoryManager {
                 language,
                 insertion_mode,
                 backend,
-                device
+                device,
+                outcome
              FROM transcription_history
              WHERE id = ?1",
         )?;
@@ -896,7 +910,8 @@ mod tests {
                 language TEXT,
                 insertion_mode TEXT,
                 backend TEXT,
-                device TEXT
+                device TEXT,
+                outcome TEXT
             );",
         )
         .expect("create transcription_history table");
@@ -990,6 +1005,7 @@ mod tests {
         assert!(entry.insertion_mode.is_none());
         assert!(entry.backend.is_none());
         assert!(entry.device.is_none());
+        assert!(entry.outcome.is_none());
     }
 
     #[test]
@@ -1055,6 +1071,22 @@ mod tests {
             .expect("runtime-tagged entry exists");
         assert_eq!(entry.backend.as_deref(), Some("vulkan"));
         assert_eq!(entry.device.as_deref(), Some("gpu-0"));
+    }
+
+    #[test]
+    fn history_entry_preserves_outcome_metadata() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "outcome-tagged recording", None);
+        conn.execute(
+            "UPDATE transcription_history SET outcome = ?1 WHERE timestamp = ?2",
+            params!["success", 100_i64],
+        )
+        .expect("store outcome metadata");
+
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch outcome-tagged entry")
+            .expect("outcome-tagged entry exists");
+        assert_eq!(entry.outcome.as_deref(), Some("success"));
     }
 
     #[test]
@@ -1357,6 +1389,44 @@ mod tests {
         .expect("filter failed history");
         assert_eq!(failed.entries.len(), 1);
         assert_eq!(failed.entries[0].timestamp, 200);
+    }
+
+    #[test]
+    fn history_outcome_filter_prefers_persisted_session_result() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "text exists but session failed", None);
+        conn.execute(
+            "UPDATE transcription_history SET outcome = 'failure' WHERE timestamp = ?1",
+            params![100_i64],
+        )
+        .expect("persist explicit failure outcome");
+
+        let failed = HistoryManager::get_history_entries_with_conn(
+            &conn,
+            None,
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+            Some("failure"),
+        )
+        .expect("filter by persisted failure outcome");
+        assert_eq!(failed.entries.len(), 1);
+        assert_eq!(failed.entries[0].outcome.as_deref(), Some("failure"));
+
+        let successful = HistoryManager::get_history_entries_with_conn(
+            &conn,
+            None,
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+            Some("success"),
+        )
+        .expect("filter by persisted success outcome");
+        assert!(successful.entries.is_empty());
     }
 
     #[test]

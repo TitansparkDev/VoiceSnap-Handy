@@ -1048,7 +1048,11 @@ backend: string | null;
 /**
  * Actual runtime compute device used by the transcription engine.
  */
-device: string | null }
+device: string | null;
+/**
+ * Persisted session result. Current recording sessions use `success` or `failure`.
+ */
+outcome: string | null }
 export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number }
 /**
  * Result of changing keyboard implementation

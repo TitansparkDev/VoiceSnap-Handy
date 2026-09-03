@@ -904,6 +904,7 @@ impl ShortcutAction for TranscribeAction {
                                     Some(HISTORY_INSERTION_MODE_AT_STOP.to_string()),
                                     history_backend.clone(),
                                     history_device.clone(),
+                                    Some("success".to_string()),
                                     history_duration_ms,
                                 ) {
                                     error!("Failed to save history entry: {}", err);
@@ -978,6 +979,7 @@ impl ShortcutAction for TranscribeAction {
                                     Some(HISTORY_INSERTION_MODE_AT_STOP.to_string()),
                                     history_backend,
                                     history_device,
+                                    Some("failure".to_string()),
                                     history_duration_ms,
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);

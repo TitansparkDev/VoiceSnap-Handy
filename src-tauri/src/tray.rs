@@ -689,6 +689,7 @@ mod tests {
             insertion_mode: None,
             backend: None,
             device: None,
+            outcome: None,
         }
     }
 

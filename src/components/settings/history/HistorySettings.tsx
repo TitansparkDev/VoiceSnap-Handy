@@ -635,6 +635,13 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
       : entry.insertion_mode
     : null;
   const runtimeLabel = [entry.backend, entry.device].filter(Boolean).join(" · ") || null;
+  const outcomeLabel = entry.outcome
+    ? entry.outcome === "success"
+      ? t("settings.history.successful", { defaultValue: "Successful" })
+      : entry.outcome === "failure"
+        ? t("settings.history.failed", { defaultValue: "Failed" })
+        : entry.outcome
+    : null;
 
   return (
     <div className="px-4 py-2 pb-5 flex flex-col gap-3">
@@ -685,6 +692,16 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
               })}
             >
               {runtimeLabel}
+            </span>
+          )}
+          {outcomeLabel && (
+            <span
+              className="rounded bg-mid-gray/10 px-1.5 py-0.5 text-[10px] text-text/50"
+              title={t("settings.history.outcomeFilter", {
+                defaultValue: "Outcome",
+              })}
+            >
+              {outcomeLabel}
             </span>
           )}
         </div>
