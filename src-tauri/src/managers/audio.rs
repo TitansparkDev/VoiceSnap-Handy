@@ -257,31 +257,63 @@ struct MuteState {
     prev_muted: Option<bool>,
 }
 
+/// Persisted microphone identity. `stable_id` comes from CPAL's host-specific
+/// stable DeviceId when available; the readable name is retained for UI and as
+/// a strict fallback for legacy stores/backends without stable IDs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MicrophonePreference {
+    name: String,
+    stable_id: Option<String>,
+}
+
 /// The persisted microphone preference currently in effect. Clamshell and
 /// regular selections are kept distinct so losing a clamshell-only device does
 /// not erase the user's normal microphone preference.
 enum DesiredMicrophone {
     Default,
-    Selected(String),
-    Clamshell(String),
+    Selected(MicrophonePreference),
+    Clamshell(MicrophonePreference),
 }
 
 /// Result of resolving the persisted preference to a live cpal device.
 /// `device: None` is reserved for an explicit system-default preference. A
-/// named preference must resolve to that exact device or recording fails open
-/// with a user-facing microphone error; it never silently switches inputs.
+/// named preference must resolve to that exact identity/name or recording fails
+/// open with a user-facing microphone error; it never silently switches inputs.
 struct MicrophoneResolution {
     device: Option<cpal::Device>,
 }
 
-fn require_requested_microphone<T>(
-    device_name: &str,
-    device: Option<T>,
+struct MicrophoneCandidate<T> {
+    stable_id: Option<String>,
+    name: String,
+    value: T,
+}
+
+fn select_requested_microphone<T>(
+    preference: &MicrophonePreference,
+    devices: impl IntoIterator<Item = MicrophoneCandidate<T>>,
 ) -> Result<T, anyhow::Error> {
-    device.ok_or_else(|| {
+    let requested = devices.into_iter().find(|candidate| {
+        if let Some(stable_id) = preference.stable_id.as_deref() {
+            // Once a stable identity is persisted, never fall back to a
+            // same-named replacement. That could silently select another USB
+            // microphone while the requested one is disconnected.
+            candidate.stable_id.as_deref() == Some(stable_id)
+        } else {
+            candidate.name == preference.name
+        }
+    });
+
+    requested.map(|candidate| candidate.value).ok_or_else(|| {
+        let identity = preference
+            .stable_id
+            .as_deref()
+            .map(|id| format!(" (id {id})"))
+            .unwrap_or_default();
         anyhow::anyhow!(
-            "No input device found: requested microphone '{}' is unavailable",
-            device_name
+            "No input device found: requested microphone '{}'{} is unavailable",
+            preference.name,
+            identity
         )
     })
 }
@@ -412,7 +444,7 @@ pub struct AudioRecordingManager {
     /// change misses naturally; cleared when an open fails (device unplugged)
     /// so the retry re-enumerates. The system-default case is never cached —
     /// the recorder resolves the current default itself, cheaply.
-    cached_device: Arc<Mutex<Option<(String, cpal::Device)>>>,
+    cached_device: Arc<Mutex<Option<(MicrophonePreference, cpal::Device)>>>,
 }
 
 impl AudioRecordingManager {
@@ -469,11 +501,17 @@ impl AudioRecordingManager {
                 is_clamshell
             );
             if is_clamshell {
-                return DesiredMicrophone::Clamshell(clamshell_microphone.clone());
+                return DesiredMicrophone::Clamshell(MicrophonePreference {
+                    name: clamshell_microphone.clone(),
+                    stable_id: settings.clamshell_microphone_id.clone(),
+                });
             }
         }
         match &settings.selected_microphone {
-            Some(name) => DesiredMicrophone::Selected(name.clone()),
+            Some(name) => DesiredMicrophone::Selected(MicrophonePreference {
+                name: name.clone(),
+                stable_id: settings.selected_microphone_id.clone(),
+            }),
             None => DesiredMicrophone::Default,
         }
     }
@@ -487,48 +525,53 @@ impl AudioRecordingManager {
         settings: &AppSettings,
     ) -> Result<MicrophoneResolution, anyhow::Error> {
         let desired = self.desired_microphone(settings);
-        let device_name = match desired {
+        let preference = match desired {
             DesiredMicrophone::Default => {
                 debug!("device resolve: no mic configured -> system default");
                 return Ok(MicrophoneResolution { device: None });
             }
-            DesiredMicrophone::Selected(name) | DesiredMicrophone::Clamshell(name) => name,
+            DesiredMicrophone::Selected(preference) | DesiredMicrophone::Clamshell(preference) => {
+                preference
+            }
         };
 
         // Cache hit: skip the full enumeration. A stale device (unplugged)
         // fails at open, where the caller invalidates and retries fresh.
-        if let Some((cached_name, device)) = self.cached_device.lock().unwrap().as_ref() {
-            if *cached_name == device_name {
-                debug!("device resolve: cache hit for '{}'", device_name);
+        if let Some((cached_preference, device)) = self.cached_device.lock().unwrap().as_ref() {
+            if *cached_preference == preference {
+                debug!("device resolve: cache hit for '{}'", preference.name);
                 return Ok(MicrophoneResolution {
                     device: Some(device.clone()),
                 });
             }
         }
 
-        // A named preference is an instruction, not a hint. If enumeration
-        // fails or the device disappeared, surface the failure and preserve the
-        // saved preference so the next automatic repair retries the same mic.
+        // A persisted identity is an instruction, not a hint. When an ID exists,
+        // resolve only that ID. For legacy/backends without one, fall back to an
+        // exact readable-name match. Either way, disappearance is surfaced and
+        // the preference is preserved for a later recovery attempt.
         let enumerate_started = Instant::now();
         let devices = list_input_devices().map_err(|e| {
             anyhow::anyhow!(
                 "Failed to enumerate microphones while resolving requested device '{}': {}",
-                device_name,
+                preference.name,
                 e
             )
         })?;
-        let device = require_requested_microphone(
-            &device_name,
-            devices
-                .into_iter()
-                .find(|d| d.name == device_name)
-                .map(|d| d.device),
+        let device = select_requested_microphone(
+            &preference,
+            devices.into_iter().map(|device| MicrophoneCandidate {
+                stable_id: device.stable_id,
+                name: device.name,
+                value: device.device,
+            }),
         )?;
         debug!(
-            "device resolve: enumerate={:?} (found=true)",
-            enumerate_started.elapsed()
+            "device resolve: enumerate={:?} (found=true, stable_id={})",
+            enumerate_started.elapsed(),
+            preference.stable_id.is_some()
         );
-        *self.cached_device.lock().unwrap() = Some((device_name, device.clone()));
+        *self.cached_device.lock().unwrap() = Some((preference, device.clone()));
 
         Ok(MicrophoneResolution {
             device: Some(device),
@@ -1078,22 +1121,72 @@ impl AudioRecordingManager {
 
 #[cfg(test)]
 mod tests {
-    use super::require_requested_microphone;
+    use super::{select_requested_microphone, MicrophoneCandidate, MicrophonePreference};
 
-    #[test]
-    fn requested_microphone_must_exist_in_current_enumeration() {
-        let error = require_requested_microphone::<()>("USB Mic", None).unwrap_err();
-        let message = error.to_string();
-
-        assert!(message.contains("No input device found"));
-        assert!(message.contains("USB Mic"));
+    fn candidate(
+        id: Option<&str>,
+        name: &str,
+        value: &'static str,
+    ) -> MicrophoneCandidate<&'static str> {
+        MicrophoneCandidate {
+            stable_id: id.map(str::to_string),
+            name: name.to_string(),
+            value,
+        }
     }
 
     #[test]
-    fn requested_microphone_is_kept_when_available() {
-        assert_eq!(
-            require_requested_microphone("USB Mic", Some("device")).unwrap(),
-            "device"
-        );
+    fn stable_identity_disappearance_does_not_fall_back_to_same_named_device() {
+        let preference = MicrophonePreference {
+            name: "USB Mic".into(),
+            stable_id: Some("wasapi:requested".into()),
+        };
+
+        let error = select_requested_microphone(
+            &preference,
+            [candidate(Some("wasapi:replacement"), "USB Mic", "wrong")],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("USB Mic"));
+        assert!(error.to_string().contains("wasapi:requested"));
+    }
+
+    #[test]
+    fn stable_identity_recovers_requested_device_even_if_display_name_changes() {
+        let preference = MicrophonePreference {
+            name: "USB Mic".into(),
+            stable_id: Some("wasapi:requested".into()),
+        };
+
+        let selected = select_requested_microphone(
+            &preference,
+            [
+                candidate(Some("wasapi:other"), "USB Mic", "wrong"),
+                candidate(Some("wasapi:requested"), "USB Mic (2)", "requested"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(selected, "requested");
+    }
+
+    #[test]
+    fn legacy_name_only_preference_requires_exact_name() {
+        let preference = MicrophonePreference {
+            name: "USB Mic".into(),
+            stable_id: None,
+        };
+
+        let selected = select_requested_microphone(
+            &preference,
+            [
+                candidate(Some("alsa:other"), "Other Mic", "wrong"),
+                candidate(Some("alsa:usb"), "USB Mic", "requested"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(selected, "requested");
     }
 }

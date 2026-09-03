@@ -193,7 +193,10 @@ impl AudioRecorder {
             let stop_flag_for_stream = stop_flag.clone();
             let init_result = (|| -> Result<(cpal::Stream, u32), String> {
                 let config_started = Instant::now();
-                let device_name = thread_device.name().unwrap_or_default();
+                let device_name = thread_device
+                    .description()
+                    .map(|desc| desc.name().to_string())
+                    .unwrap_or_default();
                 let cached_config = config_cache
                     .lock()
                     .unwrap()
@@ -208,12 +211,14 @@ impl AudioRecorder {
                 };
                 let config_elapsed = config_started.elapsed();
 
-                let sample_rate = config.sample_rate().0;
+                let sample_rate = config.sample_rate();
                 let channels = config.channels() as usize;
 
                 log::info!(
                     "Using device: {:?}\nSample rate: {}\nChannels: {}\nFormat: {:?}",
-                    thread_device.name(),
+                    thread_device
+                        .description()
+                        .map(|desc| desc.name().to_string()),
                     sample_rate,
                     channels,
                     config.sample_format()

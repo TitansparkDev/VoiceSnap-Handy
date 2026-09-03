@@ -412,12 +412,20 @@ pub struct AppSettings {
     pub always_on_microphone: bool,
     #[serde(default)]
     pub selected_microphone: Option<String>,
+    /// Stable CPAL identity paired with `selected_microphone`. Older stores and
+    /// hosts that cannot expose a stable ID leave this unset and resolve by the
+    /// exact readable name instead.
+    #[serde(default)]
+    pub selected_microphone_id: Option<String>,
     /// Which input channel to use on the selected microphone device.
     /// None means "average all channels" (original behavior).
     #[serde(default)]
     pub selected_channel: Option<u16>,
     #[serde(default)]
     pub clamshell_microphone: Option<String>,
+    /// Stable CPAL identity paired with the clamshell microphone preference.
+    #[serde(default)]
+    pub clamshell_microphone_id: Option<String>,
     #[serde(default)]
     pub selected_output_device: Option<String>,
     #[serde(default = "default_translate_to_english")]
@@ -942,8 +950,10 @@ pub fn get_default_settings() -> AppSettings {
         onboarding_completed: false,
         always_on_microphone: false,
         selected_microphone: None,
+        selected_microphone_id: None,
         selected_channel: None,
         clamshell_microphone: None,
+        clamshell_microphone_id: None,
         selected_output_device: None,
         translate_to_english: false,
         selected_language: "auto".to_string(),
@@ -1397,6 +1407,8 @@ mod tests {
         assert_eq!(settings.sound_theme, SoundTheme::Pop);
         assert!(settings.filler_word_removal_enabled);
         assert_eq!(settings.vad_backend, VadBackend::Silero);
+        assert_eq!(settings.selected_microphone_id, None);
+        assert_eq!(settings.clamshell_microphone_id, None);
 
         // The 0.1 integer device index is cleared once for transcribe.cpp 0.2.
         // Without an exact device, the retired generic GPU choice becomes Auto.
@@ -1413,6 +1425,32 @@ mod tests {
         // matching legacy mode rather than the new hold-or-toggle default.
         assert_eq!(settings.shortcut_activation, ShortcutActivation::Toggle);
         assert_eq!(settings.transcribe_gpu_device, None);
+    }
+
+    #[test]
+    fn microphone_identity_and_display_name_survive_settings_round_trip() {
+        let mut settings = get_default_settings();
+        settings.selected_microphone = Some("Desk USB Mic".into());
+        settings.selected_microphone_id = Some("wasapi:{stable-input-id}".into());
+        settings.clamshell_microphone = Some("Laptop Mic".into());
+        settings.clamshell_microphone_id = Some("coreaudio:BuiltInMicrophoneDevice".into());
+
+        let restored: AppSettings = serde_json::from_value(serde_json::to_value(settings).unwrap())
+            .expect("microphone selection should deserialize");
+
+        assert_eq!(
+            restored.selected_microphone.as_deref(),
+            Some("Desk USB Mic")
+        );
+        assert_eq!(
+            restored.selected_microphone_id.as_deref(),
+            Some("wasapi:{stable-input-id}")
+        );
+        assert_eq!(restored.clamshell_microphone.as_deref(), Some("Laptop Mic"));
+        assert_eq!(
+            restored.clamshell_microphone_id.as_deref(),
+            Some("coreaudio:BuiltInMicrophoneDevice")
+        );
     }
 
     #[test]

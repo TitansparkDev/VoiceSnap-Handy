@@ -35,6 +35,7 @@ interface SettingsStore {
   resetSetting: (key: keyof Settings) => Promise<void>;
   refreshSettings: () => Promise<void>;
   refreshAudioDevices: () => Promise<void>;
+  selectMicrophone: (device: AudioDevice) => Promise<void>;
   refreshOutputDevices: () => Promise<void>;
   updateBinding: (id: string, binding: string) => Promise<void>;
   resetBinding: (id: string) => Promise<void>;
@@ -75,6 +76,7 @@ interface SettingsStore {
 
 const DEFAULT_AUDIO_DEVICE: AudioDevice = {
   index: "default",
+  stable_id: null,
   name: "Default",
   is_default: true,
 };
@@ -107,6 +109,7 @@ const settingUpdaters: {
       (value as string) === "Default" || value === null
         ? "default"
         : (value as string),
+      null,
     ),
   selected_channel: async (value) => {
     const result = await commands.setSelectedChannel(
@@ -267,6 +270,42 @@ export const useSettingsStore = create<SettingsStore>()(
       } catch (error) {
         console.error("Failed to load audio devices:", error);
         set({ audioDevices: [DEFAULT_AUDIO_DEVICE] });
+      }
+    },
+
+    selectMicrophone: async (device) => {
+      const { settings, setUpdating, refreshSettings } = get();
+      const originalValue = settings?.selected_microphone;
+      const nextValue = device.is_default ? "Default" : device.name;
+      setUpdating("selected_microphone", true);
+
+      try {
+        set((state) => ({
+          settings: state.settings
+            ? { ...state.settings, selected_microphone: nextValue }
+            : null,
+        }));
+
+        const result = await commands.setSelectedMicrophone(
+          device.is_default ? "default" : device.name,
+          device.stable_id,
+        );
+        if (result.status === "error") {
+          throw new Error(result.error);
+        }
+
+        // The backend resolves by stable ID and may refresh the readable name if
+        // the OS renamed the same device between enumeration and selection.
+        await refreshSettings();
+      } catch (error) {
+        if (settings) {
+          set({
+            settings: { ...settings, selected_microphone: originalValue },
+          });
+        }
+        throw error;
+      } finally {
+        setUpdating("selected_microphone", false);
       }
     },
 

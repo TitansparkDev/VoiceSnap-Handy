@@ -21,6 +21,7 @@ interface UseSettingsReturn {
   resetSetting: (key: keyof Settings) => Promise<void>;
   refreshSettings: () => Promise<void>;
   refreshAudioDevices: () => Promise<void>;
+  selectMicrophone: (device: AudioDevice) => Promise<void>;
   refreshOutputDevices: () => Promise<void>;
 
   // Binding-specific actions
@@ -67,7 +68,8 @@ export const useSettings = (): UseSettingsReturn => {
     resetSetting: store.resetSetting,
     refreshSettings: store.refreshSettings,
     refreshAudioDevices: store.refreshAudioDevices,
-    refreshOutputDevices: store.refreshOutputDevices,
+    selectMicrophone: store.selectMicrophone,
+    refreshOutputDevices: store.refreshOutputDevices;
     updateBinding: store.updateBinding,
     resetBinding: store.resetBinding,
     getSetting: store.getSetting,

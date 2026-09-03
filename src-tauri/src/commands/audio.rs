@@ -37,8 +37,33 @@ pub fn check_custom_sounds(app: AppHandle) -> CustomSounds {
 #[derive(Serialize, Deserialize, Debug, Clone, Type)]
 pub struct AudioDevice {
     pub index: String,
+    pub stable_id: Option<String>,
     pub name: String,
     pub is_default: bool,
+}
+
+fn resolve_input_device_selection(
+    device_name: &str,
+    requested_stable_id: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    let mut devices = list_input_devices()
+        .map_err(|e| format!("Failed to list audio devices: {e}"))?
+        .into_iter();
+
+    let device = match requested_stable_id {
+        Some(stable_id) => devices.find(|device| device.stable_id.as_deref() == Some(stable_id)),
+        None => devices.find(|device| device.name == device_name),
+    }
+    .ok_or_else(|| {
+        let identity = requested_stable_id
+            .map(|id| format!(" (id {id})"))
+            .unwrap_or_default();
+        format!(
+            "No input device found: requested microphone '{device_name}'{identity} is unavailable"
+        )
+    })?;
+
+    Ok((device.name, device.stable_id))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type)]
@@ -196,12 +221,14 @@ pub async fn get_available_microphones() -> Result<Vec<AudioDevice>, String> {
 
         let mut result = vec![AudioDevice {
             index: "default".to_string(),
+            stable_id: None,
             name: "Default".to_string(),
             is_default: true,
         }];
 
         result.extend(devices.into_iter().map(|d| AudioDevice {
             index: d.index,
+            stable_id: d.stable_id,
             name: d.name,
             is_default: false, // The explicit default is handled separately
         }));
@@ -214,18 +241,37 @@ pub async fn get_available_microphones() -> Result<Vec<AudioDevice>, String> {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn set_selected_microphone(app: AppHandle, device_name: String) -> Result<(), String> {
-    let mut settings = get_settings(&app);
-    settings.selected_microphone = if device_name == "default" {
-        None
+pub async fn set_selected_microphone(
+    app: AppHandle,
+    device_name: String,
+    device_id: Option<String>,
+) -> Result<(), String> {
+    // Capture the exact stable identity while the selected device is known to be
+    // present. Enumeration can stall, so keep it off the webview/main run loop.
+    // Legacy callers without an ID retain strict readable-name resolution.
+    let (selected_microphone, selected_microphone_id) = if device_name == "default" {
+        (None, None)
     } else {
-        Some(device_name)
+        let requested_name = device_name.clone();
+        let requested_id = device_id.clone();
+        let (resolved_name, stable_id) = tokio::task::spawn_blocking(move || {
+            resolve_input_device_selection(&requested_name, requested_id.as_deref())
+        })
+        .await
+        .map_err(|e| format!("audio task join failed: {e}"))??;
+        (Some(resolved_name), stable_id)
     };
+
+    let mut settings = get_settings(&app);
+    settings.selected_microphone = selected_microphone;
+    settings.selected_microphone_id = selected_microphone_id;
     write_settings(&app, settings);
 
     // Update the audio manager to use the new device. update_selected_device
     // can restart the cpal stream (blocking CoreAudio) — run it on a blocking
-    // thread, not inline on the webview/main run loop.
+    // thread, not inline on the webview/main run loop. If reopening fails after
+    // the device disappears, keep the requested name+identity persisted so a
+    // later recovery retries it instead of silently selecting the default.
     let rm = app.state::<Arc<AudioRecordingManager>>().inner().clone();
     tokio::task::spawn_blocking(move || rm.update_selected_device())
         .await
@@ -252,12 +298,14 @@ pub async fn get_available_output_devices() -> Result<Vec<AudioDevice>, String> 
 
         let mut result = vec![AudioDevice {
             index: "default".to_string(),
+            stable_id: None,
             name: "Default".to_string(),
             is_default: true,
         }];
 
         result.extend(devices.into_iter().map(|d| AudioDevice {
             index: d.index,
+            stable_id: d.stable_id,
             name: d.name,
             is_default: false, // The explicit default is handled separately
         }));
@@ -306,13 +354,22 @@ pub async fn play_test_sound(app: AppHandle, sound_type: String) {
 
 #[tauri::command]
 #[specta::specta]
-pub fn set_clamshell_microphone(app: AppHandle, device_name: String) -> Result<(), String> {
-    let mut settings = get_settings(&app);
-    settings.clamshell_microphone = if device_name == "default" {
-        None
+pub async fn set_clamshell_microphone(app: AppHandle, device_name: String) -> Result<(), String> {
+    let (clamshell_microphone, clamshell_microphone_id) = if device_name == "default" {
+        (None, None)
     } else {
-        Some(device_name)
+        let requested_name = device_name.clone();
+        let (resolved_name, stable_id) = tokio::task::spawn_blocking(move || {
+            resolve_input_device_selection(&requested_name, None)
+        })
+        .await
+        .map_err(|e| format!("audio task join failed: {e}"))??;
+        (Some(resolved_name), stable_id)
     };
+
+    let mut settings = get_settings(&app);
+    settings.clamshell_microphone = clamshell_microphone;
+    settings.clamshell_microphone_id = clamshell_microphone_id;
     write_settings(&app, settings);
     Ok(())
 }
