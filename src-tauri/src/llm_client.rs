@@ -1,4 +1,5 @@
-use crate::settings::PostProcessProvider;
+use crate::settings::{PostProcessProvider, LOCAL_CLEANUP_PROVIDER_ID};
+use futures_util::StreamExt;
 use log::{debug, error, info};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,13 @@ use std::sync::{Mutex, OnceLock};
 /// room for long dictations while preventing a local model from wandering into
 /// lengthy explanations or reasoning when an endpoint ignores prompt guidance.
 const POST_PROCESS_MAX_OUTPUT_TOKENS: u32 = 2048;
+/// Hard cap on a successful chat-completion response body. `max_tokens` is a
+/// request hint that a buggy or non-conforming local runtime can ignore; this
+/// keeps the client from accepting or buffering an unbounded cleanup response.
+const POST_PROCESS_MAX_RESPONSE_BYTES: usize = 128 * 1024;
+/// Local cleanup is latency-sensitive and must fail open instead of pinning the
+/// transcription pipeline behind an unhealthy resident runtime.
+const LOCAL_CLEANUP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Debug, Serialize)]
 struct ChatMessage {
@@ -182,8 +190,13 @@ fn build_headers(provider: &PostProcessProvider, api_key: &str) -> Result<Header
 /// Create an HTTP client with provider-specific headers
 fn create_client(provider: &PostProcessProvider, api_key: &str) -> Result<reqwest::Client, String> {
     let headers = build_headers(provider, api_key)?;
-    reqwest::Client::builder()
-        .default_headers(headers)
+    let mut builder = reqwest::Client::builder().default_headers(headers);
+    if provider.id == LOCAL_CLEANUP_PROVIDER_ID {
+        builder = builder
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(LOCAL_CLEANUP_REQUEST_TIMEOUT);
+    }
+    builder
         .build()
         .map_err(|e| report_reqwest_error("Failed to build HTTP client", &e))
 }
@@ -269,6 +282,41 @@ fn sanitized_url_for_log(url: &str) -> String {
         .unwrap_or_else(|_| "<invalid URL>".to_string())
 }
 
+async fn read_bounded_completion_response(
+    response: reqwest::Response,
+) -> Result<ChatCompletionResponse, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > POST_PROCESS_MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(format!(
+            "Cleanup response exceeded the {} byte limit",
+            POST_PROCESS_MAX_RESPONSE_BYTES
+        ));
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| report_reqwest_error("Failed to read API response", &e))?;
+        if body.len().saturating_add(chunk.len()) > POST_PROCESS_MAX_RESPONSE_BYTES {
+            return Err(format!(
+                "Cleanup response exceeded the {} byte limit",
+                POST_PROCESS_MAX_RESPONSE_BYTES
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&body).map_err(|e| {
+        // Do not quote the response body in the error: a malformed local server
+        // response may contain transcript text.
+        let details = format!("Failed to parse API response as JSON: {e}");
+        error!("{}", details);
+        details
+    })
+}
+
 fn report_reqwest_error(context: &str, error: &reqwest::Error) -> String {
     let kinds = reqwest_error_kinds(error);
     let url = error
@@ -342,6 +390,11 @@ pub async fn send_chat_completion_with_schema(
     json_schema: Option<Value>,
     disable_reasoning: bool,
 ) -> Result<Option<String>, String> {
+    // For the dedicated local provider this acquires one supervised resident
+    // runtime lease. Any early-return error or cancellation drops the unfinished
+    // lease, which kills/reaps the managed child; successful requests keep it
+    // warm for the next utterance.
+    let runtime_lease = crate::local_cleanup_runtime::acquire(provider).await?;
     let base_url = provider.base_url.trim_end_matches('/');
     let url = format!("{}/chat/completions", base_url);
 
@@ -418,10 +471,19 @@ pub async fn send_chat_completion_with_schema(
         let error_text = response.text().await.unwrap_or_else(|e| {
             report_reqwest_error("Failed to read reasoning rejection response", &e)
         });
-        info!(
-            "Endpoint rejected request with reasoning disabled (status {}): {}. Retrying without reasoning fields",
-            status, error_text
-        );
+        if provider.id == LOCAL_CLEANUP_PROVIDER_ID {
+            // A local runtime error body may echo the prompt/transcript. Keep it
+            // out of diagnostics while still retrying the compatibility path.
+            info!(
+                "Local cleanup endpoint rejected reasoning-disable fields (status {}). Retrying without them",
+                status
+            );
+        } else {
+            info!(
+                "Endpoint rejected request with reasoning disabled (status {}): {}. Retrying without reasoning fields",
+                status, error_text
+            );
+        }
 
         request_body.reasoning = ReasoningParams::default();
         response = client
@@ -448,6 +510,9 @@ pub async fn send_chat_completion_with_schema(
     }
 
     if !status.is_success() {
+        if provider.id == LOCAL_CLEANUP_PROVIDER_ID {
+            return Err(format!("Local cleanup request failed with status {status}"));
+        }
         let error_text = response
             .text()
             .await
@@ -458,15 +523,15 @@ pub async fn send_chat_completion_with_schema(
         ));
     }
 
-    let completion: ChatCompletionResponse = response
-        .json()
-        .await
-        .map_err(|e| report_reqwest_error("Failed to parse API response", &e))?;
-
-    Ok(completion
+    let completion = read_bounded_completion_response(response).await?;
+    let content = completion
         .choices
         .first()
-        .and_then(|choice| choice.message.content.clone()))
+        .and_then(|choice| choice.message.content.clone());
+    if let Some(lease) = runtime_lease {
+        lease.complete();
+    }
+    Ok(content)
 }
 
 /// Fetch available models from an OpenAI-compatible API
@@ -475,6 +540,10 @@ pub async fn fetch_models(
     provider: &PostProcessProvider,
     api_key: String,
 ) -> Result<Vec<String>, String> {
+    // Listing models is also a legitimate first touch of the local provider, so
+    // it shares the same resident supervisor rather than requiring an unmanaged
+    // server to have been started out-of-band.
+    let runtime_lease = crate::local_cleanup_runtime::acquire(provider).await?;
     let base_url = provider.base_url.trim_end_matches('/');
     let url = format!("{}/models", base_url);
 
@@ -496,6 +565,11 @@ pub async fn fetch_models(
         sanitized_url(response.url())
     );
     if !status.is_success() {
+        if provider.id == LOCAL_CLEANUP_PROVIDER_ID {
+            return Err(format!(
+                "Local cleanup model list failed with status {status}"
+            ));
+        }
         let error_text = response
             .text()
             .await
@@ -532,6 +606,9 @@ pub async fn fetch_models(
         }
     }
 
+    if let Some(lease) = runtime_lease {
+        lease.complete();
+    }
     Ok(models)
 }
 
@@ -681,6 +758,32 @@ mod tests {
     fn cleanup_requests_have_a_bounded_output_token_budget() {
         let json = request_json(ReasoningParams::default());
         assert_eq!(json["max_tokens"], POST_PROCESS_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn cleanup_request_schema_contains_only_text_model_and_control_fields() {
+        let json = request_json(ReasoningParams::default());
+        let object = json.as_object().unwrap();
+        assert_eq!(json["messages"][0]["content"], "hi");
+        assert!(object.get("audio").is_none());
+        assert!(object.get("clipboard").is_none());
+        assert!(object.get("window_title").is_none());
+        assert!(object.get("application_data").is_none());
+        assert!(object.keys().all(|key| matches!(
+            key.as_str(),
+            "model" | "messages" | "stream" | "max_tokens" | "response_format"
+        )));
+    }
+
+    #[tokio::test]
+    async fn completion_response_body_is_hard_bounded() {
+        let body = "x".repeat(POST_PROCESS_MAX_RESPONSE_BYTES + 1);
+        let base_url = serve_one_response("200 OK", &body).await;
+        let response = reqwest::get(base_url).await.unwrap();
+        let error = read_bounded_completion_response(response)
+            .await
+            .unwrap_err();
+        assert!(error.contains("exceeded"));
     }
 
     #[test]

@@ -7,7 +7,10 @@ use crate::managers::history::HistoryManager;
 use crate::managers::model::{EngineType, ModelManager};
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::TranscriptionManager;
-use crate::settings::{get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID};
+use crate::settings::{
+    get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID,
+    LOCAL_CLEANUP_PROVIDER_ID,
+};
 use crate::shortcut;
 use crate::tray::{set_tray_state, TrayIconState};
 use crate::utils::{
@@ -69,6 +72,9 @@ const TRANSCRIPTION_FIELD: &str = "transcription";
 /// transcript is cleaned, but they must not relax the shape or safety of the
 /// returned text.
 const CLEANUP_OUTPUT_CONTRACT: &str = "Return only the cleaned transcription text. Do not add explanations, surrounding quotes, markdown/code fences, JSON/XML wrappers, or invented content.";
+/// A second hard bound after the HTTP response cap. This constrains the actual
+/// text field even when a server pads the JSON envelope or ignores max_tokens.
+const CLEANUP_MAX_OUTPUT_CHARS: usize = 16 * 1024;
 
 /// Strip invisible Unicode characters that some LLMs may insert
 fn strip_invisible_chars(s: &str) -> String {
@@ -112,7 +118,7 @@ fn build_legacy_prompt(prompt_template: &str, transcription: &str) -> String {
 fn normalize_cleanup_output(output: &str) -> Option<String> {
     let output = strip_invisible_chars(strip_think_block(output));
     let output = output.trim();
-    if output.is_empty() {
+    if output.is_empty() || output.chars().count() > CLEANUP_MAX_OUTPUT_CHARS {
         return None;
     }
 
@@ -120,11 +126,45 @@ fn normalize_cleanup_output(output: &str) -> Option<String> {
     let quoted = (output.starts_with('"') && output.ends_with('"'))
         || (output.starts_with('\'') && output.ends_with('\''))
         || (output.starts_with('`') && output.ends_with('`'));
-    if fenced || quoted {
+    if fenced || quoted || looks_like_cleanup_wrapper(output) {
         return None;
     }
 
     Some(output.to_string())
+}
+
+fn looks_like_cleanup_wrapper(output: &str) -> bool {
+    // Legacy endpoints sometimes ignore the text-only instruction and return a
+    // JSON object/array. Reject the wrapper rather than opportunistically mining
+    // a field out of it; structured providers have their own exact schema path.
+    if serde_json::from_str::<serde_json::Value>(output)
+        .ok()
+        .is_some_and(|value| value.is_object() || value.is_array())
+    {
+        return true;
+    }
+
+    let lower = output.to_ascii_lowercase();
+    for tag in [
+        "transcription",
+        "output",
+        "response",
+        "result",
+        "cleaned_text",
+    ] {
+        if lower.starts_with(&format!("<{tag}>")) && lower.ends_with(&format!("</{tag}>")) {
+            return true;
+        }
+    }
+
+    [
+        "cleaned transcription:",
+        "cleaned text:",
+        "here is the cleaned transcription:",
+        "here's the cleaned transcription:",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
 }
 
 fn parse_structured_cleanup_output(content: &str) -> Option<String> {
@@ -255,7 +295,10 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
     // Ask these providers to skip reasoning/thinking — post-processing rarely
     // benefits from it and it adds seconds of latency. llm_client picks the
     // field the endpoint understands and retries without it if rejected.
-    let disable_reasoning = matches!(provider.id.as_str(), "custom" | "openrouter");
+    let disable_reasoning = matches!(
+        provider.id.as_str(),
+        "custom" | "openrouter" | LOCAL_CLEANUP_PROVIDER_ID
+    );
 
     if provider.supports_structured_output {
         debug!("Using structured outputs for provider '{}'", provider.id);
@@ -462,6 +505,19 @@ pub(crate) struct ProcessedTranscription {
     pub cleanup_mode: String,
 }
 
+/// Apply cleanup as an explicitly fail-open transform. Every cleanup runtime
+/// failure is represented as `None`; this helper makes the preservation rule
+/// testable without a Tauri AppHandle or a live model server.
+fn apply_cleanup_fail_open(
+    raw_text: &str,
+    cleaned_text: Option<String>,
+) -> (String, Option<String>) {
+    match cleaned_text {
+        Some(cleaned) => (cleaned.clone(), Some(cleaned)),
+        None => (raw_text.to_string(), None),
+    }
+}
+
 /// Describe the cleanup path requested for a history row without persisting
 /// transcript content or provider secrets. Provider-backed cleanup remains
 /// distinguishable until the dedicated fast/local cleanup modes are added.
@@ -565,10 +621,11 @@ pub(crate) async fn process_transcription_output(
     }
 
     if post_process {
-        if let Some(processed_text) = post_process_transcription(&settings, &final_text).await {
-            post_processed_text = Some(processed_text.clone());
-            final_text = processed_text;
+        let cleanup_input = final_text.clone();
+        let cleanup_result = post_process_transcription(&settings, &cleanup_input).await;
+        (final_text, post_processed_text) = apply_cleanup_fail_open(&cleanup_input, cleanup_result);
 
+        if post_processed_text.is_some() {
             if let Some(prompt_id) = &settings.post_process_selected_prompt_id {
                 if let Some(prompt) = settings
                     .post_process_prompts
@@ -1154,10 +1211,11 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 #[cfg(test)]
 mod tests {
     use super::{
-        build_legacy_prompt, build_system_prompt, complete_unless_cancelled,
-        is_blank_transcription, normalize_cleanup_output, parse_structured_cleanup_output,
-        resolve_history_cleanup_mode, resolve_history_compute_plan, resolve_stream_or_batch,
-        should_use_streaming_overlay, strip_think_block, CLEANUP_OUTPUT_CONTRACT,
+        apply_cleanup_fail_open, build_legacy_prompt, build_system_prompt,
+        complete_unless_cancelled, is_blank_transcription, normalize_cleanup_output,
+        parse_structured_cleanup_output, resolve_history_cleanup_mode,
+        resolve_history_compute_plan, resolve_stream_or_batch, should_use_streaming_overlay,
+        strip_think_block, CLEANUP_MAX_OUTPUT_CHARS, CLEANUP_OUTPUT_CONTRACT,
     };
     use crate::settings::{AppSettings, OverlayStyle};
     use std::cell::Cell;
@@ -1313,6 +1371,46 @@ mod tests {
         assert_eq!(normalize_cleanup_output("\"Cleaned text.\""), None);
         assert_eq!(normalize_cleanup_output("'Cleaned text.'"), None);
         assert_eq!(normalize_cleanup_output("`Cleaned text.`"), None);
+        assert_eq!(
+            normalize_cleanup_output(r#"{"transcription":"Cleaned text."}"#),
+            None
+        );
+        assert_eq!(
+            normalize_cleanup_output("<transcription>Cleaned text.</transcription>"),
+            None
+        );
+        assert_eq!(
+            normalize_cleanup_output("Here is the cleaned transcription: Cleaned text."),
+            None
+        );
+    }
+
+    #[test]
+    fn cleanup_output_rejects_text_beyond_the_hard_bound() {
+        let oversized = "x".repeat(CLEANUP_MAX_OUTPUT_CHARS + 1);
+        assert_eq!(normalize_cleanup_output(&oversized), None);
+    }
+
+    #[test]
+    fn cleanup_failures_and_malformed_output_preserve_raw_text() {
+        let raw = "raw transcript stays available";
+        assert_eq!(apply_cleanup_fail_open(raw, None), (raw.to_string(), None));
+        assert_eq!(
+            apply_cleanup_fail_open(
+                raw,
+                normalize_cleanup_output(r#"{"transcription":"wrapped"}"#)
+            ),
+            (raw.to_string(), None)
+        );
+    }
+
+    #[test]
+    fn valid_cleanup_replaces_raw_text_without_losing_history_value() {
+        let cleaned = "Cleaned transcript.".to_string();
+        assert_eq!(
+            apply_cleanup_fail_open("raw transcript", Some(cleaned.clone())),
+            (cleaned.clone(), Some(cleaned))
+        );
     }
 
     #[test]
