@@ -7,6 +7,7 @@ import {
   extractModelPath,
   normalizeCleanupOutput,
   parseArgs,
+  parseCandidateProfileSpec,
   parseCandidateSpec,
   percentile,
   replaceModelPath,
@@ -20,8 +21,32 @@ test("candidate specs separate reporting labels from local asset paths", () => {
   assert.deepEqual(candidateIdentity(candidate), {
     candidate: "qwen3-1.7b",
     model_asset: "qwen.gguf",
+    prompt_profile: "generic-v1",
   });
   assert.equal(JSON.stringify(candidateIdentity(candidate)).includes(candidate.modelPath), false);
+});
+
+test("candidate prompt profiles are explicit and validated", () => {
+  assert.deepEqual(parseCandidateProfileSpec("s1-mini=s1-mini-v1"), {
+    label: "s1-mini",
+    profile: "s1-mini-v1",
+  });
+  assert.throws(() => parseCandidateProfileSpec("s1-mini=unknown"), /Unsupported cleanup prompt profile/);
+
+  const options = parseArgs(
+    [
+      "--candidate",
+      "s1-mini=./s1.gguf",
+      "--candidate-profile",
+      "s1-mini=s1-mini-v1",
+    ],
+    {},
+  );
+  assert.equal(options.candidates[0].profile, "s1-mini-v1");
+  assert.throws(
+    () => parseArgs(["--candidate", "qwen=./q.gguf", "--candidate-profile", "missing=s1-mini-v1"], {}),
+    /unknown candidate/,
+  );
 });
 
 test("configured model path is extracted from common llama.cpp argument forms", () => {
@@ -72,6 +97,42 @@ test("nearest-rank percentiles stay deterministic for small benchmark samples", 
   assert.equal(percentile([40, 10, 30, 20], 50), 20);
   assert.equal(percentile([40, 10, 30, 20], 95), 40);
   assert.equal(percentile([], 50), null);
+});
+
+test("s1-mini profile uses its trained control contract and greedy decoding", async (t) => {
+  let body;
+  const server = createServer((request, response) => {
+    if (request.url !== "/v1/chat/completions") {
+      response.statusCode = 404;
+      response.end();
+      return;
+    }
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(chunk));
+    request.on("end", () => {
+      body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ choices: [{ message: { content: "Clean text." } }] }));
+    });
+  });
+  await new Promise((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise));
+  t.after(() => server.close());
+  const address = server.address();
+  const fixture = { id: "local", input: "clean text", accepted: ["Clean text."] };
+  const result = await runFixture(
+    `http://127.0.0.1:${address.port}/v1`,
+    "loaded-model",
+    fixture,
+    1_000,
+    "s1-mini-v1",
+  );
+
+  assert.equal(result.correct, true);
+  assert.equal(body.temperature, 0);
+  assert.deepEqual(body.chat_template_kwargs, { enable_thinking: false });
+  assert.equal(body.reasoning_effort, undefined);
+  assert.match(body.messages[0].content, /^You are a text normalizer/);
+  assert.match(body.messages[1].content, /^\[Styling: semi-formal\] \[Structure: prose\] \[Context: general\]\nclean text$/);
 });
 
 test("fixture execution measures loopback cleanup without persisting output text", async (t) => {
