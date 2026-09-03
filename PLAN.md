@@ -444,8 +444,7 @@ Deliverables:
 - Record saved preference, recommended plan, and actual runtime backend/device
   separately. — done 2026-09-03
 - If GPU startup fails or becomes unhealthy, downgrade for the current run only;
-  do not rewrite the user's saved preference. — startup fallback done 2026-09-03;
-  runtime-health downgrade remains.
+  do not rewrite the user's saved preference. — startup and runtime-health fallback done 2026-09-03.
 - Keep CPU fallback healthy on systems with no Vulkan runtime.
 - Add selected-device diagnostics and a user-facing recovery explanation.
 - Audit selected microphone persistence and recovery. An automatic stream repair
