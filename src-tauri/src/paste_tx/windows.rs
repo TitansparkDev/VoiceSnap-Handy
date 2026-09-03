@@ -22,7 +22,7 @@ use log::{error, info, warn};
 use tauri::Manager;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    SetLastError, ERROR_SUCCESS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
+    SetLastError, ERROR_SUCCESS, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
 
@@ -81,6 +81,35 @@ impl Drop for OleGuard {
 struct SavedFormat {
     format: u32,
     data: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotMediumKind {
+    HGlobal,
+    GdiBitmap,
+    Skip,
+}
+
+/// Clipboard formats are typed by storage medium, not by HANDLE shape. Keep the
+/// safe set deliberately narrow: flat HGLOBAL data can be byte-copied, and a
+/// CF_BITMAP returned as TYMED_GDI can be duplicated with CopyImage. Metafiles,
+/// palettes, owner-display and display-only formats have different ownership /
+/// lifetime rules and are intentionally left to the current clipboard owner.
+fn snapshot_medium_kind(format: u32) -> SnapshotMediumKind {
+    if format == CF_BITMAP.0 as u32 {
+        SnapshotMediumKind::GdiBitmap
+    } else if format == CF_ENHMETAFILE.0 as u32
+        || format == CF_DSPENHMETAFILE.0 as u32
+        || format == CF_DSPBITMAP.0 as u32
+        || format == CF_DSPMETAFILEPICT.0 as u32
+        || format == CF_DSPTEXT.0 as u32
+        || format == CF_OWNERDISPLAY.0 as u32
+        || format == CF_PALETTE.0 as u32
+    {
+        SnapshotMediumKind::Skip
+    } else {
+        SnapshotMediumKind::HGlobal
+    }
 }
 
 pub(super) struct WinTxShared {
@@ -408,6 +437,20 @@ unsafe fn restore_snapshot_if_current(shared: &WinTxShared, expected_sequence: u
     true
 }
 
+unsafe fn copy_hglobal_bytes(hg: HGLOBAL) -> Option<Vec<u8>> {
+    let size = GlobalSize(hg);
+    if size == 0 || size > MAX_FORMAT_BYTES {
+        return None;
+    }
+    let ptr = GlobalLock(hg) as *const u8;
+    if ptr.is_null() {
+        return None;
+    }
+    let copied = std::slice::from_raw_parts(ptr, size).to_vec();
+    let _ = GlobalUnlock(hg);
+    Some(copied)
+}
+
 unsafe fn copy_hglobal_medium(data_object: &IDataObject, format: u32) -> Option<Vec<u8>> {
     let request = FORMATETC {
         cfFormat: format as u16,
@@ -418,20 +461,7 @@ unsafe fn copy_hglobal_medium(data_object: &IDataObject, format: u32) -> Option<
     };
     let mut medium = data_object.GetData(&request).ok()?;
     let data = if medium.tymed == TYMED_HGLOBAL.0 {
-        let hg = medium.u.hGlobal;
-        let size = GlobalSize(hg);
-        if size == 0 || size > MAX_FORMAT_BYTES {
-            None
-        } else {
-            let ptr = GlobalLock(hg) as *const u8;
-            if ptr.is_null() {
-                None
-            } else {
-                let copied = std::slice::from_raw_parts(ptr, size).to_vec();
-                let _ = GlobalUnlock(hg);
-                Some(copied)
-            }
-        }
+        copy_hglobal_bytes(medium.u.hGlobal)
     } else {
         None
     };
@@ -487,26 +517,20 @@ unsafe fn snapshot_clipboard(hwnd: HWND, shared: &WinTxShared) -> Result<u32, St
     let data_object = OleGetClipboard().map_err(|e| format!("OleGetClipboard failed: {e}"))?;
     let mut formats = Vec::new();
     for format in available_formats {
-        if format == CF_BITMAP.0 as u32 {
-            if let Some(copy) = copy_bitmap_medium(&data_object) {
-                if let Ok(mut slot) = shared.saved_bitmap.lock() {
-                    *slot = Some(copy);
+        match snapshot_medium_kind(format) {
+            SnapshotMediumKind::GdiBitmap => {
+                if let Some(copy) = copy_bitmap_medium(&data_object) {
+                    if let Ok(mut slot) = shared.saved_bitmap.lock() {
+                        *slot = Some(copy);
+                    }
                 }
             }
-            continue;
-        }
-        if format == CF_ENHMETAFILE.0 as u32
-            || format == CF_DSPENHMETAFILE.0 as u32
-            || format == CF_DSPBITMAP.0 as u32
-            || format == CF_DSPMETAFILEPICT.0 as u32
-            || format == CF_DSPTEXT.0 as u32
-            || format == CF_OWNERDISPLAY.0 as u32
-            || format == CF_PALETTE.0 as u32
-        {
-            continue;
-        }
-        if let Some(data) = copy_hglobal_medium(&data_object, format) {
-            formats.push(SavedFormat { format, data });
+            SnapshotMediumKind::HGlobal => {
+                if let Some(data) = copy_hglobal_medium(&data_object, format) {
+                    formats.push(SavedFormat { format, data });
+                }
+            }
+            SnapshotMediumKind::Skip => {}
         }
     }
 
@@ -845,6 +869,7 @@ mod tests {
 
     struct HarnessTx {
         snapshot: String,
+        transcript: String,
         published_sequence: u32,
         state: TxState,
     }
@@ -852,27 +877,33 @@ mod tests {
     impl HarnessTx {
         fn publish(clipboard: &mut HarnessClipboard, transcript: String) -> Self {
             let snapshot = clipboard.contents.clone();
-            clipboard.replace(transcript);
+            clipboard.replace(transcript.clone());
             let mut state = TxState::new();
             state.injected_at = Some(Instant::now());
             Self {
                 snapshot,
+                transcript,
                 published_sequence: clipboard.sequence,
                 state,
             }
         }
 
-        fn settle(&mut self, clipboard: &mut HarnessClipboard) -> bool {
+        fn settle(&mut self, clipboard: &mut HarnessClipboard, preserve_transcript: bool) -> bool {
             self.state.cancelled = true;
             assert!(
                 self.state.claim_settlement(),
                 "transaction settlement leaked or was claimed twice"
             );
-            let can_restore = may_restore(&self.state, self.published_sequence, clipboard.sequence);
-            if can_restore {
-                clipboard.replace(self.snapshot.clone());
+            let can_settle = may_restore(&self.state, self.published_sequence, clipboard.sequence);
+            if can_settle {
+                let contents = if preserve_transcript {
+                    self.transcript.clone()
+                } else {
+                    self.snapshot.clone()
+                };
+                clipboard.replace(contents);
             }
-            can_restore
+            can_settle
         }
     }
 
@@ -891,7 +922,7 @@ mod tests {
                 "paste publication was lost on cycle {cycle}"
             );
             assert!(
-                tx.settle(&mut clipboard),
+                tx.settle(&mut clipboard, false),
                 "restore ownership lost on cycle {cycle}"
             );
             assert_eq!(
@@ -915,7 +946,7 @@ mod tests {
             let newer = format!("newer-owner-{cycle}");
             clipboard.replace(newer.clone());
             assert!(
-                !raced.settle(&mut clipboard),
+                !raced.settle(&mut clipboard, false),
                 "ownership clobber was not detected on cycle {cycle}"
             );
             assert_eq!(
@@ -930,11 +961,134 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_medium_policy_covers_safe_representative_formats() {
+        // Clipboard format ids below 0xC000 are fixed Win32 ids. HTML, RTF and
+        // custom application formats are registered dynamically in the
+        // 0xC000..=0xFFFF range; their storage medium is determined through
+        // IDataObject::GetData rather than inferred from the numeric id.
+        const CF_HDROP_ID: u32 = 15;
+        const REGISTERED_HTML: u32 = 0xC001;
+        const REGISTERED_RTF: u32 = 0xC002;
+        const REGISTERED_CUSTOM: u32 = 0xC003;
+
+        for format in [
+            CF_UNICODETEXT.0 as u32,
+            CF_HDROP_ID,
+            REGISTERED_HTML,
+            REGISTERED_RTF,
+            REGISTERED_CUSTOM,
+        ] {
+            assert_eq!(
+                snapshot_medium_kind(format),
+                SnapshotMediumKind::HGlobal,
+                "safe flat format {format:#x} must be requested as TYMED_HGLOBAL"
+            );
+        }
+        assert_eq!(
+            snapshot_medium_kind(CF_BITMAP.0 as u32),
+            SnapshotMediumKind::GdiBitmap
+        );
+        assert_eq!(
+            snapshot_medium_kind(CF_ENHMETAFILE.0 as u32),
+            SnapshotMediumKind::Skip
+        );
+        assert_eq!(
+            snapshot_medium_kind(CF_PALETTE.0 as u32),
+            SnapshotMediumKind::Skip
+        );
+    }
+
+    #[test]
+    fn hglobal_materialization_copies_storage_bytes() {
+        let payload = b"Handy clipboard materialization fixture\0";
+        unsafe {
+            let hg = GlobalAlloc(GMEM_MOVEABLE, payload.len()).expect("allocate test HGLOBAL");
+            let ptr = GlobalLock(hg) as *mut u8;
+            assert!(!ptr.is_null(), "lock test HGLOBAL");
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), ptr, payload.len());
+            let _ = GlobalUnlock(hg);
+
+            assert_eq!(
+                copy_hglobal_bytes(hg).as_deref(),
+                Some(payload.as_slice()),
+                "materialization must copy the complete STGMEDIUM HGLOBAL payload"
+            );
+            let _ = GlobalFree(Some(hg));
+        }
+    }
+
+    #[test]
+    fn normal_transaction_restores_prior_clipboard_unless_preservation_is_requested() {
+        let mut clipboard = HarnessClipboard::new("prior clipboard");
+
+        let mut normal = HarnessTx::publish(&mut clipboard, "normal transcript".to_string());
+        assert!(normal.settle(&mut clipboard, false));
+        assert_eq!(clipboard.contents, "prior clipboard");
+
+        let mut preserve = HarnessTx::publish(&mut clipboard, "kept transcript".to_string());
+        assert!(preserve.settle(&mut clipboard, true));
+        assert_eq!(clipboard.contents, "kept transcript");
+
+        let mut raced = HarnessTx::publish(&mut clipboard, "raced transcript".to_string());
+        clipboard.replace("newer owner");
+        assert!(!raced.settle(&mut clipboard, false));
+        assert_eq!(clipboard.contents, "newer owner");
+    }
+
+    #[test]
+    fn format_preservation_bookkeeping_stays_below_normal_paste_regression_budget() {
+        const CYCLES: u32 = 20_000;
+        const MAX_ADDED_PER_TRANSACTION: std::time::Duration =
+            std::time::Duration::from_micros(500);
+
+        let representative = [
+            (CF_UNICODETEXT.0 as u32, vec![0_u8; 64]),
+            (15_u32, vec![1_u8; 128]),
+            (0xC001_u32, vec![2_u8; 256]),
+            (0xC002_u32, vec![3_u8; 256]),
+            (0xC003_u32, vec![4_u8; 128]),
+        ];
+
+        // Baseline models the pre-audit transaction bookkeeping: snapshot one
+        // text payload, publish, then restore. The rich path adds representative
+        // safe formats and the STGMEDIUM classification. This intentionally does
+        // not time SendInput or the receipt quiet-period because those are
+        // unchanged by this audit.
+        let baseline_start = Instant::now();
+        for _ in 0..CYCLES {
+            let original = std::hint::black_box(vec![0_u8; 64]);
+            let published = std::hint::black_box(vec![9_u8; 64]);
+            std::hint::black_box(published);
+            std::hint::black_box(original);
+        }
+        let baseline = baseline_start.elapsed();
+
+        let rich_start = Instant::now();
+        for _ in 0..CYCLES {
+            let snapshot: Vec<_> = representative
+                .iter()
+                .filter(|(format, _)| snapshot_medium_kind(*format) == SnapshotMediumKind::HGlobal)
+                .map(|(format, data)| (*format, data.clone()))
+                .collect();
+            let published = std::hint::black_box(vec![9_u8; 64]);
+            std::hint::black_box(published);
+            std::hint::black_box(snapshot);
+        }
+        let rich = rich_start.elapsed();
+        let added = rich.saturating_sub(baseline) / CYCLES;
+
+        assert!(
+            added <= MAX_ADDED_PER_TRANSACTION,
+            "format-preservation bookkeeping added {added:?} per transaction; budget is {MAX_ADDED_PER_TRANSACTION:?}"
+        );
+    }
+
+    #[test]
     fn uipi_failure_preserves_newer_clipboard_owner_and_is_actionable() {
         let mut clipboard = HarnessClipboard::new("original");
         let mut tx = HarnessTx::publish(&mut clipboard, "transcript".to_string());
         tx.state.injection_failed = true;
-        assert!(tx.settle(&mut clipboard));
+        assert!(tx.settle(&mut clipboard, false));
         assert_eq!(
             clipboard.contents, "original",
             "UIPI fallback lost the original clipboard"
@@ -946,7 +1100,7 @@ mod tests {
         // Simulate the user/app copying something after Handy published but
         // before the UIPI failure is handled. The newer owner must win.
         clipboard.replace("newer-owner");
-        assert!(!raced.settle(&mut clipboard));
+        assert!(!raced.settle(&mut clipboard, false));
         assert_eq!(
             clipboard.contents, "newer-owner",
             "newer clipboard owner was clobbered"
