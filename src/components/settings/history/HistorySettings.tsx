@@ -65,43 +65,70 @@ export const HistorySettings: React.FC = () => {
   const [entries, setEntries] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [hasMore, setHasMore] = useState(true);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchTerm, setSearchTerm] = useState("");
   const sentinelRef = useRef<HTMLDivElement>(null);
   const entriesRef = useRef<HistoryEntry[]>([]);
   const loadingRef = useRef(false);
+  const requestGenerationRef = useRef(0);
 
   // Keep ref in sync for use in IntersectionObserver callback
   useEffect(() => {
     entriesRef.current = entries;
   }, [entries]);
 
-  const loadPage = useCallback(async (cursor?: number) => {
-    const isFirstPage = cursor === undefined;
-    if (!isFirstPage && loadingRef.current) return;
-    loadingRef.current = true;
+  const loadPage = useCallback(
+    async (cursor?: number) => {
+      const isFirstPage = cursor === undefined;
+      if (!isFirstPage && loadingRef.current) return;
 
-    if (isFirstPage) setLoading(true);
+      const generation = isFirstPage
+        ? ++requestGenerationRef.current
+        : requestGenerationRef.current;
+      loadingRef.current = true;
 
-    try {
-      const result = await commands.getHistoryEntries(
-        cursor ?? null,
-        PAGE_SIZE,
-      );
-      if (result.status === "ok") {
+      if (isFirstPage) setLoading(true);
+
+      try {
+        const result = await commands.getHistoryEntries(
+          cursor ?? null,
+          PAGE_SIZE,
+          searchTerm || null,
+        );
+        if (generation !== requestGenerationRef.current) {
+          return;
+        }
+        if (result.status !== "ok") {
+          throw new Error(String(result.error));
+        }
+
         const { entries: newEntries, has_more } = result.data;
         setEntries((prev) =>
           isFirstPage ? newEntries : [...prev, ...newEntries],
         );
         setHasMore(has_more);
+      } catch (error) {
+        if (generation === requestGenerationRef.current) {
+          console.error("Failed to load history entries:", error);
+        }
+      } finally {
+        if (generation === requestGenerationRef.current) {
+          setLoading(false);
+          loadingRef.current = false;
+        }
       }
-    } catch (error) {
-      console.error("Failed to load history entries:", error);
-    } finally {
-      setLoading(false);
-      loadingRef.current = false;
-    }
-  }, []);
+    },
+    [searchTerm],
+  );
 
-  // Initial load
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setSearchTerm(searchQuery.trim());
+    }, 200);
+    return () => window.clearTimeout(timer);
+  }, [searchQuery]);
+
+  // Initial load and full reload when the debounced search changes.
   useEffect(() => {
     loadPage();
   }, [loadPage]);
@@ -130,16 +157,22 @@ export const HistorySettings: React.FC = () => {
     return () => observer.disconnect();
   }, [loading, hasMore, loadPage]);
 
-  // Listen for new entries added from the transcription pipeline
+  // Listen for new entries added from the transcription pipeline.
   useEffect(() => {
     const unlisten = events.historyUpdatePayload.listen((event) => {
       const payload: HistoryUpdatePayload = event.payload;
-      if (payload.action === "added") {
-        setEntries((prev) => [payload.entry, ...prev]);
-      } else if (payload.action === "updated") {
-        setEntries((prev) =>
-          prev.map((e) => (e.id === payload.entry.id ? payload.entry : e)),
-        );
+      if (payload.action === "added" || payload.action === "updated") {
+        if (searchTerm) {
+          // Re-run the server-side filter so unrelated live updates never leak
+          // into an active search result set.
+          void loadPage();
+        } else if (payload.action === "added") {
+          setEntries((prev) => [payload.entry, ...prev]);
+        } else {
+          setEntries((prev) =>
+            prev.map((e) => (e.id === payload.entry.id ? payload.entry : e)),
+          );
+        }
       }
       // "deleted" and "toggled" are handled by optimistic updates only,
       // so we intentionally ignore them here to avoid double-mutation.
@@ -148,7 +181,7 @@ export const HistorySettings: React.FC = () => {
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, []);
+  }, [loadPage, searchTerm]);
 
   const toggleSaved = async (id: number) => {
     // Optimistic update
@@ -245,7 +278,11 @@ export const HistorySettings: React.FC = () => {
   } else if (entries.length === 0) {
     content = (
       <div className="px-4 py-3 text-center text-text/60">
-        {t("settings.history.empty")}
+        {searchTerm
+          ? t("settings.history.noSearchResults", {
+              defaultValue: "No matching history entries.",
+            })
+          : t("settings.history.empty")}
       </div>
     );
   } else {
@@ -275,11 +312,20 @@ export const HistorySettings: React.FC = () => {
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">
       <div className="space-y-2">
-        <div className="px-4 flex items-center justify-between">
-          <div>
+        <div className="px-4 flex items-center justify-between gap-3">
+          <div className="min-w-0 flex-1">
             <h2 className="text-xs font-medium text-mid-gray uppercase tracking-wide">
               {t("settings.history.title")}
             </h2>
+            <input
+              type="search"
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder={t("settings.history.search", {
+                defaultValue: "Search history...",
+              })}
+              className="mt-2 w-full rounded-md border border-mid-gray/20 bg-background px-3 py-1.5 text-sm text-text outline-none transition-colors placeholder:text-text/35 focus:border-logo-primary/60"
+            />
           </div>
           <OpenRecordingsButton
             onClick={openRecordingsFolder}

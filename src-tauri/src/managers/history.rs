@@ -451,50 +451,42 @@ impl HistoryManager {
         &self,
         cursor: Option<i64>,
         limit: Option<usize>,
+        search: Option<&str>,
     ) -> Result<PaginatedHistory> {
         let conn = self.get_connection()?;
-        let limit = limit.map(|l| l.min(100));
+        Self::get_history_entries_with_conn(&conn, cursor, limit, search)
+    }
 
-        let mut entries: Vec<HistoryEntry> = match (cursor, limit) {
-            (Some(cursor_id), Some(lim)) => {
-                let fetch_count = (lim + 1) as i64;
-                let mut stmt = conn.prepare(
-                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
-                     FROM transcription_history
-                     WHERE id < ?1
-                     ORDER BY id DESC
-                     LIMIT ?2",
-                )?;
-                let result = stmt
-                    .query_map(params![cursor_id, fetch_count], Self::map_history_entry)?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                result
-            }
-            (None, Some(lim)) => {
-                let fetch_count = (lim + 1) as i64;
-                let mut stmt = conn.prepare(
-                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
-                     FROM transcription_history
-                     ORDER BY id DESC
-                     LIMIT ?1",
-                )?;
-                let result = stmt
-                    .query_map(params![fetch_count], Self::map_history_entry)?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                result
-            }
-            (_, None) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
-                     FROM transcription_history
-                     ORDER BY id DESC",
-                )?;
-                let result = stmt
-                    .query_map([], Self::map_history_entry)?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                result
-            }
-        };
+    fn get_history_entries_with_conn(
+        conn: &Connection,
+        cursor: Option<i64>,
+        limit: Option<usize>,
+        search: Option<&str>,
+    ) -> Result<PaginatedHistory> {
+        let limit = limit.map(|l| l.min(100));
+        let fetch_count = limit
+            .map(|lim| lim.saturating_add(1) as i64)
+            .unwrap_or(i64::MAX);
+        let search_pattern = Self::history_search_pattern(search);
+
+        let mut stmt = conn.prepare(
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+             FROM transcription_history
+             WHERE (?1 IS NULL OR id < ?1)
+               AND (
+                    ?2 IS NULL
+                    OR transcription_text LIKE ?2 ESCAPE '\\'
+                    OR COALESCE(post_processed_text, '') LIKE ?2 ESCAPE '\\'
+               )
+             ORDER BY id DESC
+             LIMIT ?3",
+        )?;
+        let mut entries = stmt
+            .query_map(
+                params![cursor, search_pattern, fetch_count],
+                Self::map_history_entry,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let has_more = limit.is_some_and(|lim| entries.len() > lim);
         if has_more {
@@ -502,6 +494,22 @@ impl HistoryManager {
         }
 
         Ok(PaginatedHistory { entries, has_more })
+    }
+
+    fn history_search_pattern(search: Option<&str>) -> Option<String> {
+        let search = search?.trim();
+        if search.is_empty() {
+            return None;
+        }
+
+        let mut escaped = String::with_capacity(search.len());
+        for ch in search.chars() {
+            if matches!(ch, '\\' | '%' | '_') {
+                escaped.push('\\');
+            }
+            escaped.push(ch);
+        }
+        Some(format!("%{escaped}%"))
     }
 
     #[cfg(test)]
@@ -733,5 +741,51 @@ mod tests {
 
         assert_eq!(entry.timestamp, 100);
         assert_eq!(entry.transcription_text, "completed");
+    }
+
+    #[test]
+    fn history_search_matches_raw_and_final_text_case_insensitively() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "Alpha raw phrase", None);
+        insert_entry(&conn, 200, "different raw", Some("Polished Beta phrase"));
+        insert_entry(&conn, 300, "unrelated", None);
+
+        let raw =
+            HistoryManager::get_history_entries_with_conn(&conn, None, Some(10), Some("alpha"))
+                .expect("search raw text");
+        assert_eq!(raw.entries.len(), 1);
+        assert_eq!(raw.entries[0].timestamp, 100);
+
+        let final_text =
+            HistoryManager::get_history_entries_with_conn(&conn, None, Some(10), Some("BETA"))
+                .expect("search final text");
+        assert_eq!(final_text.entries.len(), 1);
+        assert_eq!(final_text.entries[0].timestamp, 200);
+    }
+
+    #[test]
+    fn history_search_preserves_literal_wildcards_and_cursor_pagination() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "needle 100% first", None);
+        insert_entry(&conn, 200, "needle 100% second", None);
+        insert_entry(&conn, 300, "needle 100 percent unrelated", None);
+
+        let first_page =
+            HistoryManager::get_history_entries_with_conn(&conn, None, Some(1), Some("100%"))
+                .expect("first search page");
+        assert_eq!(first_page.entries.len(), 1);
+        assert_eq!(first_page.entries[0].timestamp, 200);
+        assert!(first_page.has_more);
+
+        let second_page = HistoryManager::get_history_entries_with_conn(
+            &conn,
+            Some(first_page.entries[0].id),
+            Some(1),
+            Some("100%"),
+        )
+        .expect("second search page");
+        assert_eq!(second_page.entries.len(), 1);
+        assert_eq!(second_page.entries[0].timestamp, 100);
+        assert!(!second_page.has_more);
     }
 }
