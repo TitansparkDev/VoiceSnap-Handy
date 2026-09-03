@@ -134,6 +134,14 @@ pub(crate) enum WaitDecision {
     Finish,
 }
 
+/// Restoration is permitted only while the clipboard still represents this
+/// transaction. Cancellation itself does not forbid restoration — a newer Handy
+/// transaction deliberately cancels and settles the previous one — but any
+/// ownership-loss event or sequence change means a newer owner wins.
+pub(crate) fn may_restore(state: &TxState, published_sequence: u32, current_sequence: u32) -> bool {
+    !state.ownership_lost && published_sequence == current_sequence
+}
+
 /// Pure decision: given the current transaction state, keep waiting for the
 /// target to read, or finish now. Both platform event loops call this.
 pub(crate) fn evaluate(state: &TxState, now: Instant) -> WaitDecision {
@@ -190,6 +198,11 @@ pub(crate) fn send_chord(
 /// the caller should fall back to the legacy paste path. On `Ok`, publishing
 /// and chord injection have completed and the guarded restore (plus
 /// auto-submit) finishes asynchronously.
+#[cfg(target_os = "windows")]
+pub(crate) fn shutdown_pending() {
+    windows::shutdown_pending();
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn try_reliable_paste(
     text: &str,
@@ -279,5 +292,56 @@ mod tests {
         let mut s = state_after_publish(Duration::from_millis(10));
         s.ownership_lost = true;
         assert!(matches!(evaluate(&s, Instant::now()), WaitDecision::Finish));
+    }
+
+    #[test]
+    fn app_exit_or_explicit_cancellation_finishes_immediately() {
+        let mut s = state_after_publish(Duration::from_millis(10));
+        s.cancelled = true;
+        assert!(matches!(evaluate(&s, Instant::now()), WaitDecision::Finish));
+    }
+
+    #[test]
+    fn newer_clipboard_sequence_always_wins() {
+        let s = state_after_publish(Duration::from_millis(10));
+        assert!(may_restore(&s, 41, 41));
+        assert!(!may_restore(&s, 41, 42));
+
+        let mut ownership_lost = s;
+        ownership_lost.ownership_lost = true;
+        assert!(!may_restore(&ownership_lost, 41, 41));
+    }
+
+    #[test]
+    fn delayed_render_and_clipboard_manager_races_survive_thousand_cycles() {
+        for _ in 0..1_000 {
+            let now = Instant::now();
+            let mut s = TxState::new();
+            s.published_at = now - Duration::from_millis(500);
+
+            // An eager clipboard manager can request the delayed format as soon
+            // as it is advertised. That pre-injection receipt must not settle
+            // the transaction or authorize auto-submit.
+            s.record_receipt(now - Duration::from_millis(300));
+            s.injected_at = Some(now - Duration::from_millis(200));
+            assert!(!s.any_receipt_after_injection());
+            assert!(matches!(evaluate(&s, now), WaitDecision::KeepWaiting));
+
+            // The target's delayed-render read after the paste chord is the real
+            // receipt. Keep waiting through the quiet period, then settle.
+            let target_read = now - Duration::from_millis(100);
+            s.record_receipt(target_read);
+            assert!(s.any_receipt_after_injection());
+            assert!(matches!(
+                evaluate(&s, target_read + QUIET_PERIOD - Duration::from_millis(1)),
+                WaitDecision::KeepWaiting
+            ));
+            assert!(matches!(
+                evaluate(&s, target_read + QUIET_PERIOD),
+                WaitDecision::Finish
+            ));
+            assert!(may_restore(&s, 7, 7));
+            assert!(!may_restore(&s, 7, 8));
+        }
     }
 }
