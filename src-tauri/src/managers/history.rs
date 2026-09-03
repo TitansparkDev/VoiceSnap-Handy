@@ -337,6 +337,57 @@ impl HistoryManager {
         Ok(entry)
     }
 
+    pub fn update_cleanup(
+        &self,
+        id: i64,
+        post_processed_text: String,
+        post_process_prompt: Option<String>,
+    ) -> Result<HistoryEntry> {
+        let conn = self.get_connection()?;
+        let entry =
+            Self::update_cleanup_with_conn(&conn, id, post_processed_text, post_process_prompt)?;
+
+        debug!("Updated cleanup for history entry {}", id);
+
+        if let Err(e) = (HistoryUpdatePayload::Updated {
+            entry: entry.clone(),
+        })
+        .emit(&self.app_handle)
+        {
+            error!("Failed to emit history-updated event: {}", e);
+        }
+
+        Ok(entry)
+    }
+
+    fn update_cleanup_with_conn(
+        conn: &Connection,
+        id: i64,
+        post_processed_text: String,
+        post_process_prompt: Option<String>,
+    ) -> Result<HistoryEntry> {
+        let updated = conn.execute(
+            "UPDATE transcription_history
+             SET post_processed_text = ?1,
+                 post_process_prompt = ?2,
+                 post_process_requested = 1
+             WHERE id = ?3",
+            params![post_processed_text, post_process_prompt, id],
+        )?;
+
+        if updated == 0 {
+            return Err(anyhow!("History entry {} not found", id));
+        }
+
+        conn.query_row(
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id
+             FROM transcription_history WHERE id = ?1",
+            params![id],
+            Self::map_history_entry,
+        )
+        .map_err(Into::into)
+    }
+
     pub fn cleanup_old_entries(&self) -> Result<()> {
         let retention_period = crate::settings::get_recording_retention_period(&self.app_handle);
 
@@ -881,6 +932,42 @@ mod tests {
 
         assert_eq!(entry.timestamp, 100);
         assert_eq!(entry.transcription_text, "completed");
+    }
+
+    #[test]
+    fn retry_cleanup_updates_only_cleanup_fields() {
+        let conn = setup_conn();
+        insert_entry_with_model(
+            &conn,
+            100,
+            "raw transcript",
+            Some("old cleanup"),
+            Some("whisper-large-v3-turbo"),
+        );
+
+        let entry = HistoryManager::update_cleanup_with_conn(
+            &conn,
+            1,
+            "new cleanup".to_string(),
+            Some("new prompt".to_string()),
+        )
+        .expect("update cleanup without retranscribing");
+
+        assert_eq!(entry.transcription_text, "raw transcript");
+        assert_eq!(entry.post_processed_text.as_deref(), Some("new cleanup"));
+        assert_eq!(entry.post_process_prompt.as_deref(), Some("new prompt"));
+        assert!(entry.post_process_requested);
+        assert_eq!(entry.model_id.as_deref(), Some("whisper-large-v3-turbo"));
+    }
+
+    #[test]
+    fn retry_cleanup_rejects_missing_history_entry() {
+        let conn = setup_conn();
+        let error =
+            HistoryManager::update_cleanup_with_conn(&conn, 99, "new cleanup".to_string(), None)
+                .expect_err("missing history entry should fail");
+
+        assert!(error.to_string().contains("History entry 99 not found"));
     }
 
     #[test]
