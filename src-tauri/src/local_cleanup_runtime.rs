@@ -14,6 +14,22 @@ const LOCAL_RUNTIME_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 const LOCAL_RUNTIME_HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
 const LOCAL_RUNTIME_HEALTH_POLL: Duration = Duration::from_millis(100);
 
+/// Backend cleanup policy used by the Wave 1 runtime boundary. The settings/UI
+/// steward can map its persisted mode onto this type without giving `off` or
+/// deterministic `fast` cleanup any path that can warm the local model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CleanupExecutionMode {
+    Off,
+    Fast,
+    LocalAi,
+}
+
+impl CleanupExecutionMode {
+    fn requires_local_runtime(self) -> bool {
+        matches!(self, Self::LocalAi)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LaunchAttempt {
     command: String,
@@ -210,19 +226,32 @@ fn supervisor() -> &'static RuntimeSupervisor {
 /// the caller cancelled the async request) kills and reaps the managed child so
 /// abandoned inference cannot remain stranded in the background.
 pub async fn acquire(provider: &PostProcessProvider) -> Result<Option<LocalRuntimeLease>, String> {
-    if provider.id != LOCAL_CLEANUP_PROVIDER_ID {
+    acquire_for_mode(CleanupExecutionMode::LocalAi, provider).await
+}
+
+/// Acquire the resident runtime only for local-AI cleanup. Off mode is the raw
+/// deterministic transcript and Fast mode is code-only cleanup; neither may
+/// probe, launch, or warm a local model process.
+pub(crate) async fn acquire_for_mode(
+    mode: CleanupExecutionMode,
+    provider: &PostProcessProvider,
+) -> Result<Option<LocalRuntimeLease>, String> {
+    if !mode.requires_local_runtime() || provider.id != LOCAL_CLEANUP_PROVIDER_ID {
         return Ok(None);
     }
 
-    let request_guard = Arc::clone(&supervisor().request_gate).lock_owned().await;
-    supervisor().ensure_ready(provider).await?;
+    let runtime = supervisor();
+    let request_guard = Arc::clone(&runtime.request_gate).lock_owned().await;
+    runtime.ensure_ready(provider).await?;
     Ok(Some(LocalRuntimeLease {
+        supervisor: runtime,
         _request_guard: request_guard,
         finished: false,
     }))
 }
 
 pub struct LocalRuntimeLease {
+    supervisor: &'static RuntimeSupervisor,
     _request_guard: OwnedMutexGuard<()>,
     finished: bool,
 }
@@ -244,7 +273,8 @@ impl Drop for LocalRuntimeLease {
         // HTTP response, and panics unwinding through the request future. A local
         // cleanup failure is fail-open at the caller, while the abandoned child is
         // never left doing work that nobody will consume.
-        supervisor().stop_child("cleanup request ended before successful completion");
+        self.supervisor
+            .stop_child("cleanup request ended before successful completion");
     }
 }
 
@@ -418,6 +448,28 @@ fn derive_llama_cpu_args(primary: &[String]) -> Option<Vec<String>> {
 mod tests {
     use super::*;
     use std::thread;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve_health_checks(count: usize) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind health fixture");
+        let address = listener.local_addr().expect("health fixture address");
+        let handle = tokio::spawn(async move {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().await.expect("accept health check");
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await.expect("read health check");
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}",
+                    )
+                    .await
+                    .expect("write health response");
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
 
     const TEST_CHILD_MODE_ENV: &str = "HANDY_LOCAL_CLEANUP_TEST_CHILD_MODE";
 
@@ -451,6 +503,108 @@ mod tests {
             Ok("exit") => {}
             _ => {}
         }
+    }
+
+    #[test]
+    fn cleanup_modes_warm_runtime_only_for_local_ai() {
+        assert!(!CleanupExecutionMode::Off.requires_local_runtime());
+        assert!(!CleanupExecutionMode::Fast.requires_local_runtime());
+        assert!(CleanupExecutionMode::LocalAi.requires_local_runtime());
+    }
+
+    #[tokio::test]
+    async fn off_and_fast_modes_do_not_probe_or_launch_local_runtime() {
+        // This endpoint is deliberately unreachable. Returning successfully for
+        // Off/Fast proves mode gating happens before health checks or configured
+        // process discovery.
+        let provider = test_provider("http://127.0.0.1:1");
+        assert!(acquire_for_mode(CleanupExecutionMode::Off, &provider)
+            .await
+            .expect("off mode")
+            .is_none());
+        assert!(acquire_for_mode(CleanupExecutionMode::Fast, &provider)
+            .await
+            .expect("fast mode")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn healthy_resident_runtime_is_reused_across_cleanup_requests() {
+        let (base_url, server) = serve_health_checks(2).await;
+        let provider = test_provider(&base_url);
+        let runtime = RuntimeSupervisor::new();
+        let child = spawn_fixture_child("wait");
+        let original_pid = child.id();
+        runtime.lock_state().child = Some(ManagedChild {
+            child,
+            label: "test-resident",
+            generation: 42,
+        });
+
+        runtime
+            .ensure_ready(&provider)
+            .await
+            .expect("first request ready");
+        let first_pid = runtime
+            .lock_state()
+            .child
+            .as_ref()
+            .expect("resident child retained")
+            .child
+            .id();
+        runtime
+            .ensure_ready(&provider)
+            .await
+            .expect("second request ready");
+        let second_pid = runtime
+            .lock_state()
+            .child
+            .as_ref()
+            .expect("resident child reused")
+            .child
+            .id();
+
+        assert_eq!(first_pid, original_pid);
+        assert_eq!(second_pid, original_pid);
+        runtime.stop_child("resident reuse test complete");
+        server.await.expect("health fixture completed");
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_lease_kills_child_and_allows_clean_recovery() {
+        let runtime: &'static RuntimeSupervisor = Box::leak(Box::new(RuntimeSupervisor::new()));
+        runtime.lock_state().child = Some(ManagedChild {
+            child: spawn_fixture_child("wait"),
+            label: "cancelled-request",
+            generation: 51,
+        });
+        let request_guard = Arc::clone(&runtime.request_gate).lock_owned().await;
+        let cancelled_lease = LocalRuntimeLease {
+            supervisor: runtime,
+            _request_guard: request_guard,
+            finished: false,
+        };
+
+        drop(cancelled_lease);
+        assert!(runtime.lock_state().child.is_none());
+
+        // The supervisor remains reusable after cancellation; a later request
+        // can own a fresh child rather than inheriting abandoned inference.
+        runtime.lock_state().child = Some(ManagedChild {
+            child: spawn_fixture_child("wait"),
+            label: "recovered-request",
+            generation: 52,
+        });
+        assert_eq!(
+            runtime
+                .lock_state()
+                .child
+                .as_ref()
+                .expect("replacement child")
+                .generation,
+            52
+        );
+        runtime.stop_child("cancellation recovery test complete");
     }
 
     #[test]
