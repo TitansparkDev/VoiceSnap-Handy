@@ -204,6 +204,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     );
     let history_manager =
         Arc::new(HistoryManager::new(app_handle).expect("Failed to initialize history manager"));
+    let recording_media_controller = managers::media::system_recording_media_controller();
 
     // Initialize the transcribe-cpp native backend (logging + backend module
     // registration) once, before any whisper model is loaded.
@@ -217,6 +218,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     app_handle.manage(model_manager.clone());
     app_handle.manage(transcription_manager.clone());
     app_handle.manage(history_manager.clone());
+    app_handle.manage(recording_media_controller);
     app_handle.manage(tray::TrayState::new());
 
     // Note: Shortcuts are NOT initialized here.
@@ -690,6 +692,7 @@ pub fn run(cli_args: CliArgs) {
             shortcut::suspend_all_bindings,
             shortcut::resume_all_bindings,
             shortcut::change_mute_while_recording_setting,
+            shortcut::change_pause_media_while_recording_setting,
             shortcut::change_append_trailing_space_setting,
             shortcut::change_lazy_stream_close_setting,
             shortcut::change_vad_enabled_setting,

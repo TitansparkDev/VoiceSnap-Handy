@@ -158,6 +158,7 @@ objc2-service-management = "0.3.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
+zbus = "5.13.2"
 gtk = "0.18"
 libc = "0.2"
 transcribe-cpp = { version = "0.2.0", default-features = false, features = [
