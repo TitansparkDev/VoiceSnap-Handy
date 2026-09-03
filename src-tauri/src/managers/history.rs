@@ -864,6 +864,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("search raw text");
         assert_eq!(raw.entries.len(), 1);
@@ -874,6 +875,7 @@ mod tests {
             None,
             Some(10),
             Some("BETA"),
+            None,
             None,
             None,
             None,
@@ -898,6 +900,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("first search page");
         assert_eq!(first_page.entries.len(), 1);
@@ -909,6 +912,7 @@ mod tests {
             Some(first_page.entries[0].id),
             Some(1),
             Some("100%"),
+            None,
             None,
             None,
             None,
@@ -934,6 +938,7 @@ mod tests {
             Some(200),
             Some(300),
             None,
+            None,
         )
         .expect("filter history by date range");
 
@@ -955,6 +960,7 @@ mod tests {
             Some("target"),
             Some(150),
             Some(250),
+            None,
             None,
         )
         .expect("combine search and date range");
@@ -997,6 +1003,7 @@ mod tests {
             None,
             None,
             Some("parakeet-tdt-0.6b-v3"),
+            None,
         )
         .expect("filter history by model");
 
@@ -1006,5 +1013,71 @@ mod tests {
             filtered.entries[0].model_id.as_deref(),
             Some("parakeet-tdt-0.6b-v3")
         );
+    }
+
+    #[test]
+    fn history_outcome_filter_distinguishes_success_and_failure() {
+        let conn = setup_conn();
+        insert_entry_with_model(
+            &conn,
+            100,
+            "successful parakeet",
+            None,
+            Some("parakeet-tdt-0.6b-v3"),
+        );
+        insert_entry_with_model(&conn, 200, "", None, Some("parakeet-tdt-0.6b-v3"));
+        insert_entry_with_model(
+            &conn,
+            300,
+            "successful whisper",
+            None,
+            Some("whisper-large-v3-turbo"),
+        );
+
+        let successful = HistoryManager::get_history_entries_with_conn(
+            &conn,
+            None,
+            Some(10),
+            None,
+            None,
+            None,
+            Some("parakeet-tdt-0.6b-v3"),
+            Some("success"),
+        )
+        .expect("filter successful history");
+        assert_eq!(successful.entries.len(), 1);
+        assert_eq!(successful.entries[0].timestamp, 100);
+
+        let failed = HistoryManager::get_history_entries_with_conn(
+            &conn,
+            None,
+            Some(10),
+            None,
+            None,
+            None,
+            Some("parakeet-tdt-0.6b-v3"),
+            Some("failure"),
+        )
+        .expect("filter failed history");
+        assert_eq!(failed.entries.len(), 1);
+        assert_eq!(failed.entries[0].timestamp, 200);
+    }
+
+    #[test]
+    fn history_outcome_filter_rejects_unknown_values() {
+        let conn = setup_conn();
+        let error = HistoryManager::get_history_entries_with_conn(
+            &conn,
+            None,
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+            Some("unknown"),
+        )
+        .expect_err("reject unknown history outcome filter");
+
+        assert!(error.to_string().contains("Invalid history outcome filter"));
     }
 }
