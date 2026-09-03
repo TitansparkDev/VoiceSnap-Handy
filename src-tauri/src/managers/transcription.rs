@@ -70,6 +70,18 @@ fn terminate_live_insertion_state(
     clear_live_insertion_state(active, blocked_after_clear);
 }
 
+fn clear_terminal_live_insertion_state(
+    active: &mut Option<LiveInsertionLedger>,
+    blocked_after_clear: &AtomicBool,
+) {
+    if active
+        .as_ref()
+        .is_some_and(|ledger| ledger.stop_reason().is_some())
+    {
+        clear_live_insertion_state(active, blocked_after_clear);
+    }
+}
+
 fn live_insertion_state_blocks_final_paste(
     active: Option<&LiveInsertionLedger>,
     blocked_after_clear: bool,
@@ -1051,16 +1063,18 @@ impl TranscriptionManager {
         event: &StreamTextEvent,
     ) -> Option<LiveInsertionAttempt> {
         let current_target = crate::paste_tx::capture_target_identity();
-        self.live_insertion
-            .lock()
-            .unwrap()
-            .as_mut()
-            .and_then(|ledger| {
-                ledger.observe_committed(
-                    event.committed_for_live_insertion(),
-                    current_target.as_ref(),
-                )
-            })
+        let mut guard = self.live_insertion.lock().unwrap();
+        let attempt = guard.as_mut().and_then(|ledger| {
+            ledger.observe_committed(
+                event.committed_for_live_insertion(),
+                current_target.as_ref(),
+            )
+        });
+        clear_terminal_live_insertion_state(
+            &mut guard,
+            self.live_insertion_blocks_final_paste_after_clear.as_ref(),
+        );
+        attempt
     }
 
     /// Positive speech evidence is supplied separately from model text. This is
@@ -1076,7 +1090,12 @@ impl TranscriptionManager {
             return None;
         }
         let current_target = crate::paste_tx::capture_target_identity();
-        ledger.observe_speech_evidence(current_target.as_ref())
+        let attempt = ledger.observe_speech_evidence(current_target.as_ref());
+        clear_terminal_live_insertion_state(
+            &mut guard,
+            self.live_insertion_blocks_final_paste_after_clear.as_ref(),
+        );
+        attempt
     }
 
     /// Called by the recorder after the active VAD policy admits a speech frame.
@@ -1093,11 +1112,15 @@ impl TranscriptionManager {
         sequence: u64,
         outcome: LiveInsertionOutcome,
     ) -> bool {
-        self.live_insertion
-            .lock()
-            .unwrap()
+        let mut guard = self.live_insertion.lock().unwrap();
+        let recorded = guard
             .as_mut()
-            .is_some_and(|ledger| ledger.record_attempt_result(sequence, outcome))
+            .is_some_and(|ledger| ledger.record_attempt_result(sequence, outcome));
+        clear_terminal_live_insertion_state(
+            &mut guard,
+            self.live_insertion_blocks_final_paste_after_clear.as_ref(),
+        );
+        recorded
     }
 
     /// Ask the live ledger for at most the still-uncommitted final raw tail.
@@ -1107,11 +1130,15 @@ impl TranscriptionManager {
         final_text: &str,
     ) -> Option<LiveInsertionAttempt> {
         let current_target = crate::paste_tx::capture_target_identity();
-        self.live_insertion
-            .lock()
-            .unwrap()
+        let mut guard = self.live_insertion.lock().unwrap();
+        let attempt = guard
             .as_mut()
-            .and_then(|ledger| ledger.finalize(final_text, current_target.as_ref()))
+            .and_then(|ledger| ledger.finalize(final_text, current_target.as_ref()));
+        clear_terminal_live_insertion_state(
+            &mut guard,
+            self.live_insertion_blocks_final_paste_after_clear.as_ref(),
+        );
+        attempt
     }
 
     pub(crate) fn cancel_live_insertion(&self) {
@@ -2943,6 +2970,23 @@ mod tests {
         ));
 
         terminate_live_insertion_state(&mut active, &blocked_after_clear);
+
+        assert!(active.is_none());
+        assert!(blocked_after_clear.load(Ordering::Acquire));
+        assert!(live_insertion_state_blocks_final_paste(
+            active.as_ref(),
+            blocked_after_clear.load(Ordering::Acquire)
+        ));
+    }
+
+    #[test]
+    fn terminal_focus_loss_clears_active_live_session_and_keeps_repaste_blocked() {
+        let blocked_after_clear = AtomicBool::new(false);
+        let mut ledger = LiveInsertionLedger::new(InsertionMode::LiveCommittedExperimental, None);
+        ledger.observe_speech_evidence(None);
+        let mut active = Some(ledger);
+
+        clear_terminal_live_insertion_state(&mut active, &blocked_after_clear);
 
         assert!(active.is_none());
         assert!(blocked_after_clear.load(Ordering::Acquire));
