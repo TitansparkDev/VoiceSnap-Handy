@@ -559,13 +559,17 @@ impl TranscriptionManager {
                     None => {
                         let settings = get_settings(&self.app_handle);
                         let accelerator = settings.transcribe_accelerator;
-                        let device = resolve_gpu_device(
+                        let mut device = resolve_gpu_device(
                             accelerator,
                             settings.transcribe_gpu_device.as_deref(),
                         );
+                        if device.is_none() && accelerator != TranscribeAcceleratorSetting::Cpu {
+                            device = preferred_discrete_transcribe_device();
+                        }
                         // Backend::Auto accepts an exact GPU device. Without a
-                        // valid exact device, backend selection handles the
-                        // retired generic GPU state and host CPU guard.
+                        // usable discrete candidate (or a valid saved exact
+                        // device), backend selection keeps the existing Auto/CPU
+                        // fallback semantics.
                         let backend = if device.is_some() {
                             Backend::Auto
                         } else {
@@ -2026,6 +2030,25 @@ fn transcribe_device_label(device: &transcribe_cpp::Device) -> String {
     }
 }
 
+/// Pick an exact discrete GPU for automatic transcribe-cpp selection when one
+/// is registered. DeviceType is backend-provided runtime truth: `Gpu` is a
+/// discrete device and `Igpu` is integrated/shared-memory. If no usable
+/// discrete device exists, return `None` so the existing Backend::Auto path can
+/// keep its normal integrated/CPU fallback behavior.
+fn preferred_discrete_transcribe_device() -> Option<transcribe_cpp::Device> {
+    let devices = transcribe_compute_devices();
+    preferred_discrete_device_position(devices.iter().map(|device| &device.device_type))
+        .and_then(|position| devices.into_iter().nth(position))
+}
+
+fn preferred_discrete_device_position<'a>(
+    device_types: impl IntoIterator<Item = &'a transcribe_cpp::DeviceType>,
+) -> Option<usize> {
+    device_types
+        .into_iter()
+        .position(|device_type| matches!(device_type, transcribe_cpp::DeviceType::Gpu))
+}
+
 /// Apply the user's ORT accelerator preference to the transcribe-rs global.
 /// Called on startup and before loading a model.
 ///
@@ -2212,6 +2235,38 @@ mod tests {
         for kind in ["metal", "cuda", "vulkan", "gpu", "unknown"] {
             assert!(!transcribe_device_allowed(kind, true));
         }
+    }
+
+    #[test]
+    fn automatic_device_preference_picks_discrete_over_integrated() {
+        let device_types = [
+            transcribe_cpp::DeviceType::Igpu,
+            transcribe_cpp::DeviceType::Gpu,
+            transcribe_cpp::DeviceType::Gpu,
+        ];
+
+        assert_eq!(
+            preferred_discrete_device_position(device_types.iter()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn automatic_device_preference_preserves_fallback_without_discrete_gpu() {
+        let device_types = [
+            transcribe_cpp::DeviceType::Cpu,
+            transcribe_cpp::DeviceType::Igpu,
+            transcribe_cpp::DeviceType::Accel,
+        ];
+
+        assert_eq!(
+            preferred_discrete_device_position(device_types.iter()),
+            None
+        );
+        assert_eq!(
+            select_transcribe_backend_for_host(TranscribeAcceleratorSetting::Auto, false),
+            Backend::Auto
+        );
     }
 
     #[test]
