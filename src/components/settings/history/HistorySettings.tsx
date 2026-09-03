@@ -20,10 +20,6 @@ import {
 } from "@/bindings";
 import { useOsType } from "@/hooks/useOsType";
 import { formatDateTime } from "@/utils/dateFormat";
-import {
-  formatRecommendedRuntime,
-  getRuntimeRecoveryDiagnostic,
-} from "./runtimeDiagnostics";
 import { AudioPlayer, AudioPlayerGroup } from "../../ui/AudioPlayer";
 import { Button } from "../../ui/Button";
 
@@ -639,19 +635,6 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
       : entry.insertion_mode
     : null;
   const runtimeLabel = [entry.backend, entry.device].filter(Boolean).join(" · ") || null;
-  const recommendedRuntimeLabel = formatRecommendedRuntime(entry);
-  const runtimeRecovery = getRuntimeRecoveryDiagnostic(entry);
-  const runtimeRecoveryExplanation = runtimeRecovery
-    ? runtimeRecovery.reason === "gpu_cpu_fallback"
-      ? t("settings.history.gpuCpuFallbackExplanation", {
-          defaultValue:
-            "The selected GPU was unavailable or became unhealthy, so this dictation used CPU. Your saved GPU preference was not changed.",
-        })
-      : t("settings.history.autoCpuFallbackExplanation", {
-          defaultValue:
-            "Automatic acceleration used CPU for this dictation because no healthy GPU path was available. Your Auto preference was not changed.",
-        })
-    : null;
   const cleanupModeLabel = entry.cleanup_mode
     ? entry.cleanup_mode === "off"
       ? t("settings.history.cleanupNotRequested", {
@@ -728,19 +711,6 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
               })}
             >
               {runtimeLabel}
-            </span>
-          )}
-          {recommendedRuntimeLabel && (
-            <span
-              className="rounded bg-mid-gray/10 px-1.5 py-0.5 text-[10px] text-text/50"
-              title={t("settings.history.recommendedRuntime", {
-                defaultValue: "Recommended backend and selected device",
-              })}
-            >
-              {t("settings.history.recommendedRuntimeShort", {
-                defaultValue: "Plan: {{runtime}}",
-                runtime: recommendedRuntimeLabel,
-              })}
             </span>
           )}
           {cleanupModeLabel && (
@@ -841,12 +811,6 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
           </IconButton>
         </div>
       </div>
-
-      {runtimeRecoveryExplanation && (
-        <div className="rounded-md border border-mid-gray/20 bg-mid-gray/5 px-3 py-2 text-xs text-text/65">
-          {runtimeRecoveryExplanation}
-        </div>
-      )}
 
       {(!hasDistinctFinalText || retrying) && (
         <p
