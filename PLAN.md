@@ -331,7 +331,7 @@ started until Wave 0 and Wave 2 are complete.
 
 Deliverables:
 
-- Add `AtStop`, `PreviewOnly`, and `LiveCommittedExperimental` insertion modes.
+- Add `AtStop`, `PreviewOnly`, and `LiveCommittedExperimental` insertion modes. — done 2026-09-03
 - Capture the target window/focus identity at session start.
 - Maintain a per-session ledger:
   - committed text already inserted;
@@ -344,7 +344,7 @@ Deliverables:
 - Stop live insertion on foreground-window change, target loss, failed input,
   or clipboard ownership loss.
 - Finalize and insert the remaining tail exactly once.
-- Make the setting and warning explicit. Do not silently activate this mode.
+- Make the setting and warning explicit. Do not silently activate this mode. — done 2026-09-03
 - Keep AI cleanup disabled for live insertion sessions unless the behavior is
   preview-only.
 - Require a positive speech-evidence latch before the first live insertion. If
