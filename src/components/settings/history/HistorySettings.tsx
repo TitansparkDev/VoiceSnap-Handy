@@ -258,7 +258,7 @@ export const HistorySettings: React.FC = () => {
                 key={entry.id}
                 entry={entry}
                 onToggleSaved={() => toggleSaved(entry.id)}
-                onCopyText={() => copyToClipboard(entry.transcription_text)}
+                onCopyText={copyToClipboard}
                 getAudioUrl={getAudioUrl}
                 deleteAudio={deleteAudioEntry}
                 retryTranscription={retryHistoryEntry}
@@ -297,7 +297,7 @@ export const HistorySettings: React.FC = () => {
 interface HistoryEntryProps {
   entry: HistoryEntry;
   onToggleSaved: () => void;
-  onCopyText: () => void;
+  onCopyText: (text: string) => void;
   getAudioUrl: (fileName: string) => Promise<string | null>;
   deleteAudio: (id: number) => Promise<void>;
   retryTranscription: (id: number) => Promise<void>;
@@ -315,7 +315,11 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   const [showCopied, setShowCopied] = useState(false);
   const [retrying, setRetrying] = useState(false);
 
-  const hasTranscription = entry.transcription_text.trim().length > 0;
+  const rawText = entry.transcription_text.trim();
+  const finalText = entry.post_processed_text?.trim() ?? "";
+  const hasTranscription = rawText.length > 0;
+  const hasDistinctFinalText = finalText.length > 0 && finalText !== rawText;
+  const copyText = finalText || rawText;
 
   const handleLoadAudio = useCallback(
     () => getAudioUrl(entry.file_name),
@@ -323,11 +327,11 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   );
 
   const handleCopyText = () => {
-    if (!hasTranscription) {
+    if (!copyText) {
       return;
     }
 
-    onCopyText();
+    onCopyText(copyText);
     setShowCopied(true);
     setTimeout(() => setShowCopied(false), 2000);
   };
@@ -412,34 +416,57 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
         </div>
       </div>
 
-      <p
-        className={`italic text-sm pb-2 ${
-          retrying
-            ? ""
+      {(!hasDistinctFinalText || retrying) && (
+        <p
+          className={`italic text-sm pb-2 ${
+            retrying
+              ? ""
+              : hasTranscription
+                ? "text-text/90 select-text cursor-text whitespace-pre-wrap break-words"
+                : "text-text/40"
+          }`}
+          style={
+            retrying
+              ? { animation: "transcribe-pulse 3s ease-in-out infinite" }
+              : undefined
+          }
+        >
+          {retrying && (
+            <style>{`
+              @keyframes transcribe-pulse {
+                0%, 100% { color: color-mix(in srgb, var(--color-text) 40%, transparent); }
+                50% { color: color-mix(in srgb, var(--color-text) 90%, transparent); }
+              }
+            `}</style>
+          )}
+          {retrying
+            ? t("settings.history.transcribing")
             : hasTranscription
-              ? "text-text/90 select-text cursor-text whitespace-pre-wrap break-words"
-              : "text-text/40"
-        }`}
-        style={
-          retrying
-            ? { animation: "transcribe-pulse 3s ease-in-out infinite" }
-            : undefined
-        }
-      >
-        {retrying && (
-          <style>{`
-            @keyframes transcribe-pulse {
-              0%, 100% { color: color-mix(in srgb, var(--color-text) 40%, transparent); }
-              50% { color: color-mix(in srgb, var(--color-text) 90%, transparent); }
-            }
-          `}</style>
-        )}
-        {retrying
-          ? t("settings.history.transcribing")
-          : hasTranscription
-            ? entry.transcription_text
-            : t("settings.history.transcriptionFailed")}
-      </p>
+              ? rawText
+              : t("settings.history.transcriptionFailed")}
+        </p>
+      )}
+
+      {hasDistinctFinalText && !retrying && (
+        <div className="grid gap-2 sm:grid-cols-2">
+          <div className="rounded-md border border-mid-gray/20 bg-mid-gray/5 p-3">
+            <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-text/45">
+              {t("settings.history.rawTranscript", { defaultValue: "Raw" })}
+            </div>
+            <p className="select-text whitespace-pre-wrap break-words text-sm text-text/75">
+              {rawText}
+            </p>
+          </div>
+          <div className="rounded-md border border-logo-primary/20 bg-logo-primary/5 p-3">
+            <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-logo-primary/80">
+              {t("settings.history.finalTranscript", { defaultValue: "Final" })}
+            </div>
+            <p className="select-text whitespace-pre-wrap break-words text-sm text-text/90">
+              {finalText}
+            </p>
+          </div>
+        </div>
+      )}
 
       <AudioPlayer onLoadRequest={handleLoadAudio} className="w-full" />
     </div>
