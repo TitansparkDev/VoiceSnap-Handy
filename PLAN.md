@@ -467,23 +467,23 @@ Owner: media agent. Independent of the transcription engine.
 
 Deliverables:
 
-- Add a setting, default off.
-- On recording start, pause only if media is currently playing.
-- Resume only if this session paused it.
-- If the user manually pauses/stops media during dictation, do not resume it.
+- Add a setting, default off. — done 2026-09-03
+- On recording start, pause only if media is currently playing. — done 2026-09-03
+- Resume only if this session paused it. — done 2026-09-03
+- If the user manually pauses/stops media during dictation, do not resume it. — done 2026-09-03
 - Use a session/generation ledger so overlapping/cancelled sessions cannot resume
   the wrong state.
 - Run platform media calls off the hotkey/start path. A media service timeout or
   failure must never delay microphone capture or first partial text.
-- Keep failures non-fatal: transcription continues if media control is absent.
-- Show media action/failure in diagnostics without recording media identity.
+- Keep failures non-fatal: transcription continues if media control is absent. — done 2026-09-03
+- Show media action/failure in diagnostics without recording media identity. — done 2026-09-03
 
 Acceptance:
 
-- Playback is paused during recording when enabled.
+- Playback is paused during recording when enabled. — done 2026-09-03
 - Playback resumes after successful stop and after cancellation only when Handy
   itself paused it.
-- Existing media state is unchanged when the setting is off.
+- Existing media state is unchanged when the setting is off. — done 2026-09-03
 
 ### Wave 8 — clipboard audit and tested merge
 
