@@ -108,10 +108,13 @@ pub async fn retry_history_entry_transcription(
         return Err("Recording contains no speech".to_string());
     }
 
+    let history_settings = crate::settings::get_settings(&app);
     let model_id = transcription_manager.get_current_model().or_else(|| {
-        let selected_model = crate::settings::get_settings(&app).selected_model;
-        (!selected_model.is_empty()).then_some(selected_model)
+        (!history_settings.selected_model.is_empty())
+            .then_some(history_settings.selected_model.clone())
     });
+    let language = crate::actions::resolve_effective_language(&app, &history_settings);
+    let language = (!language.is_empty()).then_some(language);
     let processed =
         process_transcription_output(&app, &transcription, entry.post_process_requested).await;
     history_manager
@@ -121,6 +124,7 @@ pub async fn retry_history_entry_transcription(
             processed.post_processed_text,
             processed.post_process_prompt,
             model_id,
+            language,
         )
         .map(|_| ())
         .map_err(|e| e.to_string())

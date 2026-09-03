@@ -33,6 +33,7 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_requested BOOLEAN NOT NULL DEFAULT 0;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN model_id TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN duration_ms INTEGER;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN language TEXT;"),
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -67,6 +68,9 @@ pub struct HistoryEntry {
     pub post_process_prompt: Option<String>,
     pub post_process_requested: bool,
     pub model_id: Option<String>,
+    /// Effective language mode used for the transcription. `auto` means the
+    /// model was allowed to detect the language rather than a forced code.
+    pub language: Option<String>,
 }
 
 pub struct HistoryManager {
@@ -213,6 +217,7 @@ impl HistoryManager {
             post_process_prompt: row.get("post_process_prompt")?,
             post_process_requested: row.get("post_process_requested")?,
             model_id: row.get("model_id")?,
+            language: row.get("language")?,
         })
     }
 
@@ -230,6 +235,7 @@ impl HistoryManager {
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
         model_id: Option<String>,
+        language: Option<String>,
         duration_ms: i64,
     ) -> Result<HistoryEntry> {
         let timestamp = Utc::now().timestamp();
@@ -247,8 +253,9 @@ impl HistoryManager {
                 post_process_prompt,
                 post_process_requested,
                 model_id,
+                language,
                 duration_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 &file_name,
                 timestamp,
@@ -259,6 +266,7 @@ impl HistoryManager {
                 &post_process_prompt,
                 post_process_requested,
                 &model_id,
+                &language,
                 duration_ms,
             ],
         )?;
@@ -275,6 +283,7 @@ impl HistoryManager {
             post_process_prompt,
             post_process_requested,
             model_id,
+            language,
         };
 
         debug!("Saved history entry with id {}", entry.id);
@@ -301,6 +310,7 @@ impl HistoryManager {
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
         model_id: Option<String>,
+        language: Option<String>,
     ) -> Result<HistoryEntry> {
         let conn = self.get_connection()?;
         let updated = conn.execute(
@@ -308,13 +318,15 @@ impl HistoryManager {
              SET transcription_text = ?1,
                  post_processed_text = ?2,
                  post_process_prompt = ?3,
-                 model_id = ?4
-             WHERE id = ?5",
+                 model_id = ?4,
+                 language = ?5
+             WHERE id = ?6",
             params![
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
                 model_id,
+                language,
                 id
             ],
         )?;
@@ -325,7 +337,7 @@ impl HistoryManager {
 
         let entry = conn
             .query_row(
-                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, duration_ms
+                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, duration_ms, language
                  FROM transcription_history WHERE id = ?1",
                 params![id],
                 Self::map_history_entry,
@@ -387,7 +399,7 @@ impl HistoryManager {
         }
 
         conn.query_row(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, duration_ms
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, duration_ms, language
              FROM transcription_history WHERE id = ?1",
             params![id],
             Self::map_history_entry,
@@ -593,7 +605,7 @@ impl HistoryManager {
         };
 
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, duration_ms
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, duration_ms, language
              FROM transcription_history
              WHERE (?1 IS NULL OR id < ?1)
                AND (
@@ -667,7 +679,8 @@ impl HistoryManager {
                 post_process_prompt,
                 post_process_requested,
                 model_id,
-                duration_ms
+                duration_ms,
+                language
              FROM transcription_history
              ORDER BY timestamp DESC
              LIMIT 1",
@@ -696,7 +709,8 @@ impl HistoryManager {
                 post_process_prompt,
                 post_process_requested,
                 model_id,
-                duration_ms
+                duration_ms,
+                language
              FROM transcription_history
              WHERE transcription_text != ''
              ORDER BY timestamp DESC
@@ -752,7 +766,8 @@ impl HistoryManager {
                 post_process_prompt,
                 post_process_requested,
                 model_id,
-                duration_ms
+                duration_ms,
+                language
              FROM transcription_history
              WHERE id = ?1",
         )?;
@@ -823,7 +838,8 @@ mod tests {
                 post_process_prompt TEXT,
                 post_process_requested BOOLEAN NOT NULL DEFAULT 0,
                 model_id TEXT,
-                duration_ms INTEGER
+                duration_ms INTEGER,
+                language TEXT
             );",
         )
         .expect("create transcription_history table");
@@ -852,8 +868,9 @@ mod tests {
                 post_process_prompt,
                 post_process_requested,
                 model_id,
+                language,
                 duration_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 format!("handy-{}.wav", timestamp),
                 timestamp,
@@ -864,6 +881,7 @@ mod tests {
                 Option::<String>::None,
                 false,
                 model_id,
+                Option::<String>::None,
                 Option::<i64>::None,
             ],
         )
@@ -910,6 +928,7 @@ mod tests {
         assert_eq!(entry.transcription_text, "legacy text");
         assert!(entry.model_id.is_none());
         assert!(entry.duration_ms.is_none());
+        assert!(entry.language.is_none());
     }
 
     #[test]
@@ -926,6 +945,22 @@ mod tests {
             .expect("fetch timed entry")
             .expect("timed entry exists");
         assert_eq!(entry.duration_ms, Some(1_234));
+    }
+
+    #[test]
+    fn history_entry_preserves_language_metadata() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "language-tagged recording", None);
+        conn.execute(
+            "UPDATE transcription_history SET language = ?1 WHERE timestamp = ?2",
+            params!["en", 100_i64],
+        )
+        .expect("store recording language");
+
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch language-tagged entry")
+            .expect("language-tagged entry exists");
+        assert_eq!(entry.language.as_deref(), Some("en"));
     }
 
     #[test]

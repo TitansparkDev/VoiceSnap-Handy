@@ -46,7 +46,10 @@ const IconButton: React.FC<{
 
 const PAGE_SIZE = 30;
 
-const localMidnightTimestamp = (value: string, dayOffset = 0): number | null => {
+const localMidnightTimestamp = (
+  value: string,
+  dayOffset = 0,
+): number | null => {
   if (!value) return null;
 
   const [year, month, day] = value.split("-").map(Number);
@@ -448,7 +451,9 @@ export const HistorySettings: React.FC = () => {
                 className="mt-1 block w-full rounded-md border border-mid-gray/20 bg-background px-2 py-1.5 text-sm font-normal normal-case tracking-normal text-text outline-none transition-colors focus:border-logo-primary/60"
               >
                 <option value="">
-                  {t("settings.history.allModels", { defaultValue: "All models" })}
+                  {t("settings.history.allModels", {
+                    defaultValue: "All models",
+                  })}
                 </option>
                 {modelOptions.map((model) => (
                   <option key={model.id} value={model.id}>
@@ -489,10 +494,14 @@ export const HistorySettings: React.FC = () => {
                 className="mt-1 block w-full rounded-md border border-mid-gray/20 bg-background px-2 py-1.5 text-sm font-normal normal-case tracking-normal text-text outline-none transition-colors focus:border-logo-primary/60"
               >
                 <option value="">
-                  {t("settings.history.allOutcomes", { defaultValue: "All outcomes" })}
+                  {t("settings.history.allOutcomes", {
+                    defaultValue: "All outcomes",
+                  })}
                 </option>
                 <option value="success">
-                  {t("settings.history.successful", { defaultValue: "Successful" })}
+                  {t("settings.history.successful", {
+                    defaultValue: "Successful",
+                  })}
                 </option>
                 <option value="failure">
                   {t("settings.history.failed", { defaultValue: "Failed" })}
@@ -598,6 +607,11 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
 
   const formattedDate = formatDateTime(String(entry.timestamp), i18n.language);
   const formattedDuration = formatRecordingDuration(entry.duration_ms);
+  const languageLabel = entry.language
+    ? entry.language === "auto"
+      ? t("settings.general.language.auto")
+      : entry.language.toUpperCase()
+    : null;
 
   return (
     <div className="px-4 py-2 pb-5 flex flex-col gap-3">
@@ -612,6 +626,14 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
               })}
             >
               {formattedDuration}
+            </span>
+          )}
+          {languageLabel && (
+            <span
+              className="rounded bg-mid-gray/10 px-1.5 py-0.5 text-[10px] text-text/50"
+              title={t("settings.general.language.title")}
+            >
+              {languageLabel}
             </span>
           )}
         </div>
@@ -669,9 +691,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
               width={16}
               height={16}
               style={
-                cleaning
-                  ? { animation: "spin 1s linear infinite" }
-                  : undefined
+                cleaning ? { animation: "spin 1s linear infinite" } : undefined
               }
             />
           </IconButton>

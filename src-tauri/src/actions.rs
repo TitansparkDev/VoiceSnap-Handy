@@ -462,7 +462,7 @@ pub(crate) struct ProcessedTranscription {
 /// paths apply (see [`crate::managers::model::effective_language`]). Post-processing
 /// resolves it independently so it agrees with the language the transcription ran
 /// in, without threading a value through the pipeline.
-fn resolve_effective_language(app: &AppHandle, settings: &AppSettings) -> String {
+pub(crate) fn resolve_effective_language(app: &AppHandle, settings: &AppSettings) -> String {
     let tm = app.state::<Arc<TranscriptionManager>>();
     let model_manager = app.state::<Arc<ModelManager>>();
     let active_model = tm
@@ -807,10 +807,12 @@ impl ShortcutAction for TranscribeAction {
                         }
                     };
 
-                    let selected_history_model_id = {
-                        let selected_model = get_settings(&ah).selected_model;
-                        (!selected_model.is_empty()).then_some(selected_model)
-                    };
+                    let history_settings = get_settings(&ah);
+                    let selected_history_model_id = (!history_settings.selected_model.is_empty())
+                        .then_some(history_settings.selected_model.clone());
+                    let history_language = resolve_effective_language(&ah, &history_settings);
+                    let history_language =
+                        (!history_language.is_empty()).then_some(history_language);
                     let history_duration_ms =
                         i64::try_from(sample_count.saturating_mul(1000) / 16_000)
                             .unwrap_or(i64::MAX);
@@ -866,6 +868,7 @@ impl ShortcutAction for TranscribeAction {
                                     processed.post_process_prompt.clone(),
                                     tm.get_current_model()
                                         .or_else(|| selected_history_model_id.clone()),
+                                    history_language.clone(),
                                     history_duration_ms,
                                 ) {
                                     error!("Failed to save history entry: {}", err);
@@ -931,6 +934,7 @@ impl ShortcutAction for TranscribeAction {
                                     None,
                                     None,
                                     selected_history_model_id,
+                                    history_language,
                                     history_duration_ms,
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);
