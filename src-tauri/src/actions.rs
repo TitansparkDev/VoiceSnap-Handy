@@ -762,6 +762,11 @@ impl ShortcutAction for TranscribeAction {
                         }
                     };
 
+                    let selected_history_model_id = {
+                        let selected_model = get_settings(&ah).selected_model;
+                        (!selected_model.is_empty()).then_some(selected_model)
+                    };
+
                     if rm.was_cancelled_since(cancel_generation) {
                         debug!("Transcription operation cancelled before output handling");
                         utils::hide_recording_overlay(&ah);
@@ -811,6 +816,8 @@ impl ShortcutAction for TranscribeAction {
                                     post_process,
                                     processed.post_processed_text.clone(),
                                     processed.post_process_prompt.clone(),
+                                    tm.get_current_model()
+                                        .or_else(|| selected_history_model_id.clone()),
                                 ) {
                                     error!("Failed to save history entry: {}", err);
                                 }
@@ -874,6 +881,7 @@ impl ShortcutAction for TranscribeAction {
                                     post_process,
                                     None,
                                     None,
+                                    selected_history_model_id,
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);
                                 }

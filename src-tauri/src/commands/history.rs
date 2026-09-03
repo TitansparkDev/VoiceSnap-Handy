@@ -16,6 +16,7 @@ pub async fn get_history_entries(
     search: Option<String>,
     start_timestamp: Option<i64>,
     end_timestamp_exclusive: Option<i64>,
+    model_filter: Option<String>,
 ) -> Result<PaginatedHistory, String> {
     history_manager
         .get_history_entries(
@@ -24,6 +25,7 @@ pub async fn get_history_entries(
             search.as_deref(),
             start_timestamp,
             end_timestamp_exclusive,
+            model_filter.as_deref(),
         )
         .await
         .map_err(|e| e.to_string())
@@ -102,6 +104,10 @@ pub async fn retry_history_entry_transcription(
         return Err("Recording contains no speech".to_string());
     }
 
+    let model_id = transcription_manager.get_current_model().or_else(|| {
+        let selected_model = crate::settings::get_settings(&app).selected_model;
+        (!selected_model.is_empty()).then_some(selected_model)
+    });
     let processed =
         process_transcription_output(&app, &transcription, entry.post_process_requested).await;
     history_manager
@@ -110,6 +116,7 @@ pub async fn retry_history_entry_transcription(
             transcription,
             processed.post_processed_text,
             processed.post_process_prompt,
+            model_id,
         )
         .map(|_| ())
         .map_err(|e| e.to_string())

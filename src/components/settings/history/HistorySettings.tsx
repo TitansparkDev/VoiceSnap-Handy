@@ -79,6 +79,10 @@ export const HistorySettings: React.FC = () => {
   const [searchTerm, setSearchTerm] = useState("");
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
+  const [modelFilter, setModelFilter] = useState("");
+  const [modelOptions, setModelOptions] = useState<
+    Array<{ id: string; name: string }>
+  >([]);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const entriesRef = useRef<HistoryEntry[]>([]);
   const loadingRef = useRef(false);
@@ -108,6 +112,7 @@ export const HistorySettings: React.FC = () => {
           searchTerm || null,
           localMidnightTimestamp(startDate),
           localMidnightTimestamp(endDate, 1),
+          modelFilter || null,
         );
         if (generation !== requestGenerationRef.current) {
           return;
@@ -132,7 +137,7 @@ export const HistorySettings: React.FC = () => {
         }
       }
     },
-    [searchTerm, startDate, endDate],
+    [searchTerm, startDate, endDate, modelFilter],
   );
 
   useEffect(() => {
@@ -141,6 +146,18 @@ export const HistorySettings: React.FC = () => {
     }, 200);
     return () => window.clearTimeout(timer);
   }, [searchQuery]);
+
+  useEffect(() => {
+    void commands.getAvailableModels().then((result) => {
+      if (result.status === "ok") {
+        setModelOptions(
+          result.data
+            .map((model) => ({ id: model.id, name: model.name }))
+            .sort((a, b) => a.name.localeCompare(b.name)),
+        );
+      }
+    });
+  }, []);
 
   // Initial load and full reload when the debounced search changes.
   useEffect(() => {
@@ -176,9 +193,9 @@ export const HistorySettings: React.FC = () => {
     const unlisten = events.historyUpdatePayload.listen((event) => {
       const payload: HistoryUpdatePayload = event.payload;
       if (payload.action === "added" || payload.action === "updated") {
-        if (searchTerm) {
-          // Re-run the server-side filter so unrelated live updates never leak
-          // into an active search result set.
+        if (searchTerm || startDate || endDate || modelFilter) {
+          // Re-run server-side filters so unrelated live updates never leak
+          // into an active filtered result set.
           void loadPage();
         } else if (payload.action === "added") {
           setEntries((prev) => [payload.entry, ...prev]);
@@ -195,7 +212,7 @@ export const HistorySettings: React.FC = () => {
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [loadPage, searchTerm]);
+  }, [loadPage, searchTerm, startDate, endDate, modelFilter]);
 
   const toggleSaved = async (id: number) => {
     // Optimistic update
@@ -281,6 +298,10 @@ export const HistorySettings: React.FC = () => {
     }
   };
 
+  const hasActiveFilters = Boolean(
+    searchTerm || startDate || endDate || modelFilter,
+  );
+
   let content: React.ReactNode;
 
   if (loading) {
@@ -292,7 +313,7 @@ export const HistorySettings: React.FC = () => {
   } else if (entries.length === 0) {
     content = (
       <div className="px-4 py-3 text-center text-text/60">
-        {searchTerm
+        {hasActiveFilters
           ? t("settings.history.noSearchResults", {
               defaultValue: "No matching history entries.",
             })
@@ -365,6 +386,23 @@ export const HistorySettings: React.FC = () => {
                 />
               </label>
             </div>
+            <label className="mt-2 block text-[10px] font-medium uppercase tracking-wide text-text/45">
+              {t("settings.history.modelFilter", { defaultValue: "Model" })}
+              <select
+                value={modelFilter}
+                onChange={(event) => setModelFilter(event.target.value)}
+                className="mt-1 block w-full rounded-md border border-mid-gray/20 bg-background px-2 py-1.5 text-sm font-normal normal-case tracking-normal text-text outline-none transition-colors focus:border-logo-primary/60"
+              >
+                <option value="">
+                  {t("settings.history.allModels", { defaultValue: "All models" })}
+                </option>
+                {modelOptions.map((model) => (
+                  <option key={model.id} value={model.id}>
+                    {model.name}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
           <OpenRecordingsButton
             onClick={openRecordingsFolder}

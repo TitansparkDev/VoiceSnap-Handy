@@ -31,6 +31,7 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN post_processed_text TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_prompt TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_requested BOOLEAN NOT NULL DEFAULT 0;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN model_id TEXT;"),
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -63,6 +64,7 @@ pub struct HistoryEntry {
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
     pub post_process_requested: bool,
+    pub model_id: Option<String>,
 }
 
 pub struct HistoryManager {
@@ -207,6 +209,7 @@ impl HistoryManager {
             post_processed_text: row.get("post_processed_text")?,
             post_process_prompt: row.get("post_process_prompt")?,
             post_process_requested: row.get("post_process_requested")?,
+            model_id: row.get("model_id")?,
         })
     }
 
@@ -223,6 +226,7 @@ impl HistoryManager {
         post_process_requested: bool,
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
+        model_id: Option<String>,
     ) -> Result<HistoryEntry> {
         let timestamp = Utc::now().timestamp();
         let title = self.format_timestamp_title(timestamp);
@@ -237,8 +241,9 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                post_process_requested,
+                model_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 &file_name,
                 timestamp,
@@ -248,6 +253,7 @@ impl HistoryManager {
                 &post_processed_text,
                 &post_process_prompt,
                 post_process_requested,
+                &model_id,
             ],
         )?;
 
@@ -261,6 +267,7 @@ impl HistoryManager {
             post_processed_text,
             post_process_prompt,
             post_process_requested,
+            model_id,
         };
 
         debug!("Saved history entry with id {}", entry.id);
@@ -286,18 +293,21 @@ impl HistoryManager {
         transcription_text: String,
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
+        model_id: Option<String>,
     ) -> Result<HistoryEntry> {
         let conn = self.get_connection()?;
         let updated = conn.execute(
             "UPDATE transcription_history
              SET transcription_text = ?1,
                  post_processed_text = ?2,
-                 post_process_prompt = ?3
-             WHERE id = ?4",
+                 post_process_prompt = ?3,
+                 model_id = ?4
+             WHERE id = ?5",
             params![
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
+                model_id,
                 id
             ],
         )?;
@@ -308,7 +318,7 @@ impl HistoryManager {
 
         let entry = conn
             .query_row(
-                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id
                  FROM transcription_history WHERE id = ?1",
                 params![id],
                 Self::map_history_entry,
@@ -454,6 +464,7 @@ impl HistoryManager {
         search: Option<&str>,
         start_timestamp: Option<i64>,
         end_timestamp_exclusive: Option<i64>,
+        model_filter: Option<&str>,
     ) -> Result<PaginatedHistory> {
         let conn = self.get_connection()?;
         Self::get_history_entries_with_conn(
@@ -463,6 +474,7 @@ impl HistoryManager {
             search,
             start_timestamp,
             end_timestamp_exclusive,
+            model_filter,
         )
     }
 
@@ -473,6 +485,7 @@ impl HistoryManager {
         search: Option<&str>,
         start_timestamp: Option<i64>,
         end_timestamp_exclusive: Option<i64>,
+        model_filter: Option<&str>,
     ) -> Result<PaginatedHistory> {
         let limit = limit.map(|l| l.min(100));
         let fetch_count = limit
@@ -481,7 +494,7 @@ impl HistoryManager {
         let search_pattern = Self::history_search_pattern(search);
 
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id
              FROM transcription_history
              WHERE (?1 IS NULL OR id < ?1)
                AND (
@@ -491,8 +504,9 @@ impl HistoryManager {
                )
                AND (?3 IS NULL OR timestamp >= ?3)
                AND (?4 IS NULL OR timestamp < ?4)
+               AND (?5 IS NULL OR model_id = ?5)
              ORDER BY id DESC
-             LIMIT ?5",
+             LIMIT ?6",
         )?;
         let mut entries = stmt
             .query_map(
@@ -501,6 +515,7 @@ impl HistoryManager {
                     search_pattern,
                     start_timestamp,
                     end_timestamp_exclusive,
+                    model_filter,
                     fetch_count
                 ],
                 Self::map_history_entry,
@@ -543,7 +558,8 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
+                post_process_requested,
+                model_id
              FROM transcription_history
              ORDER BY timestamp DESC
              LIMIT 1",
@@ -570,7 +586,8 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
+                post_process_requested,
+                model_id
              FROM transcription_history
              WHERE transcription_text != ''
              ORDER BY timestamp DESC
@@ -624,7 +641,8 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
+                post_process_requested,
+                model_id
              FROM transcription_history
              WHERE id = ?1",
         )?;
@@ -693,7 +711,8 @@ mod tests {
                 transcription_text TEXT NOT NULL,
                 post_processed_text TEXT,
                 post_process_prompt TEXT,
-                post_process_requested BOOLEAN NOT NULL DEFAULT 0
+                post_process_requested BOOLEAN NOT NULL DEFAULT 0,
+                model_id TEXT
             );",
         )
         .expect("create transcription_history table");
@@ -701,6 +720,49 @@ mod tests {
     }
 
     fn insert_entry(conn: &Connection, timestamp: i64, text: &str, post_processed: Option<&str>) {
+        insert_entry_with_model(conn, timestamp, text, post_processed, None);
+    }
+
+    fn insert_entry_with_model(
+        conn: &Connection,
+        timestamp: i64,
+        text: &str,
+        post_processed: Option<&str>,
+        model_id: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO transcription_history (
+                file_name,
+                timestamp,
+                saved,
+                title,
+                transcription_text,
+                post_processed_text,
+                post_process_prompt,
+                post_process_requested,
+                model_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                format!("handy-{}.wav", timestamp),
+                timestamp,
+                false,
+                format!("Recording {}", timestamp),
+                text,
+                post_processed,
+                Option::<String>::None,
+                false,
+                model_id,
+            ],
+        )
+        .expect("insert history entry");
+    }
+
+    #[test]
+    fn migrations_add_model_id_without_losing_existing_history() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        Migrations::new(MIGRATIONS[..4].to_vec())
+            .to_latest(&mut conn)
+            .expect("apply pre-model history migrations");
         conn.execute(
             "INSERT INTO transcription_history (
                 file_name,
@@ -713,17 +775,27 @@ mod tests {
                 post_process_requested
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                format!("handy-{}.wav", timestamp),
-                timestamp,
+                "handy-old.wav",
+                100_i64,
                 false,
-                format!("Recording {}", timestamp),
-                text,
-                post_processed,
+                "Old recording",
+                "legacy text",
+                Option::<String>::None,
                 Option::<String>::None,
                 false,
             ],
         )
-        .expect("insert history entry");
+        .expect("insert pre-model history row");
+
+        Migrations::new(MIGRATIONS.to_vec())
+            .to_latest(&mut conn)
+            .expect("apply model history migration");
+
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("load migrated history")
+            .expect("migrated entry exists");
+        assert_eq!(entry.transcription_text, "legacy text");
+        assert!(entry.model_id.is_none());
     }
 
     #[test]
@@ -776,6 +848,7 @@ mod tests {
             Some("alpha"),
             None,
             None,
+            None,
         )
         .expect("search raw text");
         assert_eq!(raw.entries.len(), 1);
@@ -786,6 +859,7 @@ mod tests {
             None,
             Some(10),
             Some("BETA"),
+            None,
             None,
             None,
         )
@@ -808,6 +882,7 @@ mod tests {
             Some("100%"),
             None,
             None,
+            None,
         )
         .expect("first search page");
         assert_eq!(first_page.entries.len(), 1);
@@ -819,6 +894,7 @@ mod tests {
             Some(first_page.entries[0].id),
             Some(1),
             Some("100%"),
+            None,
             None,
             None,
         )
@@ -842,6 +918,7 @@ mod tests {
             None,
             Some(200),
             Some(300),
+            None,
         )
         .expect("filter history by date range");
 
@@ -863,10 +940,56 @@ mod tests {
             Some("target"),
             Some(150),
             Some(250),
+            None,
         )
         .expect("combine search and date range");
 
         assert_eq!(filtered.entries.len(), 1);
         assert_eq!(filtered.entries[0].timestamp, 200);
+    }
+
+    #[test]
+    fn history_model_filter_matches_only_selected_model_and_combines_with_search() {
+        let conn = setup_conn();
+        insert_entry_with_model(
+            &conn,
+            100,
+            "target whisper",
+            None,
+            Some("whisper-large-v3-turbo"),
+        );
+        insert_entry_with_model(
+            &conn,
+            200,
+            "target parakeet",
+            None,
+            Some("parakeet-tdt-0.6b-v3"),
+        );
+        insert_entry_with_model(
+            &conn,
+            300,
+            "other parakeet",
+            None,
+            Some("parakeet-tdt-0.6b-v3"),
+        );
+        insert_entry(&conn, 400, "target unknown", None);
+
+        let filtered = HistoryManager::get_history_entries_with_conn(
+            &conn,
+            None,
+            Some(10),
+            Some("target"),
+            None,
+            None,
+            Some("parakeet-tdt-0.6b-v3"),
+        )
+        .expect("filter history by model");
+
+        assert_eq!(filtered.entries.len(), 1);
+        assert_eq!(filtered.entries[0].timestamp, 200);
+        assert_eq!(
+            filtered.entries[0].model_id.as_deref(),
+            Some("parakeet-tdt-0.6b-v3")
+        );
     }
 }
