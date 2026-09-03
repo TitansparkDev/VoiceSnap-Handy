@@ -1105,10 +1105,10 @@ mod tests {
                 100_i64,
                 false,
                 "Old recording",
-                "legacy text",
+                "legacy raw text",
+                Some("legacy final text"),
                 Option::<String>::None,
-                Option::<String>::None,
-                false,
+                true,
             ],
         )
         .expect("insert pre-model history row");
@@ -1120,7 +1120,12 @@ mod tests {
         let entry = HistoryManager::get_latest_entry_with_conn(&conn)
             .expect("load migrated history")
             .expect("migrated entry exists");
-        assert_eq!(entry.transcription_text, "legacy text");
+        assert_eq!(entry.transcription_text, "legacy raw text");
+        assert_eq!(
+            entry.post_processed_text.as_deref(),
+            Some("legacy final text")
+        );
+        assert!(entry.post_process_requested);
         assert!(entry.model_id.is_none());
         assert!(entry.engine_type.is_none());
         assert!(entry.duration_ms.is_none());
