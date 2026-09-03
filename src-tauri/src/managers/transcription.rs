@@ -559,13 +559,20 @@ impl TranscriptionManager {
                     None => {
                         let settings = get_settings(&self.app_handle);
                         let accelerator = settings.transcribe_accelerator;
-                        let device = resolve_gpu_device(
-                            accelerator,
-                            settings.transcribe_gpu_device.as_deref(),
-                        );
-                        // Backend::Auto accepts an exact GPU device. Without a
-                        // valid exact device, backend selection handles the
-                        // retired generic GPU state and host CPU guard.
+                        let device = match accelerator {
+                            TranscribeAcceleratorSetting::Auto => {
+                                preferred_auto_transcribe_gpu_device(transcribe_compute_devices())
+                            }
+                            TranscribeAcceleratorSetting::Gpu => resolve_gpu_device(
+                                accelerator,
+                                settings.transcribe_gpu_device.as_deref(),
+                            ),
+                            TranscribeAcceleratorSetting::Cpu => None,
+                        };
+                        // Backend::Auto accepts an exact GPU device. Automatic
+                        // selection only pins a device when a mixed integrated +
+                        // discrete topology needs disambiguation; otherwise the
+                        // backend keeps its normal CPU/GPU fallback behavior.
                         let backend = if device.is_some() {
                             Backend::Auto
                         } else {
@@ -2026,6 +2033,48 @@ fn transcribe_device_label(device: &transcribe_cpp::Device) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscribeGpuClass {
+    Discrete,
+    Integrated,
+    Other,
+}
+
+fn transcribe_gpu_class(device: &transcribe_cpp::Device) -> TranscribeGpuClass {
+    match device.device_type {
+        transcribe_cpp::DeviceType::Gpu => TranscribeGpuClass::Discrete,
+        transcribe_cpp::DeviceType::Igpu => TranscribeGpuClass::Integrated,
+        _ => TranscribeGpuClass::Other,
+    }
+}
+
+/// Return the discrete device to pin only when automatic selection would have
+/// to choose between an integrated/shared-memory GPU and a discrete GPU. On
+/// single-class systems we deliberately leave the device unset so
+/// `Backend::Auto` retains transcribe-cpp's normal fallback behavior.
+fn preferred_discrete_gpu_index(classes: &[TranscribeGpuClass]) -> Option<usize> {
+    if !classes.contains(&TranscribeGpuClass::Integrated) {
+        return None;
+    }
+
+    classes
+        .iter()
+        .position(|class| *class == TranscribeGpuClass::Discrete)
+}
+
+fn preferred_auto_transcribe_gpu_device(
+    devices: Vec<transcribe_cpp::Device>,
+) -> Option<transcribe_cpp::Device> {
+    let classes = devices.iter().map(transcribe_gpu_class).collect::<Vec<_>>();
+    let index = preferred_discrete_gpu_index(&classes)?;
+    let selected = devices.into_iter().nth(index)?;
+    info!(
+        "Automatic transcribe.cpp device selection prefers discrete device '{}' over an integrated/shared-memory GPU",
+        transcribe_device_label(&selected)
+    );
+    Some(selected)
+}
+
 /// Apply the user's ORT accelerator preference to the transcribe-rs global.
 /// Called on startup and before loading a model.
 ///
@@ -2188,6 +2237,27 @@ mod tests {
         for kind in ["cpu", "accel", "metal", "cuda", "vulkan", "gpu"] {
             assert!(transcribe_device_allowed(kind, false));
         }
+    }
+
+    #[test]
+    fn automatic_gpu_selection_pins_discrete_only_for_mixed_gpu_topologies() {
+        use TranscribeGpuClass::{Discrete, Integrated, Other};
+
+        assert_eq!(
+            preferred_discrete_gpu_index(&[Integrated, Discrete]),
+            Some(1)
+        );
+        assert_eq!(
+            preferred_discrete_gpu_index(&[Discrete, Integrated]),
+            Some(0)
+        );
+        assert_eq!(
+            preferred_discrete_gpu_index(&[Other, Integrated, Discrete]),
+            Some(2)
+        );
+        assert_eq!(preferred_discrete_gpu_index(&[Integrated]), None);
+        assert_eq!(preferred_discrete_gpu_index(&[Discrete]), None);
+        assert_eq!(preferred_discrete_gpu_index(&[Other, Discrete]), None);
     }
 
     #[test]
