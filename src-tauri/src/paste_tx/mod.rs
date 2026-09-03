@@ -43,6 +43,112 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+/// Opaque foreground target identity used by experimental live insertion.
+///
+/// The value intentionally contains no window title, document name, or other
+/// user-facing media/content metadata. It is only compared for equality inside
+/// the current process so a session can fail closed if focus leaves the target
+/// application/window captured at recording start.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TargetIdentity(String);
+
+impl TargetIdentity {
+    #[cfg(test)]
+    pub(crate) fn for_test(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+/// Capture the foreground target without exposing its title or document text.
+/// Unsupported/ambiguous environments return `None`; experimental live
+/// insertion must treat that as target loss rather than guessing.
+pub(crate) fn capture_target_identity() -> Option<TargetIdentity> {
+    capture_target_identity_impl()
+}
+
+#[cfg(target_os = "windows")]
+fn capture_target_identity_impl() -> Option<TargetIdentity> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    // SAFETY: both functions are read-only foreground-window queries. The HWND
+    // is used only as an opaque token and the process id is written to local
+    // storage supplied for the documented out parameter.
+    unsafe {
+        let window = GetForegroundWindow();
+        if window.0.is_null() {
+            return None;
+        }
+        let mut process_id = 0_u32;
+        let thread_id = GetWindowThreadProcessId(window, Some(&mut process_id));
+        if thread_id == 0 || process_id == 0 {
+            return None;
+        }
+        Some(TargetIdentity(format!(
+            "windows:{}:{}",
+            process_id, window.0 as usize
+        )))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn capture_target_identity_impl() -> Option<TargetIdentity> {
+    use objc2_app_kit::NSWorkspace;
+
+    // NSWorkspace exposes the foreground application without Accessibility
+    // permission. Using only its pid deliberately avoids collecting app/window
+    // names. This still satisfies the hard safety boundary: changing to another
+    // foreground application invalidates the session immediately.
+    let workspace = NSWorkspace::sharedWorkspace();
+    let application = workspace.frontmostApplication()?;
+    let process_id = application.processIdentifier();
+    (process_id > 0).then(|| TargetIdentity(format!("macos:{process_id}")))
+}
+
+#[cfg(target_os = "linux")]
+fn capture_target_identity_impl() -> Option<TargetIdentity> {
+    use std::process::Command;
+
+    // Cross-application focus inspection is intentionally unavailable on native
+    // Wayland. An XWayland window id is not authoritative when a native Wayland
+    // surface can become foreground, so fail closed instead of accepting it.
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return None;
+    }
+
+    let active = Command::new("xdotool")
+        .arg("getactivewindow")
+        .output()
+        .ok()?;
+    if !active.status.success() {
+        return None;
+    }
+    let window = String::from_utf8(active.stdout).ok()?;
+    let window = window.trim();
+    if window.is_empty() || !window.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    let owner = Command::new("xdotool")
+        .args(["getwindowpid", window])
+        .output()
+        .ok()?;
+    if !owner.status.success() {
+        return None;
+    }
+    let process_id = String::from_utf8(owner.stdout).ok()?;
+    let process_id = process_id.trim();
+    if process_id.is_empty() || !process_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    Some(TargetIdentity(format!("x11:{process_id}:{window}")))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+fn capture_target_identity_impl() -> Option<TargetIdentity> {
+    None
+}
+
 /// How long after the *last* observed read the transcript stays on the
 /// clipboard before restoring. Covers applications that read the clipboard
 /// several times per paste (e.g. Chromium probe-then-read).

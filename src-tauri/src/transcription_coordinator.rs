@@ -11,6 +11,407 @@ use tauri::{AppHandle, Manager};
 const DEBOUNCE: Duration = Duration::from_millis(30);
 const RELEASE_GRACE: Duration = Duration::from_millis(50);
 
+/// When text is allowed to leave Handy during a streaming session.
+///
+/// `AtStop` remains the safe default. `PreviewOnly` exposes committed/tentative
+/// text only in Handy's overlay. `LiveCommittedExperimental` is deliberately an
+/// explicit opt-in and may insert committed deltas only through
+/// [`LiveInsertionLedger`].
+#[allow(dead_code)] // activated by the later steward-owned settings/action slice
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum InsertionMode {
+    #[default]
+    AtStop,
+    PreviewOnly,
+    LiveCommittedExperimental,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveInsertionAttemptKind {
+    CommittedDelta,
+    FinalTail,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveInsertionOutcome {
+    Inserted,
+    TargetLost,
+    TargetChanged,
+    InputFailed,
+    ClipboardOwnershipLost,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveInsertionStopReason {
+    TargetLost,
+    TargetChanged,
+    InputFailed,
+    ClipboardOwnershipLost,
+    RevisedInsertedPrefix,
+    Cancelled,
+}
+
+/// Text returned to the input adapter for one append-only insertion attempt.
+/// The sequence is required when recording the result so a stale asynchronous
+/// completion cannot advance a newer attempt's ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveInsertionAttempt {
+    pub sequence: u64,
+    pub kind: LiveInsertionAttemptKind,
+    pub text: String,
+    /// Expected foreground target. The input adapter must re-check this identity
+    /// immediately before injection; the ledger's planning-time check alone is
+    /// not sufficient because focus can change while an async attempt is queued.
+    pub target: crate::paste_tx::TargetIdentity,
+}
+
+/// Metadata retained after an attempt. Text itself is intentionally not copied
+/// into the result ledger: the authoritative inserted/pending strings already
+/// exist on the session and diagnostics only need sequence/kind/size/outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveInsertionAttemptRecord {
+    pub sequence: u64,
+    pub kind: LiveInsertionAttemptKind,
+    pub byte_len: usize,
+    pub outcome: Option<LiveInsertionOutcome>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct PendingLiveInsertion {
+    attempt: LiveInsertionAttempt,
+    base_inserted_len: usize,
+}
+
+/// Per-recording append-only ledger for committed streaming text.
+///
+/// The ledger never edits text already sent to another application. A new model
+/// hypothesis must start with the exact prefix that was confirmed inserted; if
+/// it revises that prefix, live insertion stops for the rest of the session.
+/// This raw-prefix rule is the append-safe deterministic transform: whole-text
+/// cleanup (especially AI cleanup) must happen only in preview/final-only modes,
+/// never after live deltas have escaped Handy.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct LiveInsertionLedger {
+    mode: InsertionMode,
+    target: Option<crate::paste_tx::TargetIdentity>,
+    inserted_committed: String,
+    latest_committed: String,
+    pending_text: String,
+    attempts: Vec<LiveInsertionAttemptRecord>,
+    safety_events: Vec<LiveInsertionStopReason>,
+    pending_attempt: Option<PendingLiveInsertion>,
+    speech_evidence: bool,
+    cancelled: bool,
+    finalization_requested: bool,
+    final_tail_flushed: bool,
+    stop_reason: Option<LiveInsertionStopReason>,
+    next_sequence: u64,
+}
+
+#[allow(dead_code)]
+impl LiveInsertionLedger {
+    pub(crate) fn new(
+        mode: InsertionMode,
+        target: Option<crate::paste_tx::TargetIdentity>,
+    ) -> Self {
+        Self {
+            mode,
+            target,
+            inserted_committed: String::new(),
+            latest_committed: String::new(),
+            pending_text: String::new(),
+            attempts: Vec::new(),
+            safety_events: Vec::new(),
+            pending_attempt: None,
+            speech_evidence: false,
+            cancelled: false,
+            finalization_requested: false,
+            final_tail_flushed: false,
+            stop_reason: None,
+            next_sequence: 1,
+        }
+    }
+
+    pub(crate) fn mode(&self) -> InsertionMode {
+        self.mode
+    }
+
+    pub(crate) fn inserted_committed(&self) -> &str {
+        &self.inserted_committed
+    }
+
+    pub(crate) fn pending_text(&self) -> &str {
+        &self.pending_text
+    }
+
+    pub(crate) fn attempts(&self) -> &[LiveInsertionAttemptRecord] {
+        &self.attempts
+    }
+
+    pub(crate) fn safety_events(&self) -> &[LiveInsertionStopReason] {
+        &self.safety_events
+    }
+
+    pub(crate) fn stop_reason(&self) -> Option<LiveInsertionStopReason> {
+        self.stop_reason
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    pub(crate) fn final_tail_flushed(&self) -> bool {
+        self.final_tail_flushed
+    }
+
+    fn is_live(&self) -> bool {
+        self.mode == InsertionMode::LiveCommittedExperimental
+    }
+
+    fn stop(&mut self, reason: LiveInsertionStopReason) {
+        if self.stop_reason.is_none() {
+            self.stop_reason = Some(reason);
+            self.safety_events.push(reason);
+        }
+        self.pending_text.clear();
+    }
+
+    fn target_is_current(
+        &mut self,
+        current_target: Option<&crate::paste_tx::TargetIdentity>,
+    ) -> bool {
+        let result = match (self.target.as_ref(), current_target) {
+            (Some(expected), Some(current)) if expected == current => Ok(()),
+            (Some(_), Some(_)) => Err(LiveInsertionStopReason::TargetChanged),
+            _ => Err(LiveInsertionStopReason::TargetLost),
+        };
+        match result {
+            Ok(()) => true,
+            Err(reason) => {
+                self.stop(reason);
+                false
+            }
+        }
+    }
+
+    /// Exact-prefix suffix extraction is deliberately the only transform used by
+    /// live mode. It cannot rewrite or delete text that has already escaped.
+    fn append_safe_suffix<'a>(&self, candidate: &'a str) -> Option<&'a str> {
+        candidate.strip_prefix(&self.inserted_committed)
+    }
+
+    fn refresh_pending_text(&mut self) -> bool {
+        match self.append_safe_suffix(&self.latest_committed) {
+            Some(suffix) => {
+                self.pending_text = suffix.to_string();
+                true
+            }
+            None => {
+                self.stop(LiveInsertionStopReason::RevisedInsertedPrefix);
+                false
+            }
+        }
+    }
+
+    fn plan_latest(
+        &mut self,
+        kind: LiveInsertionAttemptKind,
+        current_target: Option<&crate::paste_tx::TargetIdentity>,
+    ) -> Option<LiveInsertionAttempt> {
+        if !self.is_live()
+            || self.cancelled
+            || self.stop_reason.is_some()
+            || !self.speech_evidence
+            || self.pending_attempt.is_some()
+        {
+            return None;
+        }
+        if !self.target_is_current(current_target) || !self.refresh_pending_text() {
+            return None;
+        }
+        if self.pending_text.is_empty() {
+            return None;
+        }
+
+        let attempt = LiveInsertionAttempt {
+            sequence: self.next_sequence,
+            kind,
+            text: self.pending_text.clone(),
+            target: self
+                .target
+                .clone()
+                .expect("live planning requires a captured target"),
+        };
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.attempts.push(LiveInsertionAttemptRecord {
+            sequence: attempt.sequence,
+            kind,
+            byte_len: attempt.text.len(),
+            outcome: None,
+        });
+        self.pending_attempt = Some(PendingLiveInsertion {
+            base_inserted_len: self.inserted_committed.len(),
+            attempt: attempt.clone(),
+        });
+        Some(attempt)
+    }
+
+    /// Observe a streaming model's committed prefix. Tentative text is not an
+    /// argument to this API, so it cannot accidentally reach the insertion path.
+    pub(crate) fn observe_committed(
+        &mut self,
+        committed: &str,
+        current_target: Option<&crate::paste_tx::TargetIdentity>,
+    ) -> Option<LiveInsertionAttempt> {
+        self.latest_committed.clear();
+        self.latest_committed.push_str(committed);
+
+        if !self.is_live() || self.cancelled || self.stop_reason.is_some() {
+            return None;
+        }
+        if !self.refresh_pending_text() {
+            return None;
+        }
+        self.plan_latest(LiveInsertionAttemptKind::CommittedDelta, current_target)
+    }
+
+    /// Latch positive speech evidence for the session. A committed-looking model
+    /// emission observed before this call remains pending and becomes eligible
+    /// only after this positive latch and a successful focus check.
+    pub(crate) fn observe_speech_evidence(
+        &mut self,
+        current_target: Option<&crate::paste_tx::TargetIdentity>,
+    ) -> Option<LiveInsertionAttempt> {
+        self.speech_evidence = true;
+        self.plan_latest(LiveInsertionAttemptKind::CommittedDelta, current_target)
+    }
+
+    /// Record the result of the exact attempt returned by this ledger. Unknown,
+    /// duplicate, or stale sequence ids are ignored. A failed input attempt is
+    /// terminal because partial delivery cannot be ruled out safely; retrying
+    /// could duplicate text. Clipboard ownership loss is terminal for the same
+    /// reason and leaves the user's newer clipboard owner untouched.
+    pub(crate) fn record_attempt_result(
+        &mut self,
+        sequence: u64,
+        outcome: LiveInsertionOutcome,
+    ) -> bool {
+        let Some(pending) = self.pending_attempt.as_ref() else {
+            return false;
+        };
+        if pending.attempt.sequence != sequence {
+            return false;
+        }
+
+        let Some(record) = self
+            .attempts
+            .iter_mut()
+            .find(|record| record.sequence == sequence)
+        else {
+            return false;
+        };
+        if record.outcome.is_some() {
+            return false;
+        }
+        record.outcome = Some(outcome);
+
+        let pending = self.pending_attempt.take().expect("checked above");
+        match outcome {
+            LiveInsertionOutcome::Inserted => {
+                // Only the attempt created from the current confirmed prefix may
+                // advance it. A stale completion cannot overwrite newer state.
+                if self.inserted_committed.len() != pending.base_inserted_len {
+                    self.stop(LiveInsertionStopReason::RevisedInsertedPrefix);
+                    return false;
+                }
+                self.inserted_committed.push_str(&pending.attempt.text);
+                if pending.attempt.kind == LiveInsertionAttemptKind::FinalTail {
+                    self.final_tail_flushed = true;
+                }
+                // A newer stream event may have arrived while input was in
+                // flight. If it revised the just-inserted text, stop now rather
+                // than attempting generic deletion/replacement. Cancellation is
+                // already terminal, so keep its pending text empty instead.
+                if self.cancelled {
+                    self.pending_text.clear();
+                } else {
+                    let _ = self.refresh_pending_text();
+                }
+            }
+            LiveInsertionOutcome::TargetLost => {
+                self.stop(LiveInsertionStopReason::TargetLost);
+            }
+            LiveInsertionOutcome::TargetChanged => {
+                self.stop(LiveInsertionStopReason::TargetChanged);
+            }
+            LiveInsertionOutcome::InputFailed => {
+                self.stop(LiveInsertionStopReason::InputFailed);
+            }
+            LiveInsertionOutcome::ClipboardOwnershipLost => {
+                self.stop(LiveInsertionStopReason::ClipboardOwnershipLost);
+            }
+        }
+        true
+    }
+
+    /// Stop accepting new live insertions. An already in-flight result may still
+    /// be recorded so the ledger reflects what could have reached the target,
+    /// but cancellation never schedules a final tail.
+    pub(crate) fn cancel(&mut self) {
+        if self.cancelled {
+            return;
+        }
+        self.cancelled = true;
+        self.stop(LiveInsertionStopReason::Cancelled);
+    }
+
+    /// Plan the remaining raw tail at stop. This is at most one append-only
+    /// attempt. If the final model text revised any prefix already inserted, the
+    /// ledger records the limitation and inserts nothing rather than trying to
+    /// repair another application's document generically.
+    pub(crate) fn finalize(
+        &mut self,
+        final_text: &str,
+        current_target: Option<&crate::paste_tx::TargetIdentity>,
+    ) -> Option<LiveInsertionAttempt> {
+        if !self.is_live()
+            || self.cancelled
+            || self.stop_reason.is_some()
+            || self.finalization_requested
+        {
+            return None;
+        }
+        // A caller using asynchronous input must settle the preceding attempt
+        // before finalizing. Returning None without marking finalization lets it
+        // retry after that exact completion arrives.
+        if self.pending_attempt.is_some() {
+            return None;
+        }
+
+        self.latest_committed.clear();
+        self.latest_committed.push_str(final_text);
+        self.finalization_requested = true;
+
+        if !self.speech_evidence {
+            self.pending_text.clear();
+            return None;
+        }
+        if !self.target_is_current(current_target) || !self.refresh_pending_text() {
+            return None;
+        }
+        if self.pending_text.is_empty() {
+            self.final_tail_flushed = true;
+            return None;
+        }
+        self.plan_latest(LiveInsertionAttemptKind::FinalTail, current_target)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PttAction {
     Passthrough,
@@ -712,6 +1113,238 @@ fn stop(app: &AppHandle, binding_id: &str, hotkey_string: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn live_target(name: &str) -> crate::paste_tx::TargetIdentity {
+        crate::paste_tx::TargetIdentity::for_test(name)
+    }
+
+    fn live_ledger() -> (LiveInsertionLedger, crate::paste_tx::TargetIdentity) {
+        let target = live_target("target-a");
+        (
+            LiveInsertionLedger::new(
+                InsertionMode::LiveCommittedExperimental,
+                Some(target.clone()),
+            ),
+            target,
+        )
+    }
+
+    fn confirm_inserted(ledger: &mut LiveInsertionLedger, attempt: LiveInsertionAttempt) {
+        assert!(ledger.record_attempt_result(attempt.sequence, LiveInsertionOutcome::Inserted));
+    }
+
+    #[test]
+    fn insertion_mode_defaults_to_at_stop_and_non_live_modes_never_plan_deltas() {
+        assert_eq!(InsertionMode::default(), InsertionMode::AtStop);
+        let target = live_target("target-a");
+        for mode in [InsertionMode::AtStop, InsertionMode::PreviewOnly] {
+            let mut ledger = LiveInsertionLedger::new(mode, Some(target.clone()));
+            assert!(ledger.observe_speech_evidence(Some(&target)).is_none());
+            assert!(ledger.observe_committed("hello", Some(&target)).is_none());
+            assert!(ledger.finalize("hello", Some(&target)).is_none());
+            assert!(ledger.attempts().is_empty());
+            assert_eq!(ledger.mode(), mode);
+        }
+    }
+
+    #[test]
+    fn repeated_committed_events_insert_only_new_delta_without_duplicates() {
+        let (mut ledger, target) = live_ledger();
+        assert!(ledger.observe_speech_evidence(Some(&target)).is_none());
+
+        let first = ledger
+            .observe_committed("hello", Some(&target))
+            .expect("first committed delta");
+        assert_eq!(first.text, "hello");
+        confirm_inserted(&mut ledger, first);
+
+        assert!(ledger.observe_committed("hello", Some(&target)).is_none());
+        let second = ledger
+            .observe_committed("hello world", Some(&target))
+            .expect("only the new suffix");
+        assert_eq!(second.text, " world");
+        confirm_inserted(&mut ledger, second);
+
+        assert_eq!(ledger.inserted_committed(), "hello world");
+        assert_eq!(ledger.attempts().len(), 2);
+        assert_eq!(ledger.attempts()[0].byte_len, 5);
+        assert_eq!(ledger.attempts()[1].byte_len, 6);
+    }
+
+    #[test]
+    fn revised_already_inserted_prefix_stops_live_insertion_without_replacement() {
+        let (mut ledger, target) = live_ledger();
+        ledger.observe_speech_evidence(Some(&target));
+        let first = ledger
+            .observe_committed("hello world", Some(&target))
+            .expect("initial committed text");
+        confirm_inserted(&mut ledger, first);
+
+        assert!(ledger
+            .observe_committed("hello there", Some(&target))
+            .is_none());
+        assert_eq!(
+            ledger.stop_reason(),
+            Some(LiveInsertionStopReason::RevisedInsertedPrefix)
+        );
+        assert!(ledger.finalize("hello there!", Some(&target)).is_none());
+        assert_eq!(ledger.inserted_committed(), "hello world");
+        assert_eq!(ledger.attempts().len(), 1);
+    }
+
+    #[test]
+    fn foreground_target_change_permanently_stops_session_insertion() {
+        let (mut ledger, target) = live_ledger();
+        let other = live_target("target-b");
+        ledger.observe_speech_evidence(Some(&target));
+
+        assert!(ledger.observe_committed("hello", Some(&other)).is_none());
+        assert_eq!(
+            ledger.stop_reason(),
+            Some(LiveInsertionStopReason::TargetChanged)
+        );
+        assert_eq!(
+            ledger.safety_events(),
+            &[LiveInsertionStopReason::TargetChanged]
+        );
+        assert!(ledger
+            .observe_committed("hello world", Some(&target))
+            .is_none());
+        assert!(ledger.attempts().is_empty());
+    }
+
+    #[test]
+    fn missing_target_identity_fails_closed_before_first_insertion() {
+        let (mut ledger, target) = live_ledger();
+        ledger.observe_speech_evidence(Some(&target));
+        assert!(ledger.observe_committed("hello", None).is_none());
+        assert_eq!(
+            ledger.stop_reason(),
+            Some(LiveInsertionStopReason::TargetLost)
+        );
+        assert!(ledger.attempts().is_empty());
+    }
+
+    #[test]
+    fn committed_hallucination_waits_for_positive_speech_evidence_latch() {
+        let (mut ledger, target) = live_ledger();
+        assert!(ledger
+            .observe_committed("thank you for watching", Some(&target))
+            .is_none());
+        assert!(ledger.attempts().is_empty());
+        assert_eq!(ledger.pending_text(), "thank you for watching");
+
+        let first = ledger
+            .observe_speech_evidence(Some(&target))
+            .expect("speech latch makes existing committed text eligible");
+        assert_eq!(first.text, "thank you for watching");
+        confirm_inserted(&mut ledger, first);
+    }
+
+    #[test]
+    fn cancellation_never_schedules_or_flushes_a_final_tail() {
+        let (mut ledger, target) = live_ledger();
+        ledger.observe_speech_evidence(Some(&target));
+        let first = ledger
+            .observe_committed("hello", Some(&target))
+            .expect("initial delta");
+        confirm_inserted(&mut ledger, first);
+
+        ledger.cancel();
+        assert!(ledger.is_cancelled());
+        assert_eq!(
+            ledger.stop_reason(),
+            Some(LiveInsertionStopReason::Cancelled)
+        );
+        assert!(ledger
+            .observe_committed("hello world", Some(&target))
+            .is_none());
+        assert_eq!(ledger.pending_text(), "");
+        assert!(ledger.finalize("hello world", Some(&target)).is_none());
+        assert!(!ledger.final_tail_flushed());
+        assert_eq!(ledger.inserted_committed(), "hello");
+    }
+
+    #[test]
+    fn target_change_after_planning_before_injection_is_terminal() {
+        let (mut ledger, target) = live_ledger();
+        ledger.observe_speech_evidence(Some(&target));
+        let attempt = ledger
+            .observe_committed("hello", Some(&target))
+            .expect("initial delta");
+        assert_eq!(attempt.target, target);
+
+        assert!(ledger.record_attempt_result(attempt.sequence, LiveInsertionOutcome::TargetChanged));
+        assert_eq!(
+            ledger.stop_reason(),
+            Some(LiveInsertionStopReason::TargetChanged)
+        );
+        assert_eq!(ledger.inserted_committed(), "");
+        assert!(ledger
+            .observe_committed("hello world", Some(&target))
+            .is_none());
+        assert_eq!(ledger.attempts().len(), 1);
+    }
+
+    #[test]
+    fn finalization_flushes_remaining_tail_exactly_once() {
+        let (mut ledger, target) = live_ledger();
+        ledger.observe_speech_evidence(Some(&target));
+        let first = ledger
+            .observe_committed("hello", Some(&target))
+            .expect("initial delta");
+        confirm_inserted(&mut ledger, first);
+
+        let tail = ledger
+            .finalize("hello world", Some(&target))
+            .expect("remaining final tail");
+        assert_eq!(tail.kind, LiveInsertionAttemptKind::FinalTail);
+        assert_eq!(tail.text, " world");
+        assert!(ledger.finalize("hello world", Some(&target)).is_none());
+        confirm_inserted(&mut ledger, tail);
+        assert!(ledger.final_tail_flushed());
+        assert_eq!(ledger.inserted_committed(), "hello world");
+        assert!(ledger.finalize("hello world", Some(&target)).is_none());
+    }
+
+    #[test]
+    fn input_failure_is_terminal_and_never_retries_uncertain_text() {
+        let (mut ledger, target) = live_ledger();
+        ledger.observe_speech_evidence(Some(&target));
+        let attempt = ledger
+            .observe_committed("hello", Some(&target))
+            .expect("initial delta");
+        assert!(ledger.record_attempt_result(attempt.sequence, LiveInsertionOutcome::InputFailed));
+        assert_eq!(
+            ledger.stop_reason(),
+            Some(LiveInsertionStopReason::InputFailed)
+        );
+        assert!(ledger
+            .observe_committed("hello world", Some(&target))
+            .is_none());
+        assert_eq!(ledger.attempts().len(), 1);
+    }
+
+    #[test]
+    fn clipboard_ownership_loss_stops_live_insertion_without_advancing_prefix() {
+        let (mut ledger, target) = live_ledger();
+        ledger.observe_speech_evidence(Some(&target));
+        let attempt = ledger
+            .observe_committed("hello", Some(&target))
+            .expect("initial delta");
+        assert!(ledger.record_attempt_result(
+            attempt.sequence,
+            LiveInsertionOutcome::ClipboardOwnershipLost
+        ));
+        assert_eq!(
+            ledger.stop_reason(),
+            Some(LiveInsertionStopReason::ClipboardOwnershipLost)
+        );
+        assert_eq!(ledger.inserted_committed(), "");
+        assert!(ledger
+            .observe_committed("hello world", Some(&target))
+            .is_none());
+    }
 
     #[test]
     fn push_to_talk_release_while_recording_defers_release() {

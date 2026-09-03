@@ -8,6 +8,9 @@ use crate::settings::{
     get_settings, AppSettings, ModelUnloadTimeout, OrtAcceleratorSetting,
     TranscribeAcceleratorSetting,
 };
+use crate::transcription_coordinator::{
+    InsertionMode, LiveInsertionAttempt, LiveInsertionLedger, LiveInsertionOutcome,
+};
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -64,6 +67,16 @@ pub struct ModelStateEvent {
 pub struct StreamTextEvent {
     pub committed: String,
     pub tentative: String,
+}
+
+impl StreamTextEvent {
+    /// The only stream text eligible for experimental external insertion.
+    /// Keeping this accessor committed-only makes it impossible for the volatile
+    /// tentative suffix to enter the live insertion adapter accidentally.
+    #[allow(dead_code)] // steward hook: final Wave 3 settings/action wiring activates this
+    pub(crate) fn committed_for_live_insertion(&self) -> &str {
+        &self.committed
+    }
 }
 
 /// Phase of the streaming overlay card, emitted to drive its UI state.
@@ -319,6 +332,10 @@ pub struct TranscriptionManager {
     /// fails during inference, later persisted loads use CPU for this app run
     /// without rewriting the user's saved accelerator preference.
     force_cpu_for_run: Arc<AtomicBool>,
+    /// Optional committed-only insertion ledger. Existing behavior is unchanged
+    /// until a steward explicitly begins a non-default insertion session; no
+    /// settings/UI path enables this core on its own.
+    live_insertion: Arc<Mutex<Option<LiveInsertionLedger>>>,
 }
 
 impl TranscriptionManager {
@@ -341,6 +358,7 @@ impl TranscriptionManager {
             active_engine_lease: Arc::new(AtomicU64::new(0)),
             selection_plan: Arc::new(Mutex::new(None)),
             force_cpu_for_run: Arc::new(AtomicBool::new(false)),
+            live_insertion: Arc::new(Mutex::new(None)),
         };
 
         // Start the idle watcher
@@ -914,6 +932,91 @@ impl TranscriptionManager {
         Arc::clone(&self.router)
     }
 
+    /// Begin the insertion-side state for one recording session. This is an
+    /// intentionally separate opt-in from streaming preview: callers must choose
+    /// `LiveCommittedExperimental` explicitly, so merely using a streaming model
+    /// never changes Handy's existing final-paste behavior.
+    #[allow(dead_code)] // explicit opt-in hook; intentionally not enabled by this core task
+    pub(crate) fn begin_insertion_session(&self, mode: InsertionMode) {
+        let target = (mode == InsertionMode::LiveCommittedExperimental)
+            .then(crate::paste_tx::capture_target_identity)
+            .flatten();
+        *self.live_insertion.lock().unwrap() = Some(LiveInsertionLedger::new(mode, target));
+    }
+
+    /// Feed only the committed part of a stream snapshot into the live ledger.
+    /// The returned attempt must be executed by the native input adapter and its
+    /// exact result acknowledged with `record_live_insertion_result`.
+    #[allow(dead_code)] // steward hook: native input adapter will consume returned attempts
+    pub(crate) fn observe_live_stream_text(
+        &self,
+        event: &StreamTextEvent,
+    ) -> Option<LiveInsertionAttempt> {
+        let current_target = crate::paste_tx::capture_target_identity();
+        self.live_insertion
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|ledger| {
+                ledger.observe_committed(
+                    event.committed_for_live_insertion(),
+                    current_target.as_ref(),
+                )
+            })
+    }
+
+    /// Positive speech evidence is supplied separately from model text. This is
+    /// the latch that prevents a committed-looking silence hallucination from
+    /// becoming the first external insertion.
+    #[allow(dead_code)] // steward hook: recording/VAD wiring supplies the positive latch
+    pub(crate) fn observe_live_speech_evidence(&self) -> Option<LiveInsertionAttempt> {
+        let current_target = crate::paste_tx::capture_target_identity();
+        self.live_insertion
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|ledger| ledger.observe_speech_evidence(current_target.as_ref()))
+    }
+
+    #[allow(dead_code)] // steward hook: native input adapter records exact async outcome
+    pub(crate) fn record_live_insertion_result(
+        &self,
+        sequence: u64,
+        outcome: LiveInsertionOutcome,
+    ) -> bool {
+        self.live_insertion
+            .lock()
+            .unwrap()
+            .as_mut()
+            .is_some_and(|ledger| ledger.record_attempt_result(sequence, outcome))
+    }
+
+    /// Ask the live ledger for at most the still-uncommitted final raw tail.
+    /// Callers must pass the raw streaming final, before whole-transcript cleanup.
+    #[allow(dead_code)] // steward hook: must be called before whole-transcript cleanup
+    pub(crate) fn finalize_live_insertion_raw(
+        &self,
+        final_text: &str,
+    ) -> Option<LiveInsertionAttempt> {
+        let current_target = crate::paste_tx::capture_target_identity();
+        self.live_insertion
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|ledger| ledger.finalize(final_text, current_target.as_ref()))
+    }
+
+    pub(crate) fn cancel_live_insertion(&self) {
+        if let Some(ledger) = self.live_insertion.lock().unwrap().as_mut() {
+            ledger.cancel();
+        }
+    }
+
+    #[allow(dead_code)] // steward hook: clears the completed session after final action
+    pub(crate) fn clear_live_insertion(&self) {
+        *self.live_insertion.lock().unwrap() = None;
+    }
+
     /// Begin a live streaming transcription on the held engine's session.
     /// Audio frames pushed via [`StreamRouter::feed`] (captured directly by the
     /// audio recorder) are decoded incrementally and emitted to the overlay as
@@ -1376,6 +1479,7 @@ impl TranscriptionManager {
         if let Some(tx) = self.router.take() {
             let _ = tx.send(StreamCmd::Cancel);
         }
+        self.cancel_live_insertion();
         self.stream_active.store(false, Ordering::Release);
     }
 
@@ -2552,6 +2656,17 @@ mod tests {
 
     fn languages(codes: &[&str]) -> Vec<String> {
         codes.iter().map(|code| (*code).to_string()).collect()
+    }
+
+    #[test]
+    fn live_insertion_accessor_exposes_committed_text_only() {
+        let event = StreamTextEvent {
+            committed: "stable prefix".to_string(),
+            tentative: " volatile suffix".to_string(),
+        };
+
+        assert_eq!(event.committed_for_live_insertion(), "stable prefix");
+        assert!(!event.committed_for_live_insertion().contains("volatile"));
     }
 
     #[test]
