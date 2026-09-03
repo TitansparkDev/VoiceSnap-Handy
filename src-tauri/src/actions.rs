@@ -841,6 +841,8 @@ impl ShortcutAction for TranscribeAction {
                     let history_duration_ms =
                         i64::try_from(sample_count.saturating_mul(1000) / 16_000)
                             .unwrap_or(i64::MAX);
+                    let history_backend = tm.current_backend();
+                    let history_device = tm.current_device();
 
                     if rm.was_cancelled_since(cancel_generation) {
                         debug!("Transcription operation cancelled before output handling");
@@ -900,6 +902,8 @@ impl ShortcutAction for TranscribeAction {
                                     history_engine_type,
                                     history_language.clone(),
                                     Some(HISTORY_INSERTION_MODE_AT_STOP.to_string()),
+                                    history_backend.clone(),
+                                    history_device.clone(),
                                     history_duration_ms,
                                 ) {
                                     error!("Failed to save history entry: {}", err);
@@ -972,6 +976,8 @@ impl ShortcutAction for TranscribeAction {
                                     history_engine_type,
                                     history_language,
                                     Some(HISTORY_INSERTION_MODE_AT_STOP.to_string()),
+                                    history_backend,
+                                    history_device,
                                     history_duration_ms,
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);

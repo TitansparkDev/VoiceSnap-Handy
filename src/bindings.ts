@@ -1040,7 +1040,15 @@ language: string | null;
 /**
  * Text insertion behavior used by the original recording session.
  */
-insertion_mode: string | null }
+insertion_mode: string | null;
+/**
+ * Actual runtime compute backend used by the transcription engine.
+ */
+backend: string | null;
+/**
+ * Actual runtime compute device used by the transcription engine.
+ */
+device: string | null }
 export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number }
 /**
  * Result of changing keyboard implementation

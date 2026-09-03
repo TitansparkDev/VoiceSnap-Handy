@@ -780,6 +780,21 @@ impl TranscriptionManager {
         }
     }
 
+    /// The actual compute device the currently-loaded engine is using. Whisper-
+    /// family engines report the device bound by transcribe-cpp; the ONNX engines
+    /// in this build are CPU-only and therefore report `cpu`.
+    pub fn current_device(&self) -> Option<String> {
+        match self.lock_engine().as_ref() {
+            Some(LoadedEngine::TranscribeCpp(session)) => session
+                .model()
+                .device()
+                .ok()
+                .map(|device| transcribe_device_label(&device)),
+            Some(_) => Some("cpu".to_string()),
+            None => None,
+        }
+    }
+
     /// Whether a live streaming run is currently in flight.
     pub fn is_streaming(&self) -> bool {
         self.stream_active.load(Ordering::Acquire)

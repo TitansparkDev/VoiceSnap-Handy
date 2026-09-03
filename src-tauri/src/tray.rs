@@ -687,6 +687,8 @@ mod tests {
             engine_type: None,
             language: None,
             insertion_mode: None,
+            backend: None,
+            device: None,
         }
     }
 

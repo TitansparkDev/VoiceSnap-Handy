@@ -116,6 +116,8 @@ pub async fn retry_history_entry_transcription(
     let engine_type = crate::actions::resolve_history_engine_type(&app, model_id.as_deref());
     let language = crate::actions::resolve_effective_language(&app, &history_settings);
     let language = (!language.is_empty()).then_some(language);
+    let backend = transcription_manager.current_backend();
+    let device = transcription_manager.current_device();
     let processed =
         process_transcription_output(&app, &transcription, entry.post_process_requested).await;
     history_manager
@@ -127,6 +129,8 @@ pub async fn retry_history_entry_transcription(
             model_id,
             engine_type,
             language,
+            backend,
+            device,
         )
         .map(|_| ())
         .map_err(|e| e.to_string())

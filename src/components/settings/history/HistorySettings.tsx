@@ -634,6 +634,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
       ? t("settings.history.insertionModeAtStop", { defaultValue: "At stop" })
       : entry.insertion_mode
     : null;
+  const runtimeLabel = [entry.backend, entry.device].filter(Boolean).join(" · ") || null;
 
   return (
     <div className="px-4 py-2 pb-5 flex flex-col gap-3">
@@ -674,6 +675,16 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
               })}
             >
               {insertionModeLabel}
+            </span>
+          )}
+          {runtimeLabel && (
+            <span
+              className="rounded bg-mid-gray/10 px-1.5 py-0.5 text-[10px] text-text/50"
+              title={t("settings.history.runtime", {
+                defaultValue: "Runtime backend and device",
+              })}
+            >
+              {runtimeLabel}
             </span>
           )}
         </div>
