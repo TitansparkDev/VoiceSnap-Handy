@@ -15,12 +15,16 @@ pub use crate::tray::*;
 
 /// Preserve diagnostic text in development builds, but redact it in releases.
 /// Do not use for secrets such as API keys, which must always be redacted.
-pub fn redact_text(text: &str) -> &str {
-    if cfg!(debug_assertions) {
+fn redact_text_for_build(text: &str, debug_assertions: bool) -> &str {
+    if debug_assertions {
         text
     } else {
         "[REDACTED]"
     }
+}
+
+pub fn redact_text(text: &str) -> &str {
+    redact_text_for_build(text, cfg!(debug_assertions))
 }
 
 #[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
@@ -172,6 +176,13 @@ pub fn env_flag_enabled(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_log_text_is_redacted_while_debug_preview_is_explicit() {
+        let private_text = "PRIVATE TRANSCRIPT / CLIPBOARD / WINDOW TITLE";
+        assert_eq!(redact_text_for_build(private_text, false), "[REDACTED]");
+        assert_eq!(redact_text_for_build(private_text, true), private_text);
+    }
 
     #[test]
     fn arm64_native_machine_is_the_only_match() {

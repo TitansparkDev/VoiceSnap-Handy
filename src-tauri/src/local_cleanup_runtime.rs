@@ -19,7 +19,9 @@ const LOCAL_RUNTIME_HEALTH_POLL: Duration = Duration::from_millis(100);
 /// deterministic `fast` cleanup any path that can warm the local model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CleanupExecutionMode {
+    #[allow(dead_code)] // Explicit non-runtime policy state retained for the settings boundary.
     Off,
+    #[allow(dead_code)] // Explicit deterministic-cleanup state must never warm the local model.
     Fast,
     LocalAi,
 }

@@ -1613,7 +1613,10 @@ mod tests {
         assert!(settings.vocabulary_v1.entries.is_empty());
 
         assert!(apply_settings_migrations(&mut settings, &stored));
-        assert_eq!(settings.settings_schema_version, CURRENT_SETTINGS_SCHEMA_VERSION);
+        assert_eq!(
+            settings.settings_schema_version,
+            CURRENT_SETTINGS_SCHEMA_VERSION
+        );
         assert_eq!(settings.custom_words, legacy_words);
         assert_eq!(
             settings

@@ -91,7 +91,7 @@ pub fn system_recording_media_controller() -> RecordingMediaController {
 fn system_media_backend() -> Arc<dyn MediaBackend> {
     #[cfg(target_os = "linux")]
     {
-        return Arc::new(MprisMediaBackend::default());
+        Arc::new(MprisMediaBackend::default())
     }
 
     #[cfg(not(target_os = "linux"))]

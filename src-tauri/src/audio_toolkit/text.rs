@@ -1,4 +1,4 @@
-use crate::settings::{VocabularySettingsV1, VocabularyEntry, VocabularyReplacement};
+use crate::settings::{VocabularyEntry, VocabularyReplacement, VocabularySettingsV1};
 use natural::phonetics::soundex;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -286,13 +286,15 @@ fn language_scope_matches(scope: Option<&str>, output_language: Option<&str>) ->
         return false;
     };
 
-    scope == output
-        || scope.split('-').next() == output.split('-').next()
+    scope == output || scope.split('-').next() == output.split('-').next()
 }
 
 fn sanitized_prompt_term(value: &str) -> Option<String> {
     let without_controls: String = value.chars().filter(|c| !c.is_control()).collect();
-    let compact = without_controls.split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = without_controls
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let bounded: String = compact.chars().take(VOCABULARY_TERM_MAX_CHARS).collect();
     (!bounded.is_empty()).then_some(bounded)
 }
@@ -406,10 +408,7 @@ fn exact_rule_replace(
     (result, replacements)
 }
 
-fn apply_replacement_rule(
-    text: &str,
-    rule: &VocabularyReplacement,
-) -> (String, usize) {
+fn apply_replacement_rule(text: &str, rule: &VocabularyReplacement) -> (String, usize) {
     let (Some(from), Some(to)) = (safe_rule_term(&rule.from), safe_rule_term(&rule.to)) else {
         return (text.to_string(), 0);
     };
@@ -501,7 +500,8 @@ pub fn apply_vocabulary_corrections(
         let mut fuzzy_words = Vec::new();
         let mut seen_words = HashSet::new();
         for entry in vocabulary.entries.iter().take(VOCABULARY_MAX_RULES) {
-            if !entry.enabled || !language_scope_matches(entry.language.as_deref(), output_language) {
+            if !entry.enabled || !language_scope_matches(entry.language.as_deref(), output_language)
+            {
                 continue;
             }
             let Some(written) = safe_rule_term(&entry.written) else {
@@ -766,11 +766,7 @@ mod tests {
         normalize_transcription_output(&filtered)
     }
 
-    fn rich_entry(
-        written: &str,
-        alias: Option<&str>,
-        language: Option<&str>,
-    ) -> VocabularyEntry {
+    fn rich_entry(written: &str, alias: Option<&str>, language: Option<&str>) -> VocabularyEntry {
         VocabularyEntry {
             written: written.to_string(),
             spoken_alias: alias.map(str::to_string),
@@ -1171,14 +1167,23 @@ mod tests {
     #[test]
     fn vocabulary_short_words_never_fuzzy_overmatch() {
         let custom_words = vec!["AI".to_string(), "Inn".to_string()];
-        assert_eq!(apply_custom_words("a is useful", &custom_words, 1.0), "a is useful");
+        assert_eq!(
+            apply_custom_words("a is useful", &custom_words, 1.0),
+            "a is useful"
+        );
         assert_eq!(apply_custom_words("in here", &custom_words, 1.0), "in here");
-        assert_eq!(apply_custom_words("AI is useful", &custom_words, 1.0), "AI is useful");
+        assert_eq!(
+            apply_custom_words("AI is useful", &custom_words, 1.0),
+            "AI is useful"
+        );
     }
 
     #[test]
     fn vocabulary_alias_is_scoped_and_does_not_overmatch() {
-        let vocab = vocabulary(vec![rich_entry("OpenAI", Some("open eye"), Some("en"))], vec![]);
+        let vocab = vocabulary(
+            vec![rich_entry("OpenAI", Some("open eye"), Some("en"))],
+            vec![],
+        );
         let en = OutputLanguageEvidence::UserSelected("en-US".to_string());
         let fr = OutputLanguageEvidence::UserSelected("fr".to_string());
 
@@ -1193,14 +1198,8 @@ mod tests {
         assert_eq!(corrected.text, "use OpenAI, not open eyesight");
         assert_eq!(corrected.metadata.alias_replacements, 1);
 
-        let wrong_language = apply_vocabulary_corrections(
-            "use open eye",
-            &vocab,
-            &[],
-            0.18,
-            &fr,
-            true,
-        );
+        let wrong_language =
+            apply_vocabulary_corrections("use open eye", &vocab, &[], 0.18, &fr, true);
         assert_eq!(wrong_language.text, "use open eye");
         assert!(!wrong_language.metadata.applied());
     }
@@ -1225,7 +1224,10 @@ mod tests {
         case_sensitive.case_sensitive = Some(true);
         let mut punctuation_sensitive = rich_entry("ChatGPT", Some("chat gpt"), None);
         punctuation_sensitive.preserve_punctuation = Some(false);
-        let vocab = vocabulary(vec![disabled, case_sensitive, punctuation_sensitive], vec![]);
+        let vocab = vocabulary(
+            vec![disabled, case_sensitive, punctuation_sensitive],
+            vec![],
+        );
         let language = OutputLanguageEvidence::Unknown;
 
         let result = apply_vocabulary_corrections(
@@ -1236,7 +1238,10 @@ mod tests {
             &language,
             false,
         );
-        assert_eq!(result.text, "hand ee voice snap chat gpt, VoiceSnap ChatGPT");
+        assert_eq!(
+            result.text,
+            "hand ee voice snap chat gpt, VoiceSnap ChatGPT"
+        );
         assert_eq!(result.metadata.alias_replacements, 2);
     }
 
@@ -1347,8 +1352,9 @@ mod tests {
         entries.push(rich_entry("Duplicate", None, Some("en")));
         entries.push(rich_entry("duplicate", None, Some("en")));
         let vocab = vocabulary(entries, vec![]);
-        let prompt = build_vocabulary_prompt(&vocab, &["Legacy\u{0001}Word".to_string()], Some("en-US"))
-            .expect("bounded vocabulary prompt");
+        let prompt =
+            build_vocabulary_prompt(&vocab, &["Legacy\u{0001}Word".to_string()], Some("en-US"))
+                .expect("bounded vocabulary prompt");
 
         assert!(prompt.chars().count() <= VOCABULARY_PROMPT_MAX_CHARS);
         assert!(prompt.split(", ").count() <= VOCABULARY_PROMPT_MAX_ENTRIES);

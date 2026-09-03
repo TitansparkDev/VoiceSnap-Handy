@@ -242,9 +242,9 @@ fn should_paste_final_output(
     session_insertion_mode: InsertionMode,
     live_insertion_blocks_final_paste: bool,
 ) -> bool {
-    !final_text_is_empty
-        && !(session_insertion_mode == InsertionMode::LiveCommittedExperimental
-            && live_insertion_blocks_final_paste)
+    !(final_text_is_empty
+        || (session_insertion_mode == InsertionMode::LiveCommittedExperimental
+            && live_insertion_blocks_final_paste))
 }
 
 fn insertion_mode_history_value(mode: InsertionMode) -> &'static str {
@@ -661,7 +661,12 @@ pub(crate) async fn process_transcription_output(
         .then(|| settings.post_process_selected_prompt_id.clone())
         .flatten();
     let cleanup_model_id = post_process
-        .then(|| settings.post_process_models.get(&settings.post_process_provider_id).cloned())
+        .then(|| {
+            settings
+                .post_process_models
+                .get(&settings.post_process_provider_id)
+                .cloned()
+        })
         .flatten()
         .filter(|model| !model.trim().is_empty());
     let mut final_text = transcription.to_string();
@@ -1354,8 +1359,10 @@ mod tests {
 
     #[test]
     fn history_cleanup_mode_records_off_or_selected_provider() {
-        let mut settings = AppSettings::default();
-        settings.post_process_provider_id = "openrouter".to_string();
+        let settings = AppSettings {
+            post_process_provider_id: "openrouter".to_string(),
+            ..Default::default()
+        };
 
         assert_eq!(resolve_history_cleanup_mode(&settings, false), "off");
         assert_eq!(

@@ -414,21 +414,6 @@ where
     }
 }
 
-#[cfg(test)]
-mod headless_guard_tests {
-    use super::run_headless_guarded;
-
-    #[test]
-    fn preserves_normal_exit_codes() {
-        assert_eq!(run_headless_guarded(|| 2), 2);
-    }
-
-    #[test]
-    fn converts_worker_panics_to_runtime_failures() {
-        assert_eq!(run_headless_guarded(|| panic!("simulated failure")), 1);
-    }
-}
-
 fn run_headless_live_benchmark(app: &AppHandle, args: &CliArgs) -> i32 {
     use crate::audio_toolkit::VadPolicy;
     use std::time::{Duration, Instant};
@@ -1344,4 +1329,19 @@ pub fn run(cli_args: CliArgs) {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod headless_guard_tests {
+    use super::run_headless_guarded;
+
+    #[test]
+    fn preserves_normal_exit_codes() {
+        assert_eq!(run_headless_guarded(|| 2), 2);
+    }
+
+    #[test]
+    fn converts_worker_panics_to_runtime_failures() {
+        assert_eq!(run_headless_guarded(|| panic!("simulated failure")), 1);
+    }
 }

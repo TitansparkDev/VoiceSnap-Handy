@@ -3079,6 +3079,41 @@ pub fn get_available_accelerators() -> AvailableAccelerators {
     }
 }
 
+impl Drop for TranscriptionManager {
+    fn drop(&mut self) {
+        // Skip shutdown unless this is the very last clone. TranscriptionManager
+        // is cloned by initiate_model_load() and the watcher thread — those
+        // clones dropping must not kill the watcher. The watcher thread holds
+        // its own clone, so engine's strong_count is always >= 2 while the
+        // watcher is alive. When it reaches 1, only this instance remains
+        // and we can safely shut down.
+        if Arc::strong_count(&self.engine) > 1 {
+            return;
+        }
+
+        // Signal the watcher thread to shutdown
+        self.shutdown_signal.store(true, Ordering::Relaxed);
+
+        // Wait for the thread to finish gracefully.
+        // Use match instead of unwrap to avoid panicking if the mutex is
+        // poisoned — a panic inside Drop calls abort().
+        let mut guard = match self.watcher_handle.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("Recovered poisoned watcher_handle mutex during TranscriptionManager drop — a panic occurred earlier this session");
+                e.into_inner()
+            }
+        };
+        if let Some(handle) = guard.take() {
+            if let Err(e) = handle.join() {
+                warn!("Failed to join idle watcher thread: {:?}", e);
+            } else {
+                debug!("Idle watcher thread joined successfully");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3354,6 +3389,8 @@ mod tests {
         assert!(!serialized.contains("transcript"));
         assert!(!serialized.contains("audio"));
         assert!(!serialized.contains("clipboard"));
+        assert!(!serialized.contains("window_title"));
+        assert!(!serialized.contains("window title"));
     }
 
     #[test]
@@ -3431,9 +3468,11 @@ mod tests {
 
     #[test]
     fn no_vulkan_startup_stays_cpu_while_saved_gpu_intent_survives() {
-        let mut settings = AppSettings::default();
-        settings.transcribe_accelerator = TranscribeAcceleratorSetting::Gpu;
-        settings.transcribe_gpu_device = Some("vulkan-device-that-is-currently-absent".to_string());
+        let settings = AppSettings {
+            transcribe_accelerator: TranscribeAcceleratorSetting::Gpu,
+            transcribe_gpu_device: Some("vulkan-device-that-is-currently-absent".to_string()),
+            ..Default::default()
+        };
         let saved = describe_saved_transcribe_preference(&settings);
 
         // No registered GPU is the deterministic stand-in for a machine with no
@@ -3463,9 +3502,11 @@ mod tests {
 
     #[test]
     fn startup_gpu_failure_falls_back_for_run_without_rewriting_saved_preference() {
-        let mut settings = AppSettings::default();
-        settings.transcribe_accelerator = TranscribeAcceleratorSetting::Gpu;
-        settings.transcribe_gpu_device = Some("stable-discrete-gpu".to_string());
+        let settings = AppSettings {
+            transcribe_accelerator: TranscribeAcceleratorSetting::Gpu,
+            transcribe_gpu_device: Some("stable-discrete-gpu".to_string()),
+            ..Default::default()
+        };
 
         let saved_before = describe_saved_transcribe_preference(&settings);
         let requested_backend = Backend::Auto;
@@ -3495,9 +3536,11 @@ mod tests {
 
     #[test]
     fn runtime_gpu_failure_preserves_saved_and_recommended_diagnostics_for_cpu_reload() {
-        let mut settings = AppSettings::default();
-        settings.transcribe_accelerator = TranscribeAcceleratorSetting::Gpu;
-        settings.transcribe_gpu_device = Some("stable-discrete-gpu".to_string());
+        let settings = AppSettings {
+            transcribe_accelerator: TranscribeAcceleratorSetting::Gpu,
+            transcribe_gpu_device: Some("stable-discrete-gpu".to_string()),
+            ..Default::default()
+        };
 
         let saved = describe_saved_transcribe_preference(&settings);
         let recommended_backend = Backend::Auto;
@@ -3541,9 +3584,11 @@ mod tests {
 
     #[test]
     fn runtime_health_downgrade_preserves_actual_runtime_and_saved_preference() {
-        let mut settings = AppSettings::default();
-        settings.transcribe_accelerator = TranscribeAcceleratorSetting::Gpu;
-        settings.transcribe_gpu_device = Some("stable-discrete-gpu".to_string());
+        let settings = AppSettings {
+            transcribe_accelerator: TranscribeAcceleratorSetting::Gpu,
+            transcribe_gpu_device: Some("stable-discrete-gpu".to_string()),
+            ..Default::default()
+        };
         let saved = describe_saved_transcribe_preference(&settings);
         let mut runtime = Some(transcribe_runtime_metadata(
             "vulkan".to_string(),
@@ -3580,9 +3625,11 @@ mod tests {
 
     #[test]
     fn saved_transcribe_preference_keeps_exact_device_identity_separate() {
-        let mut settings = AppSettings::default();
-        settings.transcribe_accelerator = TranscribeAcceleratorSetting::Gpu;
-        settings.transcribe_gpu_device = Some("stable-device-id".to_string());
+        let mut settings = AppSettings {
+            transcribe_accelerator: TranscribeAcceleratorSetting::Gpu,
+            transcribe_gpu_device: Some("stable-device-id".to_string()),
+            ..Default::default()
+        };
 
         assert_eq!(
             describe_saved_transcribe_preference(&settings),
@@ -3891,40 +3938,5 @@ mod tests {
         assert!(matches!(plan.task, Task::Transcribe));
         assert_eq!(plan.language.as_deref(), Some("es"));
         assert_eq!(plan.target_language, None);
-    }
-}
-
-impl Drop for TranscriptionManager {
-    fn drop(&mut self) {
-        // Skip shutdown unless this is the very last clone. TranscriptionManager
-        // is cloned by initiate_model_load() and the watcher thread — those
-        // clones dropping must not kill the watcher. The watcher thread holds
-        // its own clone, so engine's strong_count is always >= 2 while the
-        // watcher is alive. When it reaches 1, only this instance remains
-        // and we can safely shut down.
-        if Arc::strong_count(&self.engine) > 1 {
-            return;
-        }
-
-        // Signal the watcher thread to shutdown
-        self.shutdown_signal.store(true, Ordering::Relaxed);
-
-        // Wait for the thread to finish gracefully.
-        // Use match instead of unwrap to avoid panicking if the mutex is
-        // poisoned — a panic inside Drop calls abort().
-        let mut guard = match self.watcher_handle.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                warn!("Recovered poisoned watcher_handle mutex during TranscriptionManager drop — a panic occurred earlier this session");
-                e.into_inner()
-            }
-        };
-        if let Some(handle) = guard.take() {
-            if let Err(e) = handle.join() {
-                warn!("Failed to join idle watcher thread: {:?}", e);
-            } else {
-                debug!("Idle watcher thread joined successfully");
-            }
-        }
     }
 }

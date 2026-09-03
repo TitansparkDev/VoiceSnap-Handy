@@ -31,9 +31,15 @@ fn retry_cleanup_input(raw_text: &str) -> Result<&str, String> {
     }
 }
 
-fn retry_cleanup_update(
-    processed: ProcessedTranscription,
-) -> Result<(String, Option<String>, Option<String>, Option<String>, String), String> {
+type RetryCleanupUpdate = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn retry_cleanup_update(processed: ProcessedTranscription) -> Result<RetryCleanupUpdate, String> {
     let cleaned_text = processed
         .post_processed_text
         .filter(|text| !text.trim().is_empty())
@@ -50,6 +56,7 @@ fn retry_cleanup_update(
 
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)] // IPC filter fields are part of the generated command contract.
 pub async fn get_history_entries(
     _app: AppHandle,
     history_manager: State<'_, Arc<HistoryManager>>,
@@ -217,13 +224,8 @@ pub async fn retry_history_entry_cleanup(
     let cleanup_started = Instant::now();
     let processed = process_transcription_output(&app, raw_text, true).await;
     let cleanup_total_ms = i64::try_from(cleanup_started.elapsed().as_millis()).unwrap_or(i64::MAX);
-    let (
-        cleaned_text,
-        post_process_prompt,
-        cleanup_prompt_id,
-        cleanup_model_id,
-        cleanup_mode,
-    ) = retry_cleanup_update(processed)?;
+    let (cleaned_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, cleanup_mode) =
+        retry_cleanup_update(processed)?;
 
     history_manager
         .update_cleanup(

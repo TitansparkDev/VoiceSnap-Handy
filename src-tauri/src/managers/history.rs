@@ -297,6 +297,7 @@ impl HistoryManager {
 
     /// Save a new history entry to the database.
     /// The WAV file should already have been written to the recordings directory.
+    #[allow(clippy::too_many_arguments)] // Mirrors the durable history schema at the write boundary.
     pub fn save_entry(
         &self,
         file_name: String,
@@ -437,6 +438,7 @@ impl HistoryManager {
     }
 
     /// Update an existing history entry with new transcription results (used by retry).
+    #[allow(clippy::too_many_arguments)] // Retry persistence intentionally records the full runtime snapshot atomically.
     pub fn update_transcription(
         &self,
         id: i64,
@@ -526,6 +528,7 @@ impl HistoryManager {
         Ok(entry)
     }
 
+    #[allow(clippy::too_many_arguments)] // Cleanup retry fields are persisted together as one atomic update.
     pub fn update_cleanup(
         &self,
         id: i64,
@@ -561,6 +564,7 @@ impl HistoryManager {
         Ok(entry)
     }
 
+    #[allow(clippy::too_many_arguments)] // Internal SQL helper mirrors update_cleanup's atomic field set.
     fn update_cleanup_with_conn(
         conn: &Connection,
         id: i64,
@@ -801,6 +805,7 @@ impl HistoryManager {
         Ok(deleted_count)
     }
 
+    #[allow(clippy::too_many_arguments)] // Query arguments mirror the public history filter contract.
     pub async fn get_history_entries(
         &self,
         cursor: Option<i64>,
@@ -826,6 +831,8 @@ impl HistoryManager {
         )
     }
 
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)] // Test helper retains the pre-cleanup-filter query shape.
     fn get_history_entries_with_conn(
         conn: &Connection,
         cursor: Option<i64>,
@@ -849,6 +856,7 @@ impl HistoryManager {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // SQL parameter list mirrors the independently composable filters.
     fn get_history_entries_filtered_with_conn(
         conn: &Connection,
         cursor: Option<i64>,
