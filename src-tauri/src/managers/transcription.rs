@@ -1,6 +1,6 @@
 use crate::audio_toolkit::{
-    apply_custom_words, detect_output_language, normalize_transcription_output,
-    remove_filler_words, OutputLanguageEvidence,
+    apply_vocabulary_corrections, build_vocabulary_prompt, detect_output_language,
+    normalize_transcription_output, remove_filler_words, OutputLanguageEvidence,
 };
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::model::{EngineType, ModelManager};
@@ -1801,6 +1801,7 @@ impl TranscriptionManager {
         // `model_is_whisper` instead, since non-whisper archs can advertise
         // the feature while rejecting the whisper-kind extension.
         let mut model_takes_initial_prompt = false;
+        let mut vocabulary_prompted = false;
         // Whether the loaded model is actually whisper-family (arch string).
         // Non-whisper archs (e.g. Voxtral Small) can advertise
         // Feature::InitialPrompt yet reject the whisper-kind run extension
@@ -1868,19 +1869,27 @@ impl TranscriptionManager {
             let transcribe_result = catch_unwind(AssertUnwindSafe(|| -> Result<String> {
                 match &mut engine {
                     LoadedEngine::TranscribeCpp(session) => {
-                        // Custom words become the initial prompt ONLY for models
-                        // that accept one (whisper family). Attaching the
-                        // whisper run extension to a non-whisper arch is rejected
-                        // with INVALID_ARG, so skip it there and let the fuzzy
-                        // post-correction handle custom words instead.
-                        let family = if settings.custom_words.is_empty() || !model_is_whisper {
-                            None
+                        // Only whisper-kind runs can carry the extension, and the
+                        // live model must also advertise InitialPrompt. The prompt
+                        // itself is bounded/sanitized and contains canonical written
+                        // forms only. Unsupported engines keep vocabulary local and
+                        // use deterministic post-correction below.
+                        let vocabulary_prompt = if model_is_whisper && model_takes_initial_prompt {
+                            build_vocabulary_prompt(
+                                &settings.vocabulary_v1,
+                                &settings.custom_words,
+                                Some(&validated_language),
+                            )
                         } else {
-                            Some(RunExtension::Whisper(WhisperRunOptions {
-                                initial_prompt: Some(settings.custom_words.join(", ")),
-                                ..Default::default()
-                            }))
+                            None
                         };
+                        vocabulary_prompted = vocabulary_prompt.is_some();
+                        let family = vocabulary_prompt.map(|initial_prompt| {
+                            RunExtension::Whisper(WhisperRunOptions {
+                                initial_prompt: Some(initial_prompt),
+                                ..Default::default()
+                            })
+                        });
 
                         let run_plan = transcribe_cpp_run_plan(
                             settings.translate_to_english,
@@ -2072,15 +2081,14 @@ impl TranscriptionManager {
             (text, output_language, model_languages)
         };
 
-        // Apply fuzzy word correction if custom words are configured — UNLESS the
-        // words were already handed to the model as an initial prompt (whisper
-        // family). We don't pass a prompt to non-whisper models (it requires the
-        // whisper-kind run extension), so they still get fuzzy correction here,
-        // same as the ONNX engines.
+        // Deterministic aliases/replacements always run. The bounded fuzzy
+        // fallback runs only when vocabulary was not actually sent to a prompt-
+        // capable model; streaming/unsupported engines therefore never pretend
+        // to have native vocabulary support.
         let filtered_result = post_process_transcription_text(
             result,
             &settings,
-            model_is_whisper,
+            vocabulary_prompted,
             &output_language,
             &model_languages,
         );
@@ -2383,15 +2391,25 @@ fn post_process_transcription_text(
     supported_languages: &[String],
 ) -> String {
     fail_open_text_transform(raw, |raw| {
-        let corrected = if !settings.custom_words.is_empty() && !custom_words_already_prompted {
-            apply_custom_words(
-                &raw,
-                &settings.custom_words,
-                settings.word_correction_threshold,
-            )
-        } else {
-            raw
-        };
+        let vocabulary_result = apply_vocabulary_corrections(
+            &raw,
+            &settings.vocabulary_v1,
+            &settings.custom_words,
+            settings.word_correction_threshold,
+            output_language,
+            !custom_words_already_prompted,
+        );
+        if vocabulary_result.metadata.applied() {
+            // Attribution is deliberately metadata-only: never log transcript,
+            // aliases, written forms, or replacement contents.
+            debug!(
+                "deterministic_text_operation=vocabulary aliases={} replacements={} fuzzy={}",
+                vocabulary_result.metadata.alias_replacements,
+                vocabulary_result.metadata.scoped_replacements,
+                vocabulary_result.metadata.fuzzy_applied
+            );
+        }
+        let corrected = vocabulary_result.text;
 
         // Last-resort language evidence: confidence-gated detection from the
         // transcribed text itself, constrained to the model's languages. Only

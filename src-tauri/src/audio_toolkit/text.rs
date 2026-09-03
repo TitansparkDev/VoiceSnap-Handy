@@ -1,7 +1,33 @@
+use crate::settings::{VocabularySettingsV1, VocabularyEntry, VocabularyReplacement};
 use natural::phonetics::soundex;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use std::collections::HashSet;
 use strsim::levenshtein;
+
+const VOCABULARY_PROMPT_MAX_ENTRIES: usize = 64;
+const VOCABULARY_PROMPT_MAX_CHARS: usize = 2048;
+const VOCABULARY_TERM_MAX_CHARS: usize = 80;
+const VOCABULARY_MAX_RULES: usize = 256;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VocabularyCorrectionMetadata {
+    pub alias_replacements: usize,
+    pub scoped_replacements: usize,
+    pub fuzzy_applied: bool,
+}
+
+impl VocabularyCorrectionMetadata {
+    pub fn applied(&self) -> bool {
+        self.alias_replacements > 0 || self.scoped_replacements > 0 || self.fuzzy_applied
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VocabularyCorrectionResult {
+    pub text: String,
+    pub metadata: VocabularyCorrectionMetadata,
+}
 
 /// Builds an n-gram string by cleaning and concatenating words
 ///
@@ -82,52 +108,74 @@ fn find_best_match<'a>(
     custom_word_match_keys: &[CustomWordMatchKey],
     threshold: f64,
 ) -> Option<(&'a String, f64)> {
-    if !is_supported_fuzzy_key(candidate) || candidate.chars().count() > 50 {
+    let candidate_len = candidate.chars().count();
+    if !is_supported_fuzzy_key(candidate) || candidate_len > 50 {
         return None;
     }
 
+    // The user-facing threshold predates the richer vocabulary contract and can
+    // be set very high in old stores. Cap fuzzy edits to a conservative bound;
+    // exact matches still work regardless of this cap.
+    let safe_threshold = threshold.clamp(0.0, 0.34);
     let mut best_match: Option<&String> = None;
+    let mut best_index: Option<usize> = None;
     let mut best_score = f64::MAX;
+    let mut second_best_score = f64::MAX;
 
     for custom_word_key in custom_word_match_keys {
-        // Skip if lengths are too different (optimization + prevents over-matching)
-        // Use percentage-based check: max 25% length difference (prevents n-grams from
-        // matching significantly shorter custom words, e.g., "openaigpt" vs "openai")
-        let candidate_len = candidate.chars().count();
         let custom_word_len = custom_word_key.key.chars().count();
-        let len_diff = candidate_len.abs_diff(custom_word_len) as f64;
-        let max_len = candidate_len.max(custom_word_len) as f64;
-        let max_allowed_diff = (max_len * 0.25).max(2.0); // At least 2 chars difference allowed
-        if len_diff > max_allowed_diff {
+        let exact_match = candidate == custom_word_key.key;
+
+        // Short/common tokens are only eligible for exact matching. Fuzzy edits
+        // such as "a" -> "AI" or "in" -> "Inn" are too risky to apply.
+        if !exact_match && (candidate_len < 4 || custom_word_len < 4) {
             continue;
         }
 
-        // Calculate Levenshtein distance (normalized by length)
-        let levenshtein_dist = levenshtein(candidate, &custom_word_key.key);
-        let levenshtein_score = if max_len > 0.0 {
-            levenshtein_dist as f64 / max_len
-        } else {
-            1.0
-        };
+        let len_diff = candidate_len.abs_diff(custom_word_len) as f64;
+        let max_len = candidate_len.max(custom_word_len) as f64;
+        let max_allowed_diff = (max_len * 0.25).max(1.0);
+        if !exact_match && len_diff > max_allowed_diff {
+            continue;
+        }
 
-        // Soundex is an English/ASCII phonetic algorithm. Numeric terms can
-        // still use edit distance, but must not receive a phonetic boost.
-        let phonetic_match = supports_soundex(candidate)
+        let levenshtein_score = if exact_match {
+            0.0
+        } else {
+            levenshtein(candidate, &custom_word_key.key) as f64 / max_len
+        };
+        let phonetic_match = !exact_match
+            && supports_soundex(candidate)
             && supports_soundex(&custom_word_key.key)
             && soundex(candidate, &custom_word_key.key);
-
-        // Combine scores: favor phonetic matches, but also consider string similarity
         let combined_score = if phonetic_match {
-            levenshtein_score * 0.3 // Give significant boost to phonetic matches
+            levenshtein_score * 0.3
         } else {
             levenshtein_score
         };
 
-        // Accept if the score is good enough (configurable threshold)
-        if combined_score < threshold && combined_score < best_score {
-            best_match = Some(&custom_words[custom_word_key.word_index]);
-            best_score = combined_score;
+        if !exact_match && combined_score > safe_threshold {
+            continue;
         }
+
+        if combined_score < best_score {
+            if best_index != Some(custom_word_key.word_index) {
+                second_best_score = best_score;
+            }
+            best_match = Some(&custom_words[custom_word_key.word_index]);
+            best_index = Some(custom_word_key.word_index);
+            best_score = combined_score;
+        } else if best_index != Some(custom_word_key.word_index)
+            && combined_score < second_best_score
+        {
+            second_best_score = combined_score;
+        }
+    }
+
+    // Ambiguous non-exact fuzzy candidates fail closed instead of depending on
+    // list order. A clear margin is required between the best two terms.
+    if best_score > 0.0 && second_best_score.is_finite() && second_best_score - best_score < 0.08 {
+        return None;
     }
 
     best_match.map(|m| (m, best_score))
@@ -154,9 +202,11 @@ pub fn apply_custom_words(text: &str, custom_words: &[String], threshold: f64) -
     }
 
     // Pre-compute normalized comparison keys to avoid repeated allocations.
+    let mut seen_words = HashSet::new();
     let custom_word_match_keys: Vec<CustomWordMatchKey> = custom_words
         .iter()
         .enumerate()
+        .filter(|(_, word)| seen_words.insert(build_match_key(word)))
         .flat_map(|(index, word)| build_custom_word_match_keys(word, index))
         .collect();
 
@@ -217,6 +267,265 @@ pub fn apply_custom_words(text: &str, custom_words: &[String], threshold: f64) -
     }
 
     result.join(" ")
+}
+
+fn normalized_language(language: &str) -> Option<String> {
+    let normalized = language.trim().to_lowercase();
+    if normalized.is_empty() || normalized == "auto" {
+        None
+    } else {
+        Some(normalized.replace('_', "-"))
+    }
+}
+
+fn language_scope_matches(scope: Option<&str>, output_language: Option<&str>) -> bool {
+    let Some(scope) = scope.and_then(normalized_language) else {
+        return true;
+    };
+    let Some(output) = output_language.and_then(normalized_language) else {
+        return false;
+    };
+
+    scope == output
+        || scope.split('-').next() == output.split('-').next()
+}
+
+fn sanitized_prompt_term(value: &str) -> Option<String> {
+    let without_controls: String = value.chars().filter(|c| !c.is_control()).collect();
+    let compact = without_controls.split_whitespace().collect::<Vec<_>>().join(" ");
+    let bounded: String = compact.chars().take(VOCABULARY_TERM_MAX_CHARS).collect();
+    (!bounded.is_empty()).then_some(bounded)
+}
+
+fn safe_rule_term(value: &str) -> Option<String> {
+    if value.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > VOCABULARY_TERM_MAX_CHARS {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Build bounded, control-character-free model context. Only canonical written
+/// forms are sent; spoken aliases and replacement sources remain local so prompt
+/// injection through those fields is impossible.
+pub fn build_vocabulary_prompt(
+    vocabulary: &VocabularySettingsV1,
+    legacy_custom_words: &[String],
+    language: Option<&str>,
+) -> Option<String> {
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    let mut used_chars = 0usize;
+
+    let mut push_term = |term: &str| {
+        if terms.len() >= VOCABULARY_PROMPT_MAX_ENTRIES {
+            return;
+        }
+        let Some(term) = sanitized_prompt_term(term) else {
+            return;
+        };
+        let dedupe_key = term.to_lowercase();
+        if !seen.insert(dedupe_key) {
+            return;
+        }
+        let separator_chars = usize::from(!terms.is_empty()) * 2;
+        let term_chars = term.chars().count();
+        if used_chars + separator_chars + term_chars > VOCABULARY_PROMPT_MAX_CHARS {
+            return;
+        }
+        used_chars += separator_chars + term_chars;
+        terms.push(term);
+    };
+
+    for entry in vocabulary.entries.iter().take(VOCABULARY_MAX_RULES) {
+        if entry.enabled && language_scope_matches(entry.language.as_deref(), language) {
+            push_term(&entry.written);
+        }
+    }
+    for word in legacy_custom_words {
+        push_term(word);
+    }
+
+    (!terms.is_empty()).then(|| terms.join(", "))
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn exact_rule_replace(
+    text: &str,
+    from: &str,
+    to: &str,
+    case_sensitive: bool,
+    preserve_punctuation: bool,
+) -> (String, usize) {
+    let pattern = if case_sensitive {
+        regex::escape(from)
+    } else {
+        format!("(?i:{})", regex::escape(from))
+    };
+    let Ok(regex) = Regex::new(&pattern) else {
+        return (text.to_string(), 0);
+    };
+
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut replacements = 0usize;
+    for matched in regex.find_iter(text) {
+        let left = text[..matched.start()].chars().next_back();
+        let right = text[matched.end()..].chars().next();
+        if left.is_some_and(is_word_char) || right.is_some_and(is_word_char) {
+            continue;
+        }
+        if !preserve_punctuation
+            && (left.is_some_and(|c| !c.is_whitespace() && !is_word_char(c))
+                || right.is_some_and(|c| !c.is_whitespace() && !is_word_char(c)))
+        {
+            continue;
+        }
+
+        result.push_str(&text[cursor..matched.start()]);
+        result.push_str(to);
+        cursor = matched.end();
+        replacements += 1;
+    }
+
+    if replacements == 0 {
+        return (text.to_string(), 0);
+    }
+    result.push_str(&text[cursor..]);
+    (result, replacements)
+}
+
+fn apply_replacement_rule(
+    text: &str,
+    rule: &VocabularyReplacement,
+) -> (String, usize) {
+    let (Some(from), Some(to)) = (safe_rule_term(&rule.from), safe_rule_term(&rule.to)) else {
+        return (text.to_string(), 0);
+    };
+    exact_rule_replace(
+        text,
+        &from,
+        &to,
+        rule.case_sensitive.unwrap_or(false),
+        rule.preserve_punctuation.unwrap_or(true),
+    )
+}
+
+fn apply_alias_rule(text: &str, entry: &VocabularyEntry) -> (String, usize) {
+    let Some(alias) = entry.spoken_alias.as_deref().and_then(safe_rule_term) else {
+        return (text.to_string(), 0);
+    };
+    let Some(written) = safe_rule_term(&entry.written) else {
+        return (text.to_string(), 0);
+    };
+    if alias.eq_ignore_ascii_case(&written) {
+        return (text.to_string(), 0);
+    }
+    exact_rule_replace(
+        text,
+        &alias,
+        &written,
+        entry.case_sensitive.unwrap_or(false),
+        entry.preserve_punctuation.unwrap_or(true),
+    )
+}
+
+/// Apply deterministic scoped replacements and aliases first, then the bounded
+/// fuzzy fallback when the model did not already receive vocabulary context.
+/// The result carries counts only; no transcript or vocabulary contents are
+/// needed to attribute the operation in logs/history metadata.
+pub fn apply_vocabulary_corrections(
+    text: &str,
+    vocabulary: &VocabularySettingsV1,
+    legacy_custom_words: &[String],
+    threshold: f64,
+    output_language: &OutputLanguageEvidence,
+    allow_fuzzy: bool,
+) -> VocabularyCorrectionResult {
+    let output_language = output_language.language();
+    let mut current = text.to_string();
+    let mut metadata = VocabularyCorrectionMetadata::default();
+    let mut seen_rules = HashSet::new();
+
+    for rule in vocabulary.replacements.iter().take(VOCABULARY_MAX_RULES) {
+        if !rule.enabled || !language_scope_matches(rule.language.as_deref(), output_language) {
+            continue;
+        }
+        let dedupe_key = format!(
+            "replacement:{}:{}:{}",
+            rule.from.to_lowercase(),
+            rule.to.to_lowercase(),
+            rule.language.as_deref().unwrap_or("").to_lowercase()
+        );
+        if !seen_rules.insert(dedupe_key) {
+            continue;
+        }
+        let (updated, count) = apply_replacement_rule(&current, rule);
+        current = updated;
+        metadata.scoped_replacements += count;
+    }
+
+    for entry in vocabulary.entries.iter().take(VOCABULARY_MAX_RULES) {
+        if !entry.enabled || !language_scope_matches(entry.language.as_deref(), output_language) {
+            continue;
+        }
+        let Some(alias) = entry.spoken_alias.as_deref() else {
+            continue;
+        };
+        let dedupe_key = format!(
+            "alias:{}:{}:{}",
+            alias.to_lowercase(),
+            entry.written.to_lowercase(),
+            entry.language.as_deref().unwrap_or("").to_lowercase()
+        );
+        if !seen_rules.insert(dedupe_key) {
+            continue;
+        }
+        let (updated, count) = apply_alias_rule(&current, entry);
+        current = updated;
+        metadata.alias_replacements += count;
+    }
+
+    if allow_fuzzy {
+        let mut fuzzy_words = Vec::new();
+        let mut seen_words = HashSet::new();
+        for entry in vocabulary.entries.iter().take(VOCABULARY_MAX_RULES) {
+            if !entry.enabled || !language_scope_matches(entry.language.as_deref(), output_language) {
+                continue;
+            }
+            let Some(written) = safe_rule_term(&entry.written) else {
+                continue;
+            };
+            if seen_words.insert(build_match_key(&written)) {
+                fuzzy_words.push(written);
+            }
+        }
+        for word in legacy_custom_words {
+            let Some(word) = safe_rule_term(word) else {
+                continue;
+            };
+            if seen_words.insert(build_match_key(&word)) {
+                fuzzy_words.push(word);
+            }
+        }
+
+        let corrected = apply_custom_words(&current, &fuzzy_words, threshold);
+        if corrected != current {
+            metadata.fuzzy_applied = true;
+            current = corrected;
+        }
+    }
+
+    VocabularyCorrectionResult {
+        text: current,
+        metadata,
+    }
 }
 
 /// Preserves the case pattern of the original word when applying a replacement
@@ -448,6 +757,32 @@ mod tests {
         let language = OutputLanguageEvidence::UserSelected(language.to_string());
         let filtered = remove_filler_words(text, &language, custom_filler_words, true);
         normalize_transcription_output(&filtered)
+    }
+
+    fn rich_entry(
+        written: &str,
+        alias: Option<&str>,
+        language: Option<&str>,
+    ) -> VocabularyEntry {
+        VocabularyEntry {
+            written: written.to_string(),
+            spoken_alias: alias.map(str::to_string),
+            language: language.map(str::to_string),
+            enabled: true,
+            case_sensitive: None,
+            preserve_punctuation: None,
+        }
+    }
+
+    fn vocabulary(
+        entries: Vec<VocabularyEntry>,
+        replacements: Vec<VocabularyReplacement>,
+    ) -> VocabularySettingsV1 {
+        VocabularySettingsV1 {
+            version: 1,
+            entries,
+            replacements,
+        }
     }
 
     #[test]
@@ -824,5 +1159,176 @@ mod tests {
         let custom_words = vec!["你号".to_string()];
         let result = apply_custom_words(text, &custom_words, 1.0);
         assert_eq!(result, text);
+    }
+
+    #[test]
+    fn vocabulary_short_words_never_fuzzy_overmatch() {
+        let custom_words = vec!["AI".to_string(), "Inn".to_string()];
+        assert_eq!(apply_custom_words("a is useful", &custom_words, 1.0), "a is useful");
+        assert_eq!(apply_custom_words("in here", &custom_words, 1.0), "in here");
+        assert_eq!(apply_custom_words("AI is useful", &custom_words, 1.0), "AI is useful");
+    }
+
+    #[test]
+    fn vocabulary_alias_is_scoped_and_does_not_overmatch() {
+        let vocab = vocabulary(vec![rich_entry("OpenAI", Some("open eye"), Some("en"))], vec![]);
+        let en = OutputLanguageEvidence::UserSelected("en-US".to_string());
+        let fr = OutputLanguageEvidence::UserSelected("fr".to_string());
+
+        let corrected = apply_vocabulary_corrections(
+            "use open eye, not open eyesight",
+            &vocab,
+            &[],
+            0.18,
+            &en,
+            true,
+        );
+        assert_eq!(corrected.text, "use OpenAI, not open eyesight");
+        assert_eq!(corrected.metadata.alias_replacements, 1);
+
+        let wrong_language = apply_vocabulary_corrections(
+            "use open eye",
+            &vocab,
+            &[],
+            0.18,
+            &fr,
+            true,
+        );
+        assert_eq!(wrong_language.text, "use open eye");
+        assert!(!wrong_language.metadata.applied());
+    }
+
+    #[test]
+    fn vocabulary_cjk_alias_uses_exact_boundaries() {
+        let vocab = vocabulary(vec![rich_entry("你好", Some("你号"), Some("zh"))], vec![]);
+        let zh = OutputLanguageEvidence::ModelDetected("zh-CN".to_string());
+
+        let corrected = apply_vocabulary_corrections("你号。", &vocab, &[], 1.0, &zh, true);
+        assert_eq!(corrected.text, "你好。");
+
+        let embedded = apply_vocabulary_corrections("你号世界", &vocab, &[], 1.0, &zh, true);
+        assert_eq!(embedded.text, "你号世界");
+    }
+
+    #[test]
+    fn vocabulary_respects_enabled_case_and_punctuation_policy() {
+        let mut disabled = rich_entry("Handy", Some("hand ee"), None);
+        disabled.enabled = false;
+        let mut case_sensitive = rich_entry("VoiceSnap", Some("Voice Snap"), None);
+        case_sensitive.case_sensitive = Some(true);
+        let mut punctuation_sensitive = rich_entry("ChatGPT", Some("chat gpt"), None);
+        punctuation_sensitive.preserve_punctuation = Some(false);
+        let vocab = vocabulary(vec![disabled, case_sensitive, punctuation_sensitive], vec![]);
+        let language = OutputLanguageEvidence::Unknown;
+
+        let result = apply_vocabulary_corrections(
+            "hand ee voice snap chat gpt, Voice Snap chat gpt",
+            &vocab,
+            &[],
+            0.18,
+            &language,
+            false,
+        );
+        assert_eq!(result.text, "hand ee voice snap chat gpt, VoiceSnap ChatGPT");
+        assert_eq!(result.metadata.alias_replacements, 2);
+    }
+
+    #[test]
+    fn vocabulary_duplicate_rules_are_deterministic() {
+        let first = rich_entry("OpenAI", Some("open eye"), None);
+        let duplicate = rich_entry("OpenAI", Some("open eye"), None);
+        let vocab = vocabulary(vec![first, duplicate], vec![]);
+        let result = apply_vocabulary_corrections(
+            "open eye",
+            &vocab,
+            &[],
+            0.18,
+            &OutputLanguageEvidence::Unknown,
+            false,
+        );
+        assert_eq!(result.text, "OpenAI");
+        assert_eq!(result.metadata.alias_replacements, 1);
+    }
+
+    #[test]
+    fn vocabulary_scoped_replacements_do_not_match_inside_words() {
+        let vocab = vocabulary(
+            vec![],
+            vec![VocabularyReplacement {
+                from: "cat".to_string(),
+                to: "dog".to_string(),
+                language: Some("en".to_string()),
+                enabled: true,
+                case_sensitive: None,
+                preserve_punctuation: None,
+            }],
+        );
+        let en = OutputLanguageEvidence::UserSelected("en".to_string());
+        let result = apply_vocabulary_corrections(
+            "cat concatenate bobcat cat.",
+            &vocab,
+            &[],
+            0.18,
+            &en,
+            false,
+        );
+        assert_eq!(result.text, "dog concatenate bobcat dog.");
+        assert_eq!(result.metadata.scoped_replacements, 2);
+    }
+
+    #[test]
+    fn vocabulary_control_characters_are_sanitized_for_prompts_and_rejected_for_rules() {
+        let mut entry = rich_entry("Open\u{0007}AI", Some("open\u{0008}eye"), Some("en"));
+        entry.enabled = true;
+        let vocab = vocabulary(
+            vec![entry],
+            vec![VocabularyReplacement {
+                from: "bad\u{0001}source".to_string(),
+                to: "safe".to_string(),
+                language: Some("en".to_string()),
+                enabled: true,
+                case_sensitive: None,
+                preserve_punctuation: None,
+            }],
+        );
+
+        let prompt = build_vocabulary_prompt(&vocab, &[], Some("en")).unwrap();
+        assert_eq!(prompt, "OpenAI");
+        assert!(!prompt.chars().any(char::is_control));
+
+        let result = apply_vocabulary_corrections(
+            "open eye bad source",
+            &vocab,
+            &[],
+            0.18,
+            &OutputLanguageEvidence::UserSelected("en".to_string()),
+            false,
+        );
+        assert_eq!(result.text, "open eye bad source");
+        assert!(!result.metadata.applied());
+    }
+
+    #[test]
+    fn vocabulary_prompt_is_bounded_deduplicated_and_contains_only_written_forms() {
+        let mut entries = Vec::new();
+        for index in 0..100 {
+            entries.push(rich_entry(
+                &format!("Term{index}\u{0007}{}", "x".repeat(70)),
+                Some("SECRET-ALIAS"),
+                Some("en"),
+            ));
+        }
+        entries.push(rich_entry("FrenchOnly", Some("french alias"), Some("fr")));
+        entries.push(rich_entry("Duplicate", None, Some("en")));
+        entries.push(rich_entry("duplicate", None, Some("en")));
+        let vocab = vocabulary(entries, vec![]);
+        let prompt = build_vocabulary_prompt(&vocab, &["Legacy\u{0001}Word".to_string()], Some("en-US"))
+            .expect("bounded vocabulary prompt");
+
+        assert!(prompt.chars().count() <= VOCABULARY_PROMPT_MAX_CHARS);
+        assert!(prompt.split(", ").count() <= VOCABULARY_PROMPT_MAX_ENTRIES);
+        assert!(!prompt.chars().any(char::is_control));
+        assert!(!prompt.contains("SECRET-ALIAS"));
+        assert!(!prompt.contains("FrenchOnly"));
     }
 }
