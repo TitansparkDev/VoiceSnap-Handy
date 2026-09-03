@@ -465,6 +465,7 @@ impl HistoryManager {
         start_timestamp: Option<i64>,
         end_timestamp_exclusive: Option<i64>,
         model_filter: Option<&str>,
+        outcome_filter: Option<&str>,
     ) -> Result<PaginatedHistory> {
         let conn = self.get_connection()?;
         Self::get_history_entries_with_conn(
@@ -475,6 +476,7 @@ impl HistoryManager {
             start_timestamp,
             end_timestamp_exclusive,
             model_filter,
+            outcome_filter,
         )
     }
 
@@ -486,12 +488,19 @@ impl HistoryManager {
         start_timestamp: Option<i64>,
         end_timestamp_exclusive: Option<i64>,
         model_filter: Option<&str>,
+        outcome_filter: Option<&str>,
     ) -> Result<PaginatedHistory> {
         let limit = limit.map(|l| l.min(100));
         let fetch_count = limit
             .map(|lim| lim.saturating_add(1) as i64)
             .unwrap_or(i64::MAX);
         let search_pattern = Self::history_search_pattern(search);
+        let outcome_filter = match outcome_filter {
+            None => None,
+            Some("success") => Some(true),
+            Some("failure") => Some(false),
+            Some(value) => return Err(anyhow!("Invalid history outcome filter: {value}")),
+        };
 
         let mut stmt = conn.prepare(
             "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id
@@ -505,8 +514,13 @@ impl HistoryManager {
                AND (?3 IS NULL OR timestamp >= ?3)
                AND (?4 IS NULL OR timestamp < ?4)
                AND (?5 IS NULL OR model_id = ?5)
+               AND (
+                    ?6 IS NULL
+                    OR (?6 = 1 AND transcription_text != '')
+                    OR (?6 = 0 AND transcription_text = '')
+               )
              ORDER BY id DESC
-             LIMIT ?6",
+             LIMIT ?7",
         )?;
         let mut entries = stmt
             .query_map(
@@ -516,6 +530,7 @@ impl HistoryManager {
                     start_timestamp,
                     end_timestamp_exclusive,
                     model_filter,
+                    outcome_filter,
                     fetch_count
                 ],
                 Self::map_history_entry,

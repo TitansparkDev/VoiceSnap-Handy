@@ -17,6 +17,7 @@ pub async fn get_history_entries(
     start_timestamp: Option<i64>,
     end_timestamp_exclusive: Option<i64>,
     model_filter: Option<String>,
+    outcome_filter: Option<String>,
 ) -> Result<PaginatedHistory, String> {
     history_manager
         .get_history_entries(
@@ -26,6 +27,7 @@ pub async fn get_history_entries(
             start_timestamp,
             end_timestamp_exclusive,
             model_filter.as_deref(),
+            outcome_filter.as_deref(),
         )
         .await
         .map_err(|e| e.to_string())
