@@ -1172,6 +1172,46 @@ mod tests {
     }
 
     #[test]
+    fn stable_identity_disappearance_then_recovery_retries_only_requested_device() {
+        let preference = MicrophonePreference {
+            name: "Desk USB Mic".into(),
+            stable_id: Some("wasapi:desk-mic".into()),
+        };
+
+        // First enumeration after a disconnect contains both an unrelated mic
+        // and a same-named replacement. A stable preference must fail closed.
+        let first = select_requested_microphone(
+            &preference,
+            [
+                candidate(Some("wasapi:webcam"), "Webcam Mic", "unrelated"),
+                candidate(
+                    Some("wasapi:replacement"),
+                    "Desk USB Mic",
+                    "same-name-wrong-id",
+                ),
+            ],
+        );
+        assert!(first.is_err());
+
+        // The retry/recovery enumeration may rename the requested endpoint, but
+        // once its stable identity returns it is selected again.
+        let recovered = select_requested_microphone(
+            &preference,
+            [
+                candidate(Some("wasapi:webcam"), "Webcam Mic", "unrelated"),
+                candidate(Some("wasapi:desk-mic"), "Desk USB Mic (2)", "requested"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(recovered, "requested");
+
+        // Resolution is pure: the persisted preference remains the original
+        // stable identity across both the disappearance and recovery attempt.
+        assert_eq!(preference.name, "Desk USB Mic");
+        assert_eq!(preference.stable_id.as_deref(), Some("wasapi:desk-mic"));
+    }
+
+    #[test]
     fn legacy_name_only_preference_requires_exact_name() {
         let preference = MicrophonePreference {
             name: "USB Mic".into(),
