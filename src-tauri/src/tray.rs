@@ -682,6 +682,8 @@ mod tests {
             transcription_text: transcription.to_string(),
             post_processed_text: post_processed.map(|text| text.to_string()),
             post_process_prompt: None,
+            cleanup_prompt_id: None,
+            cleanup_model_id: None,
             post_process_requested: false,
             model_id: None,
             engine_type: None,

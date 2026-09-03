@@ -139,6 +139,20 @@ export function assertLoopbackEndpoint(endpoint) {
   return url.toString().replace(/\/$/, "");
 }
 
+/// Child-runtime environment used by the benchmark. The HTTP client is already
+/// restricted to loopback; these flags additionally prevent common model hubs
+/// and proxy settings from becoming an accidental setup/network dependency.
+export function offlineRuntimeEnv(baseEnv = process.env) {
+  return {
+    ...baseEnv,
+    HF_HUB_OFFLINE: "1",
+    TRANSFORMERS_OFFLINE: "1",
+    HF_HUB_DISABLE_TELEMETRY: "1",
+    NO_PROXY: "*",
+    no_proxy: "*",
+  };
+}
+
 export function normalizeCleanupOutput(value) {
   if (typeof value !== "string") return null;
   const withoutThink = value.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
@@ -337,13 +351,7 @@ async function startRuntime(options, candidate) {
   const started = performance.now();
   const child = spawn(options.runtimeCommand, args, {
     stdio: "ignore",
-    env: {
-      ...process.env,
-      HF_HUB_OFFLINE: "1",
-      TRANSFORMERS_OFFLINE: "1",
-      NO_PROXY: "*",
-      no_proxy: "*",
-    },
+    env: offlineRuntimeEnv(process.env),
   });
   const spawnFailure = new Promise((_, reject) => {
     child.once("error", () => reject(new Error("Failed to start the configured local runtime.")));
@@ -378,7 +386,7 @@ async function loadedModelId(endpoint, fallback) {
   }
 }
 
-function completionBody(model, fixture, disableReasoning, profile = GENERIC_PROFILE) {
+export function completionBody(model, fixture, disableReasoning, profile = GENERIC_PROFILE) {
   const s1Mini = profile === S1_MINI_PROFILE;
   return {
     model,
@@ -605,6 +613,12 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     runs_per_fixture: options.runs,
     request_timeout_ms: options.requestTimeoutMs,
     endpoint_scope: "loopback-only",
+    offline_contract: {
+      external_network_dependency: false,
+      model_assets: "local-only",
+      model_hub_lookups: "disabled",
+      proxy_bypass: "all",
+    },
     runtime_lane: options.runtimeArgs.some(
       (arg, index) => ["-ngl", "--n-gpu-layers"].includes(arg) && options.runtimeArgs[index + 1] === "0",
     )

@@ -4,8 +4,10 @@ import { createServer } from "node:http";
 import {
   assertLoopbackEndpoint,
   candidateIdentity,
+  completionBody,
   extractModelPath,
   normalizeCleanupOutput,
+  offlineRuntimeEnv,
   parseArgs,
   parseCandidateProfileSpec,
   parseCandidateSpec,
@@ -84,6 +86,45 @@ test("no explicit candidate defaults to the current configured local model", () 
 test("benchmark refuses non-loopback endpoints", () => {
   assert.equal(assertLoopbackEndpoint("http://localhost:8080/v1"), "http://localhost:8080/v1");
   assert.throws(() => assertLoopbackEndpoint("https://example.com/v1"), /loopback-only/);
+  assert.throws(() => assertLoopbackEndpoint("http://192.168.1.20:8080/v1"), /loopback-only/);
+});
+
+test("benchmark child runtime is explicitly offline and proxy-independent", () => {
+  const env = offlineRuntimeEnv({ HTTPS_PROXY: "http://proxy.example:3128" });
+  assert.equal(env.HF_HUB_OFFLINE, "1");
+  assert.equal(env.TRANSFORMERS_OFFLINE, "1");
+  assert.equal(env.HF_HUB_DISABLE_TELEMETRY, "1");
+  assert.equal(env.NO_PROXY, "*");
+  assert.equal(env.no_proxy, "*");
+});
+
+test("cleanup model request contains transcript text only, never ambient application data", () => {
+  const fixture = { id: "privacy", input: "only this transcript may be sent", accepted: [] };
+  const body = completionBody("local-model", fixture, true);
+  assert.deepEqual(Object.keys(body).sort(), [
+    "chat_template_kwargs",
+    "max_tokens",
+    "messages",
+    "model",
+    "reasoning_effort",
+    "stream",
+    "temperature",
+  ]);
+  assert.equal(body.messages.length, 2);
+  assert.equal(body.messages[1].content.includes(fixture.input), true);
+
+  const serialized = JSON.stringify(body);
+  for (const forbidden of [
+    "audio",
+    "clipboard",
+    "window_title",
+    "window title",
+    "application_data",
+    "application data",
+    "foreground_app",
+  ]) {
+    assert.equal(serialized.toLowerCase().includes(forbidden), false, `${forbidden} must not reach cleanup`);
+  }
 });
 
 test("cleanup output normalization accepts text and rejects wrappers", () => {

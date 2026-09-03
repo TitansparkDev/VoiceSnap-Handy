@@ -546,6 +546,13 @@ pub(crate) struct ProcessedTranscription {
     pub final_text: String,
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
+    /// Stable selected prompt identifier used for cleanup. Unlike
+    /// `post_process_prompt`, this is safe metadata and remains meaningful when
+    /// the prompt body is later edited.
+    pub cleanup_prompt_id: Option<String>,
+    /// Cleanup-model identifier, separate from the ASR `model_id` persisted in
+    /// history. This never contains transcript or application context.
+    pub cleanup_model_id: Option<String>,
     pub cleanup_mode: String,
 }
 
@@ -650,6 +657,13 @@ pub(crate) async fn process_transcription_output(
 ) -> ProcessedTranscription {
     let settings = get_settings(app);
     let cleanup_mode = resolve_history_cleanup_mode(&settings, post_process);
+    let cleanup_prompt_id = post_process
+        .then(|| settings.post_process_selected_prompt_id.clone())
+        .flatten();
+    let cleanup_model_id = post_process
+        .then(|| settings.post_process_models.get(&settings.post_process_provider_id).cloned())
+        .flatten()
+        .filter(|model| !model.trim().is_empty());
     let mut final_text = transcription.to_string();
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
@@ -688,6 +702,8 @@ pub(crate) async fn process_transcription_output(
         final_text,
         post_processed_text,
         post_process_prompt,
+        cleanup_prompt_id,
+        cleanup_model_id,
         cleanup_mode,
     }
 }
@@ -1088,6 +1104,8 @@ impl ShortcutAction for TranscribeAction {
                                     post_process,
                                     processed.post_processed_text.clone(),
                                     processed.post_process_prompt.clone(),
+                                    processed.cleanup_prompt_id.clone(),
+                                    processed.cleanup_model_id.clone(),
                                     history_model_id,
                                     history_engine_type,
                                     history_language.clone(),
@@ -1191,6 +1209,8 @@ impl ShortcutAction for TranscribeAction {
                                     file_name,
                                     String::new(),
                                     post_process,
+                                    None,
+                                    None,
                                     None,
                                     None,
                                     selected_history_model_id,
