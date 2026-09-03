@@ -559,6 +559,73 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
     let bound_backend = tm.current_backend();
 
     let runs = args.repeat.unwrap_or(1).max(1);
+    if args.benchmark_stream {
+        let mut benchmark_samples = Vec::with_capacity(runs);
+        for i in 0..runs {
+            if !tm.is_model_loaded() {
+                if let Err(e) = tm.load_model_with_device(&model_id, device_index) {
+                    eprintln!("error: reload before benchmark run {} failed: {}", i + 1, e);
+                    return 1;
+                }
+            }
+            match tm.benchmark_fixed_audio(&samples, args.benchmark_frame_ms) {
+                Ok(sample) => benchmark_samples.push(sample),
+                Err(e) => {
+                    eprintln!("error: stream benchmark run {} failed: {}", i + 1, e);
+                    return 1;
+                }
+            }
+        }
+
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "model": model_id,
+                    "requested_device": requested_device,
+                    "bound_backend": bound_backend,
+                    "audio_secs": audio_secs,
+                    "load_ms": load_ms,
+                    "frame_ms": args.benchmark_frame_ms,
+                    "samples": benchmark_samples,
+                })
+            );
+        } else {
+            println!(
+                "model={} device={} backend={} audio={:.2}s load={}ms stream_benchmark=true",
+                model_id,
+                requested_device,
+                bound_backend.as_deref().unwrap_or("?"),
+                audio_secs,
+                load_ms,
+            );
+            for (index, sample) in benchmark_samples.iter().enumerate() {
+                println!(
+                    "run={} mode={} first_partial_ms={} committed_cadence_ms={:?} finalization_tail_ms={} total_ms={} worker_released={}",
+                    index + 1,
+                    sample.mode,
+                    sample
+                        .first_partial_ms
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    sample.committed_cadence_ms,
+                    sample.finalization_tail_ms,
+                    sample.total_ms,
+                    sample.worker_released,
+                );
+            }
+        }
+        return if benchmark_samples
+            .iter()
+            .all(|sample| sample.worker_released)
+        {
+            0
+        } else {
+            eprintln!("error: streaming worker did not release after benchmark finalization");
+            1
+        };
+    }
+
     let mut times_ms: Vec<u64> = Vec::new();
     let mut text = String::new();
     for i in 0..runs {
