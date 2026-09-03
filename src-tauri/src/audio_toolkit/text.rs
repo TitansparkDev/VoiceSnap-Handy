@@ -345,8 +345,13 @@ pub fn build_vocabulary_prompt(
             push_term(&entry.written);
         }
     }
-    for word in legacy_custom_words {
-        push_term(word);
+    // Once rich entries exist they are authoritative. Migration copies every
+    // legacy word into this list, so continuing to apply `custom_words` as a
+    // second source would make a migrated entry impossible to disable/remove.
+    if vocabulary.entries.is_empty() {
+        for word in legacy_custom_words {
+            push_term(word);
+        }
     }
 
     (!terms.is_empty()).then(|| terms.join(", "))
@@ -506,12 +511,14 @@ pub fn apply_vocabulary_corrections(
                 fuzzy_words.push(written);
             }
         }
-        for word in legacy_custom_words {
-            let Some(word) = safe_rule_term(word) else {
-                continue;
-            };
-            if seen_words.insert(build_match_key(&word)) {
-                fuzzy_words.push(word);
+        if vocabulary.entries.is_empty() {
+            for word in legacy_custom_words {
+                let Some(word) = safe_rule_term(word) else {
+                    continue;
+                };
+                if seen_words.insert(build_match_key(&word)) {
+                    fuzzy_words.push(word);
+                }
             }
         }
 
@@ -1231,6 +1238,24 @@ mod tests {
         );
         assert_eq!(result.text, "hand ee voice snap chat gpt, VoiceSnap ChatGPT");
         assert_eq!(result.metadata.alias_replacements, 2);
+    }
+
+    #[test]
+    fn vocabulary_rich_entries_override_legacy_activation_state() {
+        let mut entry = rich_entry("Handy", None, None);
+        entry.enabled = false;
+        let vocab = vocabulary(vec![entry], vec![]);
+        let result = apply_vocabulary_corrections(
+            "Handee",
+            &vocab,
+            &["Handy".to_string()],
+            1.0,
+            &OutputLanguageEvidence::Unknown,
+            true,
+        );
+        assert_eq!(result.text, "Handee");
+        assert!(!result.metadata.applied());
+        assert!(build_vocabulary_prompt(&vocab, &["Handy".to_string()], None).is_none());
     }
 
     #[test]
