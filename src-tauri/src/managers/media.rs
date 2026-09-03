@@ -644,12 +644,16 @@ fn media_state_was_changed(paused: MediaSnapshot, current: MediaSnapshot) -> boo
     false
 }
 
-fn log_nonfatal(action: &str, generation: u64, error: &MediaControlError) {
-    let outcome = match error {
+fn diagnostic_failure_outcome(error: &MediaControlError) -> &'static str {
+    match error {
         MediaControlError::Unavailable => "unavailable",
         MediaControlError::Timeout => "timeout",
         MediaControlError::Failed(_) => "failed",
-    };
+    }
+}
+
+fn log_nonfatal(action: &str, generation: u64, error: &MediaControlError) {
+    let outcome = diagnostic_failure_outcome(error);
     // Intentionally categorical: backend error strings may contain player/app
     // details. Diagnostics retain only action/outcome/generation metadata.
     log_media_diagnostic(action, outcome, Some(generation));
@@ -776,6 +780,41 @@ mod tests {
                 Ok(inner.snapshot)
             })
         }
+    }
+
+    #[test]
+    fn disabled_recording_media_control_is_a_true_noop() {
+        let backend = Arc::new(MockBackend::new(MediaPlaybackState::Playing));
+        let controller = MediaSessionController::new(backend.clone());
+        let recording_media = RecordingMediaController::new(controller.clone());
+
+        recording_media.begin_recording(false);
+        recording_media.finish_recording();
+        controller.flush_for_test();
+
+        assert_eq!(backend.counts(), (0, 0));
+    }
+
+    #[test]
+    fn enabled_recording_media_control_uses_async_controller_lifecycle() {
+        let backend = Arc::new(MockBackend::new(MediaPlaybackState::Playing));
+        let controller = MediaSessionController::new(backend.clone());
+        let recording_media = RecordingMediaController::new(controller.clone());
+
+        recording_media.begin_recording(true);
+        controller.flush_for_test();
+        assert_eq!(backend.counts(), (1, 0));
+
+        recording_media.finish_recording();
+        controller.flush_for_test();
+        assert_eq!(backend.counts(), (1, 1));
+    }
+
+    #[test]
+    fn media_failure_diagnostics_are_categorical_and_drop_backend_detail() {
+        let error = MediaControlError::Failed("private player title or service detail".to_string());
+        assert_eq!(diagnostic_failure_outcome(&error), "failed");
+        assert!(!diagnostic_failure_outcome(&error).contains("player"));
     }
 
     #[test]
