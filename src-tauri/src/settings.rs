@@ -99,6 +99,85 @@ pub struct LLMPrompt {
     pub prompt: String,
 }
 
+fn default_vocabulary_entry_enabled() -> bool {
+    true
+}
+
+/// Rich vocabulary entry stored separately from the legacy `custom_words` list.
+/// The legacy list remains `Vec<String>` on disk so older stores can always be
+/// salvaged before this richer representation is considered.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Type)]
+pub struct VocabularyEntry {
+    pub written: String,
+    #[serde(default)]
+    pub spoken_alias: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default = "default_vocabulary_entry_enabled")]
+    pub enabled: bool,
+    /// `true` requires exact case when matching aliases. `None`/`false` is
+    /// Unicode case-insensitive.
+    #[serde(default)]
+    pub case_sensitive: Option<bool>,
+    /// `false` drops punctuation immediately surrounding a matched alias.
+    /// The safe default (`None`/`true`) preserves it.
+    #[serde(default)]
+    pub preserve_punctuation: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Type)]
+pub struct VocabularyReplacement {
+    pub from: String,
+    pub to: String,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default = "default_vocabulary_entry_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub case_sensitive: Option<bool>,
+    #[serde(default)]
+    pub preserve_punctuation: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Type)]
+pub struct VocabularySettingsV1 {
+    pub version: u32,
+    #[serde(default)]
+    pub entries: Vec<VocabularyEntry>,
+    #[serde(default)]
+    pub replacements: Vec<VocabularyReplacement>,
+}
+
+impl Default for VocabularySettingsV1 {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            entries: Vec::new(),
+            replacements: Vec::new(),
+        }
+    }
+}
+
+impl VocabularySettingsV1 {
+    fn from_legacy_words(words: Vec<String>) -> Self {
+        Self {
+            version: 1,
+            entries: words
+                .into_iter()
+                .map(|written| VocabularyEntry {
+                    written,
+                    spoken_alias: None,
+                    language: None,
+                    enabled: true,
+                    case_sensitive: None,
+                    preserve_punctuation: None,
+                })
+                .collect(),
+            replacements: Vec::new(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Type)]
 pub struct PostProcessProvider {
     pub id: String,
@@ -452,6 +531,10 @@ pub struct AppSettings {
     pub log_level: LogLevel,
     #[serde(default)]
     pub custom_words: Vec<String>,
+    /// Versioned rich vocabulary. Never replaces `custom_words` in place: the
+    /// raw settings migration seeds this key from legacy values exactly once.
+    #[serde(default)]
+    pub vocabulary_v1: VocabularySettingsV1,
     #[serde(default)]
     pub model_unload_timeout: ModelUnloadTimeout,
     #[serde(default = "default_word_correction_threshold")]
@@ -553,7 +636,7 @@ fn default_model() -> String {
     "".to_string()
 }
 
-const CURRENT_SETTINGS_SCHEMA_VERSION: u32 = 2;
+const CURRENT_SETTINGS_SCHEMA_VERSION: u32 = 3;
 
 fn default_settings_schema_version() -> u32 {
     CURRENT_SETTINGS_SCHEMA_VERSION
@@ -981,6 +1064,7 @@ pub fn get_default_settings() -> AppSettings {
         debug_mode: false,
         log_level: default_log_level(),
         custom_words: Vec::new(),
+        vocabulary_v1: VocabularySettingsV1::default(),
         model_unload_timeout: ModelUnloadTimeout::default(),
         word_correction_threshold: default_word_correction_threshold(),
         history_limit: default_history_limit(),
@@ -1205,6 +1289,33 @@ fn apply_settings_migrations(
         // transcribe.cpp 0.2 replaced integer registry indices with opaque
         // process-local handles. Clear every old index once.
         settings.transcribe_gpu_device = default_transcribe_gpu_device();
+        updated = true;
+    }
+    if stored_schema_version < 3 {
+        // Wave 4 deliberately does not change `custom_words` in place. Read the
+        // legacy array from raw JSON so it survives both strict deserialization
+        // and the field-by-field salvage path, then seed the richer key only when
+        // that key did not already exist.
+        let stored_vocabulary_is_valid = settings_value
+            .get("vocabulary_v1")
+            .and_then(|value| serde_json::from_value::<VocabularySettingsV1>(value.clone()).ok())
+            .is_some();
+        if !stored_vocabulary_is_valid {
+            let legacy_words = settings_value
+                .get("custom_words")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| settings.custom_words.clone());
+            settings.vocabulary_v1 = VocabularySettingsV1::from_legacy_words(legacy_words);
+        }
+        updated = true;
+    }
+    if stored_schema_version < u64::from(CURRENT_SETTINGS_SCHEMA_VERSION) {
         settings.settings_schema_version = CURRENT_SETTINGS_SCHEMA_VERSION;
         updated = true;
     }
@@ -1481,6 +1592,67 @@ mod tests {
         assert_eq!(
             restored.clamshell_microphone_id.as_deref(),
             Some("coreaudio:BuiltInMicrophoneDevice")
+        );
+    }
+
+    #[test]
+    fn legacy_custom_words_migrate_intact_without_changing_serialized_type() {
+        let legacy_words = vec![
+            "Handy".to_string(),
+            "R&D".to_string(),
+            "你好".to_string(),
+            "control\u{0007}kept".to_string(),
+        ];
+        let mut stored = default_settings_json();
+        stored["settings_schema_version"] = serde_json::json!(2);
+        stored.as_object_mut().unwrap().remove("vocabulary_v1");
+        stored["custom_words"] = serde_json::json!(legacy_words);
+
+        let mut settings: AppSettings = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(settings.custom_words, legacy_words);
+        assert!(settings.vocabulary_v1.entries.is_empty());
+
+        assert!(apply_settings_migrations(&mut settings, &stored));
+        assert_eq!(settings.settings_schema_version, CURRENT_SETTINGS_SCHEMA_VERSION);
+        assert_eq!(settings.custom_words, legacy_words);
+        assert_eq!(
+            settings
+                .vocabulary_v1
+                .entries
+                .iter()
+                .map(|entry| entry.written.clone())
+                .collect::<Vec<_>>(),
+            legacy_words
+        );
+
+        let serialized = serde_json::to_value(&settings).unwrap();
+        assert!(serialized["custom_words"].is_array());
+        assert_eq!(serialized["custom_words"], serde_json::json!(legacy_words));
+    }
+
+    #[test]
+    fn vocabulary_migration_recovers_legacy_words_after_salvage() {
+        let legacy_words = vec!["Handy".to_string(), "ChatGPT".to_string()];
+        let mut stored = default_settings_json();
+        stored["settings_schema_version"] = serde_json::json!(2);
+        stored["custom_words"] = serde_json::json!(legacy_words);
+        // Poison the richer key and an unrelated enum to force the field-by-field
+        // salvage path. The raw legacy list must remain authoritative.
+        stored["vocabulary_v1"] = serde_json::json!({ "version": "broken" });
+        stored["sound_theme"] = serde_json::json!("theremin");
+
+        assert!(serde_json::from_value::<AppSettings>(stored.clone()).is_err());
+        let mut salvaged = salvage_settings(&stored);
+        assert_eq!(salvaged.custom_words, legacy_words);
+        assert!(apply_settings_migrations(&mut salvaged, &stored));
+        assert_eq!(
+            salvaged
+                .vocabulary_v1
+                .entries
+                .iter()
+                .map(|entry| entry.written.clone())
+                .collect::<Vec<_>>(),
+            legacy_words
         );
     }
 
