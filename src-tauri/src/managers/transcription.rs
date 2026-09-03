@@ -614,12 +614,34 @@ impl TranscriptionManager {
                     .as_ref()
                     .map(transcribe_device_label)
                     .unwrap_or_else(|| "automatic".to_string());
+                let allow_cpu_fallback = should_retry_transcribe_load_on_cpu(device_index, backend);
                 let model_options = ModelOptions { backend, device };
-                let model = Model::load_with(&model_path, &model_options).map_err(|e| {
-                    let error_msg = format!("Failed to load whisper model {}: {}", model_id, e);
-                    emit_loading_failed(&error_msg);
-                    anyhow::anyhow!(error_msg)
-                })?;
+                let model = match Model::load_with(&model_path, &model_options) {
+                    Ok(model) => model,
+                    Err(primary_err) if allow_cpu_fallback => {
+                        warn!(
+                            "Failed to load whisper model '{}' with requested backend {:?} and device '{}': {}; retrying on CPU for this run without changing the saved accelerator preference",
+                            model_id, backend, requested_device, primary_err
+                        );
+                        let cpu_options = ModelOptions {
+                            backend: Backend::Cpu,
+                            device: None,
+                        };
+                        Model::load_with(&model_path, &cpu_options).map_err(|cpu_err| {
+                            let error_msg = format!(
+                                "Failed to load whisper model {} with requested acceleration ({}), then CPU fallback also failed: {}",
+                                model_id, primary_err, cpu_err
+                            );
+                            emit_loading_failed(&error_msg);
+                            anyhow::anyhow!(error_msg)
+                        })?
+                    }
+                    Err(e) => {
+                        let error_msg = format!("Failed to load whisper model {}: {}", model_id, e);
+                        emit_loading_failed(&error_msg);
+                        return Err(anyhow::anyhow!(error_msg));
+                    }
+                };
                 // The bound backend may differ from the request (e.g. CPU
                 // fallback under Auto); log what actually loaded.
                 let bound_backend = model.backend();
@@ -2169,6 +2191,13 @@ fn resolve_transcribe_load_plan(
     (backend, device)
 }
 
+/// A persisted accelerated load may recover on strict CPU for this process only.
+/// Explicit CLI device selection stays strict: callers that hard-select a device
+/// should see that selection fail rather than silently running somewhere else.
+fn should_retry_transcribe_load_on_cpu(device_index: Option<usize>, backend: Backend) -> bool {
+    device_index.is_none() && !matches!(backend, Backend::Cpu)
+}
+
 /// Apply the user's ORT accelerator preference to the transcribe-rs global.
 /// Called on startup and before loading a model.
 ///
@@ -2352,6 +2381,13 @@ mod tests {
         assert_eq!(preferred_discrete_gpu_index(&[Integrated]), None);
         assert_eq!(preferred_discrete_gpu_index(&[Discrete]), None);
         assert_eq!(preferred_discrete_gpu_index(&[Other, Discrete]), None);
+    }
+
+    #[test]
+    fn persisted_accelerated_loads_can_fallback_to_cpu_but_explicit_device_loads_stay_strict() {
+        assert!(should_retry_transcribe_load_on_cpu(None, Backend::Auto));
+        assert!(!should_retry_transcribe_load_on_cpu(None, Backend::Cpu));
+        assert!(!should_retry_transcribe_load_on_cpu(Some(0), Backend::Auto));
     }
 
     #[test]
