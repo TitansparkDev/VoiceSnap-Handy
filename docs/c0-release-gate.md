@@ -4,6 +4,31 @@ Date: 2026-09-03
 
 This record covers the integrated remaining-wave trunk candidate exercised by the C0 automated gate.
 
+## Final trunk verification
+
+The final post-C0 trunk candidate was re-verified on 2026-09-03 after all queued feature work had landed. The exact release commands passed on the available Linux host:
+
+- `bun run lint`
+- `bun run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`
+- `cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings`
+- `cargo build --manifest-path src-tauri/Cargo.toml --locked`
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked` — 398 Rust unit tests passed, with no failures.
+
+Focused final checks also passed:
+
+- `node --test scripts/cleanup-benchmark.test.mjs` — 12/12, including loopback-only/offline runtime policy, ambient-data exclusion, output non-persistence, and deterministic percentile coverage.
+- `node --test scripts/stream-benchmark.test.mjs` — 11/11, including the Wave 2 model matrix, fixed short/medium/long fixtures, live-microphone command/schema coverage, final-only fallback, timing aggregation, and text-free reference reporting.
+- focused Rust cleanup, stream, clipboard, diagnostics, live-insertion, speech-evidence/VAD, fallback, catalog and overlay-focus tests.
+- `bun run check:model-languages`.
+- `npx playwright test tests/app.spec.ts --grep "Recording overlay"`.
+
+The Linux run executes the cross-platform clipboard transaction state-machine coverage, including newer-owner-wins and delayed-render/clipboard-manager race stress. The Windows-only STGMEDIUM materialization and timing-budget tests remain present in `src-tauri/src/paste_tx/windows.rs` and are documented in `docs/windows-clipboard-audit.md`; this Linux verification does not falsely claim to have executed Windows-only test binaries.
+
+There is no separately enabled stop-time no-speech product gate in this final trunk. The automated safety evidence is the positive speech-evidence latch and VAD behavior: live committed insertion downgrades to preview without positive speech evidence, committed-looking hallucinations wait for the latch, and silence is rejected by the Earshot VAD test. The PLAN quiet-speech/manual no-speech matrix therefore remains manual rather than being claimed by this automated run.
+
+Packaged-build diagnostics visibility and the cross-platform native application smoke matrix also remain manual gates. Automated PLAN items are only considered complete where the current code/tests above provide direct evidence.
+
 ## Automated checks
 
 Passed on the available Linux host:
