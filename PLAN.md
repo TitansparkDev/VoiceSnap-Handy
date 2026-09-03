@@ -446,7 +446,7 @@ Deliverables:
 - If GPU startup fails or becomes unhealthy, downgrade for the current run only;
   do not rewrite the user's saved preference. — startup and runtime-health fallback done 2026-09-03.
 - Keep CPU fallback healthy on systems with no Vulkan runtime. — done 2026-09-03
-- Add selected-device diagnostics and a user-facing recovery explanation.
+- Add selected-device diagnostics and a user-facing recovery explanation. — done 2026-09-03
 - Audit selected microphone persistence and recovery. An automatic stream repair
   must retry the requested device rather than silently selecting another default. — done 2026-09-03
 - Add stable device identity where the platform provides it, while retaining a
