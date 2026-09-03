@@ -260,7 +260,7 @@ branches if the command/event contract is written first.
 
 Deliverables:
 
-- Add a local cleanup provider to Handy's existing post-process abstraction.
+- Add a local cleanup provider to Handy's existing post-process abstraction. — done 2026-09-03
 - Prefer a resident local `llama.cpp`/`llama-server` process or equivalent
   bundled local runtime rather than launching a new process per utterance. If a
   sidecar is used, it needs a dedicated supervisor with child/job lifetime,
@@ -448,7 +448,7 @@ Deliverables:
 - Keep CPU fallback healthy on systems with no Vulkan runtime.
 - Add selected-device diagnostics and a user-facing recovery explanation.
 - Audit selected microphone persistence and recovery. An automatic stream repair
-  must retry the requested device rather than silently selecting another default.
+  must retry the requested device rather than silently selecting another default. — done 2026-09-03
 - Add stable device identity where the platform provides it, while retaining a
   readable device name for the UI.
 - Add tests for GPU failure, integrated-vs-discrete selection, no-GPU startup,
