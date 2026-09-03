@@ -460,7 +460,7 @@ Acceptance:
 - GPU fallback is visible and truthful. — done 2026-09-03
 - CPU fallback works without changing saved settings. — done 2026-09-03
 - A microphone recovery does not silently move dictation to a different mic. — done 2026-09-03
-- The diagnostics page shows the actual backend used for each session.
+- The diagnostics page shows the actual backend used for each session. — done 2026-09-03
 
 ### Wave 7 — optional media pause/resume
 
