@@ -1905,6 +1905,19 @@ mod tests {
     }
 
     #[test]
+    fn deleting_history_with_already_missing_audio_still_removes_the_row() {
+        let conn = setup_conn();
+        let recordings = tempfile::tempdir().expect("create recordings dir");
+        insert_entry(&conn, 100, "audio already expired", None);
+
+        assert!(
+            HistoryManager::delete_entry_with_conn(&conn, recordings.path(), 1)
+                .expect("missing retained audio is already deleted")
+        );
+        assert_eq!(row_count(&conn), 0);
+    }
+
+    #[test]
     fn history_delete_failure_keeps_row_linked_to_undeleted_audio() {
         let conn = setup_conn();
         let recordings = tempfile::tempdir().expect("create recordings dir");
