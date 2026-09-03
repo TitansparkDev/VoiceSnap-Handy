@@ -176,6 +176,19 @@ impl StreamRouter {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscribeSelectionPlanMetadata {
+    /// Persisted accelerator intent used for this load. `None` denotes a one-off
+    /// command-line device override rather than a saved app preference.
+    pub saved_accelerator: Option<String>,
+    /// Stable persisted GPU identity when the saved preference pinned one.
+    pub saved_gpu_device: Option<String>,
+    /// Backend requested by Handy before the runtime could fall back.
+    pub recommended_backend: String,
+    /// Readable exact device Handy recommended, when one was pinned.
+    pub recommended_device: Option<String>,
+}
+
 enum LoadedEngine {
     /// Whisper-family models (whisper, breeze-asr, custom .bin/.gguf) via
     /// transcribe-cpp. Holds the live `Session`, which keeps its `Model` alive
@@ -277,6 +290,9 @@ pub struct TranscriptionManager {
     /// `is_model_loaded()` consults this so the model still reports "loaded"
     /// while the worker holds it.
     active_engine_lease: Arc<AtomicU64>,
+    /// Plan-time accelerator metadata for the most recent transcribe.cpp load.
+    /// Kept separate from `current_backend`/`current_device`, which are runtime truth.
+    selection_plan: Arc<Mutex<Option<TranscribeSelectionPlanMetadata>>>,
 }
 
 impl TranscriptionManager {
@@ -297,6 +313,7 @@ impl TranscriptionManager {
             next_stream_worker_id: Arc::new(AtomicU64::new(1)),
             active_stream_worker: Arc::new(AtomicU64::new(0)),
             active_engine_lease: Arc::new(AtomicU64::new(0)),
+            selection_plan: Arc::new(Mutex::new(None)),
         };
 
         // Start the idle watcher
@@ -531,6 +548,9 @@ impl TranscriptionManager {
             let mut current_model = self.current_model_id.lock().unwrap();
             *current_model = None;
         }
+        // A new load supersedes the previous planning metadata. Non-transcribe
+        // engines intentionally leave this empty.
+        *self.selection_plan.lock().unwrap() = None;
 
         // Create appropriate engine based on model type
         let emit_loading_failed = |error_msg: &str| {
@@ -552,35 +572,44 @@ impl TranscriptionManager {
                 // --device-index flag) hard-select that registered device;
                 // otherwise re-read the persisted accelerator preference (so an
                 // accelerator change marked for reload takes effect here).
-                let (backend, device) = match device_index {
-                    Some(index) => resolve_device_index(index).inspect_err(|e| {
-                        emit_loading_failed(&e.to_string());
-                    })?,
+                let (backend, device, selection_plan) = match device_index {
+                    Some(index) => {
+                        let (backend, device) = resolve_device_index(index).inspect_err(|e| {
+                            emit_loading_failed(&e.to_string());
+                        })?;
+                        let recommended_device = device.as_ref().map(transcribe_device_label);
+                        (
+                            backend,
+                            device,
+                            TranscribeSelectionPlanMetadata {
+                                saved_accelerator: None,
+                                saved_gpu_device: None,
+                                recommended_backend: transcribe_backend_plan_label(backend)
+                                    .to_string(),
+                                recommended_device,
+                            },
+                        )
+                    }
                     None => {
                         let settings = get_settings(&self.app_handle);
-                        let accelerator = settings.transcribe_accelerator;
-                        let device = match accelerator {
-                            TranscribeAcceleratorSetting::Auto => {
-                                preferred_auto_transcribe_gpu_device(transcribe_compute_devices())
-                            }
-                            TranscribeAcceleratorSetting::Gpu => resolve_gpu_device(
-                                accelerator,
-                                settings.transcribe_gpu_device.as_deref(),
-                            ),
-                            TranscribeAcceleratorSetting::Cpu => None,
-                        };
-                        // Backend::Auto accepts an exact GPU device. Automatic
-                        // selection only pins a device when a mixed integrated +
-                        // discrete topology needs disambiguation; otherwise the
-                        // backend keeps its normal CPU/GPU fallback behavior.
-                        let backend = if device.is_some() {
-                            Backend::Auto
-                        } else {
-                            select_transcribe_backend(accelerator)
-                        };
-                        (backend, device)
+                        let (backend, device) = resolve_transcribe_load_plan(&settings);
+                        let (saved_accelerator, saved_gpu_device) =
+                            describe_saved_transcribe_preference(&settings);
+                        let recommended_device = device.as_ref().map(transcribe_device_label);
+                        (
+                            backend,
+                            device,
+                            TranscribeSelectionPlanMetadata {
+                                saved_accelerator: Some(saved_accelerator),
+                                saved_gpu_device,
+                                recommended_backend: transcribe_backend_plan_label(backend)
+                                    .to_string(),
+                                recommended_device,
+                            },
+                        )
                     }
                 };
+                *self.selection_plan.lock().unwrap() = Some(selection_plan);
                 let requested_device = device
                     .as_ref()
                     .map(transcribe_device_label)
@@ -800,6 +829,12 @@ impl TranscriptionManager {
             Some(_) => Some("cpu".to_string()),
             None => None,
         }
+    }
+
+    /// Plan used by the most recent transcribe.cpp load. It intentionally
+    /// survives model unload so the just-completed session can persist it.
+    pub fn selection_plan_metadata(&self) -> Option<TranscribeSelectionPlanMetadata> {
+        self.selection_plan.lock().unwrap().clone()
     }
 
     /// Whether a live streaming run is currently in flight.
@@ -2033,6 +2068,36 @@ fn transcribe_device_label(device: &transcribe_cpp::Device) -> String {
     }
 }
 
+fn transcribe_accelerator_label(setting: TranscribeAcceleratorSetting) -> &'static str {
+    match setting {
+        TranscribeAcceleratorSetting::Auto => "auto",
+        TranscribeAcceleratorSetting::Cpu => "cpu",
+        TranscribeAcceleratorSetting::Gpu => "gpu",
+    }
+}
+
+fn transcribe_backend_plan_label(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Cpu => "cpu",
+        _ => "auto",
+    }
+}
+
+/// The user's persisted transcribe.cpp preference. The stable device identity is
+/// kept separate from the accelerator mode so history can distinguish an exact
+/// saved device from the load plan computed for the current hardware.
+pub(crate) fn describe_saved_transcribe_preference(
+    settings: &AppSettings,
+) -> (String, Option<String>) {
+    let device = (settings.transcribe_accelerator == TranscribeAcceleratorSetting::Gpu)
+        .then(|| settings.transcribe_gpu_device.clone())
+        .flatten();
+    (
+        transcribe_accelerator_label(settings.transcribe_accelerator).to_string(),
+        device,
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TranscribeGpuClass {
     Discrete,
@@ -2073,6 +2138,35 @@ fn preferred_auto_transcribe_gpu_device(
         transcribe_device_label(&selected)
     );
     Some(selected)
+}
+
+/// Resolve the load plan Handy recommends from the saved preference and current
+/// device topology. This is the single source of truth used both by model loads
+/// and by history diagnostics, so the recorded recommendation cannot drift from
+/// what the loader actually requested.
+fn resolve_transcribe_load_plan(
+    settings: &AppSettings,
+) -> (Backend, Option<transcribe_cpp::Device>) {
+    let accelerator = settings.transcribe_accelerator;
+    let device = match accelerator {
+        TranscribeAcceleratorSetting::Auto => {
+            preferred_auto_transcribe_gpu_device(transcribe_compute_devices())
+        }
+        TranscribeAcceleratorSetting::Gpu => {
+            resolve_gpu_device(accelerator, settings.transcribe_gpu_device.as_deref())
+        }
+        TranscribeAcceleratorSetting::Cpu => None,
+    };
+
+    // Backend::Auto accepts an exact GPU device. Automatic selection only pins
+    // a device when a mixed integrated + discrete topology needs disambiguation;
+    // otherwise transcribe-cpp keeps its normal CPU/GPU fallback behavior.
+    let backend = if device.is_some() {
+        Backend::Auto
+    } else {
+        select_transcribe_backend(accelerator)
+    };
+    (backend, device)
 }
 
 /// Apply the user's ORT accelerator preference to the transcribe-rs global.
@@ -2258,6 +2352,24 @@ mod tests {
         assert_eq!(preferred_discrete_gpu_index(&[Integrated]), None);
         assert_eq!(preferred_discrete_gpu_index(&[Discrete]), None);
         assert_eq!(preferred_discrete_gpu_index(&[Other, Discrete]), None);
+    }
+
+    #[test]
+    fn saved_transcribe_preference_keeps_exact_device_identity_separate() {
+        let mut settings = AppSettings::default();
+        settings.transcribe_accelerator = TranscribeAcceleratorSetting::Gpu;
+        settings.transcribe_gpu_device = Some("stable-device-id".to_string());
+
+        assert_eq!(
+            describe_saved_transcribe_preference(&settings),
+            ("gpu".to_string(), Some("stable-device-id".to_string()))
+        );
+
+        settings.transcribe_accelerator = TranscribeAcceleratorSetting::Auto;
+        assert_eq!(
+            describe_saved_transcribe_preference(&settings),
+            ("auto".to_string(), None)
+        );
     }
 
     #[test]

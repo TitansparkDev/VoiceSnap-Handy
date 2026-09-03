@@ -118,6 +118,12 @@ pub async fn retry_history_entry_transcription(
             .then_some(history_settings.selected_model.clone())
     });
     let engine_type = crate::actions::resolve_history_engine_type(&app, model_id.as_deref());
+    let selection_plan = transcription_manager.selection_plan_metadata();
+    let (saved_accelerator, saved_gpu_device, recommended_backend, recommended_device) =
+        crate::actions::resolve_history_compute_plan(
+            engine_type.as_deref(),
+            selection_plan.as_ref(),
+        );
     let language = crate::actions::resolve_effective_language(&app, &history_settings);
     let language = (!language.is_empty()).then_some(language);
     let backend = transcription_manager.current_backend();
@@ -139,6 +145,10 @@ pub async fn retry_history_entry_transcription(
             language,
             backend,
             device,
+            saved_accelerator,
+            saved_gpu_device,
+            recommended_backend,
+            recommended_device,
             Some(processed.cleanup_mode.clone()),
             Some(transcription_total_ms),
             cleanup_total_ms,

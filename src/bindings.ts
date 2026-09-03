@@ -1050,6 +1050,22 @@ backend: string | null;
  */
 device: string | null;
 /**
+ * Saved transcribe.cpp accelerator preference for this session.
+ */
+saved_accelerator: string | null;
+/**
+ * Stable saved GPU device identity when the preference selected one exactly.
+ */
+saved_gpu_device: string | null;
+/**
+ * Backend requested by Handy's load recommendation before runtime fallback.
+ */
+recommended_backend: string | null;
+/**
+ * Readable device selected by the recommendation, when it pinned one exactly.
+ */
+recommended_device: string | null;
+/**
  * Cleanup behavior used for this row: `off` or the selected provider path.
  */
 cleanup_mode: string | null;

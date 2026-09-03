@@ -494,6 +494,34 @@ pub(crate) fn resolve_history_engine_type(
     Some(engine.to_string())
 }
 
+/// Map the exact transcribe.cpp load-time selection plan into history fields.
+/// Non-transcribe.cpp engines leave these fields empty rather than attaching
+/// unrelated Vulkan preferences to an ONNX history row.
+pub(crate) fn resolve_history_compute_plan(
+    engine_type: Option<&str>,
+    selection_plan: Option<&crate::managers::transcription::TranscribeSelectionPlanMetadata>,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    if engine_type != Some("transcribe_cpp") {
+        return (None, None, None, None);
+    }
+
+    let Some(selection_plan) = selection_plan else {
+        return (None, None, None, None);
+    };
+
+    (
+        selection_plan.saved_accelerator.clone(),
+        selection_plan.saved_gpu_device.clone(),
+        Some(selection_plan.recommended_backend.clone()),
+        selection_plan.recommended_device.clone(),
+    )
+}
+
 /// Resolve the persisted language *intent* into the language the currently-loaded
 /// model will actually use — the same capability-aware coercion the transcription
 /// paths apply (see [`crate::managers::model::effective_language`]). Post-processing
@@ -859,6 +887,7 @@ impl ShortcutAction for TranscribeAction {
                             .unwrap_or(i64::MAX);
                     let history_backend = tm.current_backend();
                     let history_device = tm.current_device();
+                    let history_selection_plan = tm.selection_plan_metadata();
 
                     if rm.was_cancelled_since(cancel_generation) {
                         debug!("Transcription operation cancelled before output handling");
@@ -913,6 +942,15 @@ impl ShortcutAction for TranscribeAction {
                                     .or_else(|| selected_history_model_id.clone());
                                 let history_engine_type =
                                     resolve_history_engine_type(&ah, history_model_id.as_deref());
+                                let (
+                                    history_saved_accelerator,
+                                    history_saved_gpu_device,
+                                    history_recommended_backend,
+                                    history_recommended_device,
+                                ) = resolve_history_compute_plan(
+                                    history_engine_type.as_deref(),
+                                    history_selection_plan.as_ref(),
+                                );
                                 if let Err(err) = hm.save_entry(
                                     file_name,
                                     transcription,
@@ -925,6 +963,10 @@ impl ShortcutAction for TranscribeAction {
                                     Some(HISTORY_INSERTION_MODE_AT_STOP.to_string()),
                                     history_backend.clone(),
                                     history_device.clone(),
+                                    history_saved_accelerator,
+                                    history_saved_gpu_device,
+                                    history_recommended_backend,
+                                    history_recommended_device,
                                     Some(processed.cleanup_mode.clone()),
                                     Some("success".to_string()),
                                     Some(history_transcription_total_ms),
@@ -991,6 +1033,15 @@ impl ShortcutAction for TranscribeAction {
                                     &ah,
                                     selected_history_model_id.as_deref(),
                                 );
+                                let (
+                                    history_saved_accelerator,
+                                    history_saved_gpu_device,
+                                    history_recommended_backend,
+                                    history_recommended_device,
+                                ) = resolve_history_compute_plan(
+                                    history_engine_type.as_deref(),
+                                    history_selection_plan.as_ref(),
+                                );
                                 if let Err(save_err) = hm.save_entry(
                                     file_name,
                                     String::new(),
@@ -1003,6 +1054,10 @@ impl ShortcutAction for TranscribeAction {
                                     Some(HISTORY_INSERTION_MODE_AT_STOP.to_string()),
                                     history_backend,
                                     history_device,
+                                    history_saved_accelerator,
+                                    history_saved_gpu_device,
+                                    history_recommended_backend,
+                                    history_recommended_device,
                                     Some(resolve_history_cleanup_mode(
                                         &history_settings,
                                         post_process,
@@ -1101,8 +1156,8 @@ mod tests {
     use super::{
         build_legacy_prompt, build_system_prompt, complete_unless_cancelled,
         is_blank_transcription, normalize_cleanup_output, parse_structured_cleanup_output,
-        resolve_history_cleanup_mode, resolve_stream_or_batch, should_use_streaming_overlay,
-        strip_think_block, CLEANUP_OUTPUT_CONTRACT,
+        resolve_history_cleanup_mode, resolve_history_compute_plan, resolve_stream_or_batch,
+        should_use_streaming_overlay, strip_think_block, CLEANUP_OUTPUT_CONTRACT,
     };
     use crate::settings::{AppSettings, OverlayStyle};
     use std::cell::Cell;
@@ -1134,6 +1189,44 @@ mod tests {
         assert_eq!(
             resolve_history_cleanup_mode(&settings, true),
             "provider:openrouter"
+        );
+    }
+
+    #[test]
+    fn history_compute_plan_skips_unrelated_engine_families() {
+        let plan = crate::managers::transcription::TranscribeSelectionPlanMetadata {
+            saved_accelerator: Some("gpu".to_string()),
+            saved_gpu_device: Some("stable-device-id".to_string()),
+            recommended_backend: "auto".to_string(),
+            recommended_device: Some("Discrete GPU".to_string()),
+        };
+        assert_eq!(
+            resolve_history_compute_plan(Some("parakeet"), Some(&plan)),
+            (None, None, None, None)
+        );
+    }
+
+    #[test]
+    fn history_compute_plan_preserves_exact_load_time_plan() {
+        let plan = crate::managers::transcription::TranscribeSelectionPlanMetadata {
+            saved_accelerator: Some("gpu".to_string()),
+            saved_gpu_device: Some("stable-device-id".to_string()),
+            recommended_backend: "auto".to_string(),
+            recommended_device: Some("Discrete GPU".to_string()),
+        };
+
+        assert_eq!(
+            resolve_history_compute_plan(Some("transcribe_cpp"), Some(&plan)),
+            (
+                Some("gpu".to_string()),
+                Some("stable-device-id".to_string()),
+                Some("auto".to_string()),
+                Some("Discrete GPU".to_string()),
+            )
+        );
+        assert_eq!(
+            resolve_history_compute_plan(Some("transcribe_cpp"), None),
+            (None, None, None, None)
         );
     }
 

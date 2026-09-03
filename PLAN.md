@@ -442,7 +442,7 @@ Deliverables:
   name guesses.
 - Prefer a usable discrete device over an integrated/shared-memory device.
 - Record saved preference, recommended plan, and actual runtime backend/device
-  separately.
+  separately. — done 2026-09-03
 - If GPU startup fails or becomes unhealthy, downgrade for the current run only;
   do not rewrite the user's saved preference.
 - Keep CPU fallback healthy on systems with no Vulkan runtime.
