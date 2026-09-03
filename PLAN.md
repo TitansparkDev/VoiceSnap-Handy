@@ -288,7 +288,7 @@ Acceptance:
 
 - A normal dictation with cleanup disabled is not slower than the Handy baseline.
 - Local AI cleanup works with networking disabled.
-- Cleanup failure never loses the raw transcript.
+- Cleanup failure never loses the raw transcript. — done 2026-09-03
 - A 1–2 sentence dictation has a measured cleanup p50/p95 visible in Diagnostics.
 - The local model never receives audio, clipboard content, window titles, or
   unrelated application data.
@@ -499,10 +499,10 @@ Deliverables:
 - Import only tested improvements:
   - STGMEDIUM-aware format materialization;
   - full-fidelity text/HTML/RTF/bitmap/file/custom format preservation where safe;
-  - newer-owner-wins behavior;
-  - delayed-rendering and clipboard-manager races;
-  - cancellation and app-exit cleanup;
-  - stress coverage over at least 1,000 paste/restore cycles.
+  - newer-owner-wins behavior; — done 2026-09-03
+  - delayed-rendering and clipboard-manager races; — done 2026-09-03
+  - cancellation and app-exit cleanup; — done 2026-09-03
+  - stress coverage over at least 1,000 paste/restore cycles. — done 2026-09-03
 - Do not replace clipboard paste with character-by-character Unicode typing.
 - Keep default paste behavior unchanged until Word, Notepad, browsers, Office,
   Electron, Qt, and elevated-window cases pass manual smoke.
@@ -512,8 +512,8 @@ Acceptance:
 - Normal paste remains as fast as the baseline after timing is measured.
 - The user's clipboard is restored unless they explicitly chose to preserve the
   transcript.
-- A newer user copy is never overwritten.
-- Higher-integrity/UIPI failure produces an actionable fallback message.
+- A newer user copy is never overwritten. — done 2026-09-03
+- Higher-integrity/UIPI failure produces an actionable fallback message. — done 2026-09-03
 
 ## Parallel agent packets
 
