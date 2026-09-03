@@ -4,6 +4,7 @@ use crate::managers::{
     transcription::TranscriptionManager,
 };
 use std::sync::Arc;
+use std::time::Instant;
 use tauri::{AppHandle, State};
 
 #[tauri::command]
@@ -99,10 +100,13 @@ pub async fn retry_history_entry_transcription(
     transcription_manager.initiate_model_load();
 
     let tm = Arc::clone(&transcription_manager);
+    let transcription_started = Instant::now();
     let transcription = tauri::async_runtime::spawn_blocking(move || tm.transcribe(samples))
         .await
         .map_err(|e| format!("Transcription task panicked: {}", e))?
         .map_err(|e| e.to_string())?;
+    let transcription_total_ms =
+        i64::try_from(transcription_started.elapsed().as_millis()).unwrap_or(i64::MAX);
 
     if transcription.is_empty() {
         return Err("Recording contains no speech".to_string());
@@ -118,8 +122,12 @@ pub async fn retry_history_entry_transcription(
     let language = (!language.is_empty()).then_some(language);
     let backend = transcription_manager.current_backend();
     let device = transcription_manager.current_device();
+    let cleanup_started = Instant::now();
     let processed =
         process_transcription_output(&app, &transcription, entry.post_process_requested).await;
+    let cleanup_total_ms = entry
+        .post_process_requested
+        .then(|| i64::try_from(cleanup_started.elapsed().as_millis()).unwrap_or(i64::MAX));
     history_manager
         .update_transcription(
             id,
@@ -131,6 +139,8 @@ pub async fn retry_history_entry_transcription(
             language,
             backend,
             device,
+            Some(transcription_total_ms),
+            cleanup_total_ms,
         )
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -153,14 +163,21 @@ pub async fn retry_history_entry_cleanup(
         return Err("Cannot retry cleanup without a raw transcription".to_string());
     }
 
+    let cleanup_started = Instant::now();
     let processed = process_transcription_output(&app, &entry.transcription_text, true).await;
+    let cleanup_total_ms = i64::try_from(cleanup_started.elapsed().as_millis()).unwrap_or(i64::MAX);
     let cleaned_text = processed
         .post_processed_text
         .filter(|text| !text.trim().is_empty())
         .ok_or_else(|| "Cleanup did not produce updated text".to_string())?;
 
     history_manager
-        .update_cleanup(id, cleaned_text, processed.post_process_prompt)
+        .update_cleanup(
+            id,
+            cleaned_text,
+            processed.post_process_prompt,
+            Some(cleanup_total_ms),
+        )
         .map(|_| ())
         .map_err(|e| e.to_string())
 }

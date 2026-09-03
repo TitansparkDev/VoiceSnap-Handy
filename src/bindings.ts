@@ -1052,7 +1052,15 @@ device: string | null;
 /**
  * Persisted session result. Current recording sessions use `success` or `failure`.
  */
-outcome: string | null }
+outcome: string | null;
+/**
+ * Safe transcription-stage timing summary for this history row.
+ */
+transcription_total_ms: number | null;
+/**
+ * Safe cleanup-stage timing summary when cleanup was requested for this row.
+ */
+cleanup_total_ms: number | null }
 export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number }
 /**
  * Result of changing keyboard implementation

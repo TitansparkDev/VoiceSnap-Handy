@@ -642,6 +642,16 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
         ? t("settings.history.failed", { defaultValue: "Failed" })
         : entry.outcome
     : null;
+  const stageTimingLabel = [
+    entry.transcription_total_ms == null
+      ? null
+      : `${t("settings.history.transcriptionStage", { defaultValue: "Transcription" })} ${formatRecordingDuration(entry.transcription_total_ms)}`,
+    entry.cleanup_total_ms == null
+      ? null
+      : `${t("settings.history.cleanupStage", { defaultValue: "Cleanup" })} ${formatRecordingDuration(entry.cleanup_total_ms)}`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   return (
     <div className="px-4 py-2 pb-5 flex flex-col gap-3">
@@ -702,6 +712,16 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
               })}
             >
               {outcomeLabel}
+            </span>
+          )}
+          {stageTimingLabel && (
+            <span
+              className="rounded bg-mid-gray/10 px-1.5 py-0.5 text-[10px] text-text/50"
+              title={t("settings.history.stageTimings", {
+                defaultValue: "Stage timings",
+              })}
+            >
+              {stageTimingLabel}
             </span>
           )}
         </div>

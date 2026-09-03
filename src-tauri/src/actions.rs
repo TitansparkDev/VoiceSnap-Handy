@@ -807,6 +807,8 @@ impl ShortcutAction for TranscribeAction {
                     // batch fallback would contend with it.
                     let transcription_result =
                         resolve_stream_or_batch(tm.finalize_stream(), || tm.transcribe(samples));
+                    let history_transcription_total_ms =
+                        i64::try_from(transcription_time.elapsed().as_millis()).unwrap_or(i64::MAX);
 
                     // Await WAV save and verify
                     let wav_saved = match wav_handle.await {
@@ -866,6 +868,7 @@ impl ShortcutAction for TranscribeAction {
                                     show_processing_overlay(&ah);
                                 }
                             }
+                            let cleanup_time = Instant::now();
                             let Some(processed) = complete_unless_cancelled(
                                 process_transcription_output(&ah, &transcription, post_process),
                                 || rm.was_cancelled_since(cancel_generation),
@@ -877,6 +880,10 @@ impl ShortcutAction for TranscribeAction {
                                 set_tray_state(&ah, TrayIconState::Idle);
                                 return;
                             };
+                            let history_cleanup_total_ms = post_process.then(|| {
+                                i64::try_from(cleanup_time.elapsed().as_millis())
+                                    .unwrap_or(i64::MAX)
+                            });
 
                             if rm.was_cancelled_since(cancel_generation) {
                                 debug!("Transcription operation cancelled before paste");
@@ -905,6 +912,8 @@ impl ShortcutAction for TranscribeAction {
                                     history_backend.clone(),
                                     history_device.clone(),
                                     Some("success".to_string()),
+                                    Some(history_transcription_total_ms),
+                                    history_cleanup_total_ms,
                                     history_duration_ms,
                                 ) {
                                     error!("Failed to save history entry: {}", err);
@@ -980,6 +989,8 @@ impl ShortcutAction for TranscribeAction {
                                     history_backend,
                                     history_device,
                                     Some("failure".to_string()),
+                                    Some(history_transcription_total_ms),
+                                    None,
                                     history_duration_ms,
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);

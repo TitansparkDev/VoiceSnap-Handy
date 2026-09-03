@@ -690,6 +690,8 @@ mod tests {
             backend: None,
             device: None,
             outcome: None,
+            transcription_total_ms: None,
+            cleanup_total_ms: None,
         }
     }
 
