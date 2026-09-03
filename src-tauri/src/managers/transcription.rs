@@ -2097,17 +2097,6 @@ fn resolve_device_index(index: usize) -> Result<(Backend, Option<transcribe_cpp:
     Ok((Backend::Auto, Some(device)))
 }
 
-/// Map Handy's whisper accelerator setting to a transcribe-cpp [`Backend`].
-///
-/// `Auto` lets the library pick the best device (with CPU fallback), while
-/// `Cpu` forces strict CPU. `Gpu` only remains as the companion setting for an
-/// exact device; without a valid exact device it has the retired generic GPU
-/// state's new Auto semantics. An emulated x64 process on Windows ARM64 forces
-/// strict CPU for every setting.
-fn select_transcribe_backend(setting: TranscribeAcceleratorSetting) -> Backend {
-    select_transcribe_backend_for_host(setting, transcribe_gpu_disabled_for_host())
-}
-
 fn select_transcribe_backend_for_host(
     setting: TranscribeAcceleratorSetting,
     gpu_disabled: bool,
@@ -2115,6 +2104,23 @@ fn select_transcribe_backend_for_host(
     match effective_transcribe_accelerator(setting, gpu_disabled) {
         TranscribeAcceleratorSetting::Cpu => Backend::Cpu,
         TranscribeAcceleratorSetting::Auto | TranscribeAcceleratorSetting::Gpu => Backend::Auto,
+    }
+}
+
+/// Resolve the effective transcribe.cpp backend when the runtime topology is
+/// already known. If no usable GPU device registered (for example because no
+/// Vulkan runtime is installed), use strict CPU for this load instead of asking
+/// `Backend::Auto` to rediscover the same absence. The persisted setting remains
+/// unchanged and is still recorded separately in history.
+fn select_transcribe_backend_for_topology(
+    setting: TranscribeAcceleratorSetting,
+    gpu_disabled: bool,
+    has_gpu_device: bool,
+) -> Backend {
+    if !has_gpu_device {
+        Backend::Cpu
+    } else {
+        select_transcribe_backend_for_host(setting, gpu_disabled)
     }
 }
 
@@ -2239,10 +2245,10 @@ fn resolve_transcribe_load_plan(
     settings: &AppSettings,
 ) -> (Backend, Option<transcribe_cpp::Device>) {
     let accelerator = settings.transcribe_accelerator;
+    let devices = transcribe_compute_devices();
+    let has_gpu_device = devices.iter().any(is_transcribe_gpu_device);
     let device = match accelerator {
-        TranscribeAcceleratorSetting::Auto => {
-            preferred_auto_transcribe_gpu_device(transcribe_compute_devices())
-        }
+        TranscribeAcceleratorSetting::Auto => preferred_auto_transcribe_gpu_device(devices),
         TranscribeAcceleratorSetting::Gpu => {
             resolve_gpu_device(accelerator, settings.transcribe_gpu_device.as_deref())
         }
@@ -2250,12 +2256,18 @@ fn resolve_transcribe_load_plan(
     };
 
     // Backend::Auto accepts an exact GPU device. Automatic selection only pins
-    // a device when a mixed integrated + discrete topology needs disambiguation;
-    // otherwise transcribe-cpp keeps its normal CPU/GPU fallback behavior.
+    // a device when a mixed integrated + discrete topology needs disambiguation.
+    // If no usable GPU registered at all (including a host with no Vulkan
+    // runtime), make the load plan explicitly CPU while preserving the saved
+    // preference for later runs where acceleration may become available.
     let backend = if device.is_some() {
         Backend::Auto
     } else {
-        select_transcribe_backend(accelerator)
+        select_transcribe_backend_for_topology(
+            accelerator,
+            transcribe_gpu_disabled_for_host(),
+            has_gpu_device,
+        )
     };
     (backend, device)
 }
@@ -2458,6 +2470,28 @@ mod tests {
         assert_eq!(preferred_discrete_gpu_index(&[Integrated]), None);
         assert_eq!(preferred_discrete_gpu_index(&[Discrete]), None);
         assert_eq!(preferred_discrete_gpu_index(&[Other, Discrete]), None);
+    }
+
+    #[test]
+    fn no_gpu_topology_uses_cpu_without_changing_accelerator_intent() {
+        for setting in [
+            TranscribeAcceleratorSetting::Auto,
+            TranscribeAcceleratorSetting::Cpu,
+            TranscribeAcceleratorSetting::Gpu,
+        ] {
+            assert_eq!(
+                select_transcribe_backend_for_topology(setting, false, false),
+                Backend::Cpu
+            );
+        }
+        assert_eq!(
+            select_transcribe_backend_for_topology(TranscribeAcceleratorSetting::Auto, false, true,),
+            Backend::Auto
+        );
+        assert_eq!(
+            select_transcribe_backend_for_topology(TranscribeAcceleratorSetting::Gpu, false, true,),
+            Backend::Auto
+        );
     }
 
     #[test]
