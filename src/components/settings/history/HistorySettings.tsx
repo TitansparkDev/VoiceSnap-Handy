@@ -321,6 +321,9 @@ export const HistorySettings: React.FC = () => {
               type="search"
               value={searchQuery}
               onChange={(event) => setSearchQuery(event.target.value)}
+              aria-label={t("settings.history.search", {
+                defaultValue: "Search history",
+              })}
               placeholder={t("settings.history.search", {
                 defaultValue: "Search history...",
               })}
