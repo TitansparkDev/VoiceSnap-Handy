@@ -1,4 +1,4 @@
-use crate::actions::process_transcription_output;
+use crate::actions::{process_transcription_output, ProcessedTranscription};
 use crate::managers::{
     history::{HistoryManager, PaginatedHistory},
     transcription::TranscriptionManager,
@@ -6,6 +6,45 @@ use crate::managers::{
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, State};
+
+fn ensure_retry_transcription_audio(samples: &[f32]) -> Result<(), String> {
+    if samples.is_empty() {
+        Err("Recording has no audio samples".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_retry_transcription_text(transcription: &str) -> Result<(), String> {
+    if transcription.trim().is_empty() {
+        Err("Recording contains no speech".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn retry_cleanup_input(raw_text: &str) -> Result<&str, String> {
+    if raw_text.trim().is_empty() {
+        Err("Cannot retry cleanup without a raw transcription".to_string())
+    } else {
+        Ok(raw_text)
+    }
+}
+
+fn retry_cleanup_update(
+    processed: ProcessedTranscription,
+) -> Result<(String, Option<String>, String), String> {
+    let cleaned_text = processed
+        .post_processed_text
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| "Cleanup did not produce updated text".to_string())?;
+
+    Ok((
+        cleaned_text,
+        processed.post_process_prompt,
+        processed.cleanup_mode,
+    ))
+}
 
 #[tauri::command]
 #[specta::specta]
@@ -93,9 +132,7 @@ pub async fn retry_history_entry_transcription(
     let samples = crate::audio_toolkit::read_wav_samples(&audio_path)
         .map_err(|e| format!("Failed to load audio: {}", e))?;
 
-    if samples.is_empty() {
-        return Err("Recording has no audio samples".to_string());
-    }
+    ensure_retry_transcription_audio(&samples)?;
 
     transcription_manager.initiate_model_load();
 
@@ -108,9 +145,7 @@ pub async fn retry_history_entry_transcription(
     let transcription_total_ms =
         i64::try_from(transcription_started.elapsed().as_millis()).unwrap_or(i64::MAX);
 
-    if transcription.is_empty() {
-        return Err("Recording contains no speech".to_string());
-    }
+    ensure_retry_transcription_text(&transcription)?;
 
     let history_settings = crate::settings::get_settings(&app);
     let model_id = transcription_manager.get_current_model().or_else(|| {
@@ -170,25 +205,19 @@ pub async fn retry_history_entry_cleanup(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("History entry {} not found", id))?;
 
-    if entry.transcription_text.trim().is_empty() {
-        return Err("Cannot retry cleanup without a raw transcription".to_string());
-    }
+    let raw_text = retry_cleanup_input(&entry.transcription_text)?;
 
     let cleanup_started = Instant::now();
-    let processed = process_transcription_output(&app, &entry.transcription_text, true).await;
+    let processed = process_transcription_output(&app, raw_text, true).await;
     let cleanup_total_ms = i64::try_from(cleanup_started.elapsed().as_millis()).unwrap_or(i64::MAX);
-    let cleanup_mode = Some(processed.cleanup_mode.clone());
-    let cleaned_text = processed
-        .post_processed_text
-        .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| "Cleanup did not produce updated text".to_string())?;
+    let (cleaned_text, post_process_prompt, cleanup_mode) = retry_cleanup_update(processed)?;
 
     history_manager
         .update_cleanup(
             id,
             cleaned_text,
-            processed.post_process_prompt,
-            cleanup_mode,
+            post_process_prompt,
+            Some(cleanup_mode),
             Some(cleanup_total_ms),
         )
         .map(|_| ())
@@ -211,6 +240,64 @@ pub async fn update_history_limit(
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn processed_cleanup(text: Option<&str>) -> ProcessedTranscription {
+        ProcessedTranscription {
+            final_text: text.unwrap_or("raw transcript").to_string(),
+            post_processed_text: text.map(str::to_string),
+            post_process_prompt: Some("cleanup prompt".to_string()),
+            cleanup_mode: "provider:openai".to_string(),
+        }
+    }
+
+    #[test]
+    fn retry_transcription_requires_retained_audio() {
+        assert_eq!(
+            ensure_retry_transcription_audio(&[]).unwrap_err(),
+            "Recording has no audio samples"
+        );
+        assert!(ensure_retry_transcription_audio(&[0.25]).is_ok());
+    }
+
+    #[test]
+    fn retry_transcription_rejects_empty_or_whitespace_only_results() {
+        for text in ["", "   ", "\n\t"] {
+            assert_eq!(
+                ensure_retry_transcription_text(text).unwrap_err(),
+                "Recording contains no speech"
+            );
+        }
+        assert!(ensure_retry_transcription_text("new raw transcript").is_ok());
+    }
+
+    #[test]
+    fn retry_cleanup_uses_stored_raw_text_without_audio_input() {
+        let raw = "stored raw transcript";
+        assert_eq!(retry_cleanup_input(raw).unwrap(), raw);
+        assert_eq!(
+            retry_cleanup_input("  ").unwrap_err(),
+            "Cannot retry cleanup without a raw transcription"
+        );
+    }
+
+    #[test]
+    fn retry_cleanup_requires_a_real_cleaned_result_before_persisting() {
+        assert_eq!(
+            retry_cleanup_update(processed_cleanup(None)).unwrap_err(),
+            "Cleanup did not produce updated text"
+        );
+
+        let (text, prompt, mode) = retry_cleanup_update(processed_cleanup(Some("cleaned text")))
+            .expect("valid cleanup should be persisted");
+        assert_eq!(text, "cleaned text");
+        assert_eq!(prompt.as_deref(), Some("cleanup prompt"));
+        assert_eq!(mode, "provider:openai");
+    }
 }
 
 #[tauri::command]
