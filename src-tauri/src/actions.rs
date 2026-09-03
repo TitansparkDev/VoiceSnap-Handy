@@ -118,6 +118,20 @@ fn should_use_streaming_overlay(style: OverlayStyle, is_streaming: bool) -> bool
     style == OverlayStyle::Live && is_streaming
 }
 
+fn resolve_stream_or_batch<E, F>(
+    stream_result: Result<Option<String>, E>,
+    batch_transcribe: F,
+) -> Result<String, E>
+where
+    F: FnOnce() -> Result<String, E>,
+{
+    match stream_result {
+        Ok(Some(text)) if !text.trim().is_empty() => Ok(text),
+        Ok(_) => batch_transcribe(),
+        Err(err) => Err(err),
+    }
+}
+
 async fn post_process_transcription(settings: &AppSettings, transcription: &str) -> Option<String> {
     if is_blank_transcription(transcription) {
         debug!("Post-processing skipped because the transcription is empty");
@@ -716,17 +730,13 @@ impl ShortcutAction for TranscribeAction {
                     // running, finalize it and use its text (all audio was already
                     // fed to the stream); otherwise batch-transcribe the samples.
                     let transcription_time = Instant::now();
-                    let transcription_result = match tm.finalize_stream() {
-                        // A finalized stream with usable text wins. An empty result
-                        // (no active stream, produced nothing, or a finalize error
-                        // after the engine was returned) falls back to a full batch
-                        // transcription of the same audio. A finalize timeout is
-                        // surfaced instead — the worker may still hold the engine,
-                        // so a batch fallback would contend with it.
-                        Ok(Some(text)) if !text.trim().is_empty() => Ok(text),
-                        Ok(_) => tm.transcribe(samples),
-                        Err(err) => Err(err),
-                    };
+                    // A finalized stream with usable text wins. An empty result
+                    // (including the normal non-streaming path) falls back to a full
+                    // batch transcription of the same audio. A finalize timeout is
+                    // surfaced instead — the worker may still hold the engine, so a
+                    // batch fallback would contend with it.
+                    let transcription_result =
+                        resolve_stream_or_batch(tm.finalize_stream(), || tm.transcribe(samples));
 
                     // Await WAV save and verify
                     let wav_saved = match wav_handle.await {
@@ -952,10 +962,11 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_unless_cancelled, is_blank_transcription, should_use_streaming_overlay,
-        strip_think_block,
+        complete_unless_cancelled, is_blank_transcription, resolve_stream_or_batch,
+        should_use_streaming_overlay, strip_think_block,
     };
     use crate::settings::OverlayStyle;
+    use std::cell::Cell;
     use std::future;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1035,5 +1046,17 @@ mod tests {
         assert!(!should_use_streaming_overlay(OverlayStyle::Live, false));
         assert!(!should_use_streaming_overlay(OverlayStyle::Minimal, true));
         assert!(!should_use_streaming_overlay(OverlayStyle::None, true));
+    }
+
+    #[test]
+    fn non_streaming_session_falls_back_to_batch_transcription() {
+        let batch_called = Cell::new(false);
+        let result: Result<String, &'static str> = resolve_stream_or_batch(Ok(None), || {
+            batch_called.set(true);
+            Ok("batch transcript".to_string())
+        });
+
+        assert_eq!(result.unwrap(), "batch transcript");
+        assert!(batch_called.get());
     }
 }
