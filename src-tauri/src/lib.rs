@@ -11,6 +11,7 @@ mod commands;
 mod helpers;
 mod input;
 mod llm_client;
+mod local_cleanup_runtime;
 mod managers;
 mod memory;
 mod overlay;
@@ -1078,6 +1079,10 @@ pub fn run(cli_args: CliArgs) {
         tauri::RunEvent::Exit => {
             #[cfg(target_os = "windows")]
             crate::paste_tx::shutdown_pending();
+            // The local cleanup sidecar is process-global and intentionally
+            // resident between utterances, so tear it down explicitly before
+            // Tauri exits rather than relying on static Drop order.
+            local_cleanup_runtime::shutdown();
             if let Some(tm) = app.try_state::<Arc<TranscriptionManager>>() {
                 let _ = tm.unload_model();
             }
