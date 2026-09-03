@@ -50,6 +50,21 @@ const OVERLAY_HEIGHT: f64 = 46.0;
 const OVERLAY_STREAM_WIDTH: f64 = 400.0;
 const OVERLAY_STREAM_HEIGHT: f64 = 120.0;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OverlayActivationPolicy {
+    focusable: bool,
+    initially_focused: bool,
+    activates_when_shown: bool,
+}
+
+const fn overlay_activation_policy() -> OverlayActivationPolicy {
+    OverlayActivationPolicy {
+        focusable: false,
+        initially_focused: false,
+        activates_when_shown: false,
+    }
+}
+
 /// Overlay window size (logical) for a given UI state.
 fn overlay_dimensions(state: &str) -> (f64, f64) {
     if state == "streaming" {
@@ -379,6 +394,7 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
 
     // Position starts unset — update_overlay_position() sets the correct
     // LogicalPosition before the overlay is shown.
+    let activation = overlay_activation_policy();
     let mut builder = WebviewWindowBuilder::new(
         app_handle,
         "recording_overlay",
@@ -396,8 +412,8 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
     .always_on_top(true)
     .skip_taskbar(true)
     .transparent(true)
-    .focusable(false)
-    .focused(false)
+    .focusable(activation.focusable)
+    .focused(activation.initially_focused)
     .visible(false);
 
     if let Some(data_dir) = crate::portable::data_dir() {
@@ -747,6 +763,14 @@ pub fn emit_levels(app_handle: &AppHandle, levels: &[f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_activation_policy_never_requests_target_focus() {
+        let policy = overlay_activation_policy();
+        assert!(!policy.focusable);
+        assert!(!policy.initially_focused);
+        assert!(!policy.activates_when_shown);
+    }
 
     #[test]
     fn monitor_hit_test_uses_half_open_physical_bounds() {

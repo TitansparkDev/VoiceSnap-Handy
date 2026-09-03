@@ -69,6 +69,18 @@ pub struct CliArgs {
     #[arg(long, value_name = "MS", default_value_t = 100)]
     pub benchmark_frame_ms: u64,
 
+    /// Capture a real microphone session for N seconds and benchmark the same
+    /// stream/final-only path as --benchmark-stream. This is headless and does
+    /// not open the application overlay.
+    #[arg(long, value_name = "SECONDS")]
+    pub benchmark_live_seconds: Option<u64>,
+
+    /// Optional UTF-8 reference transcript used to report deterministic WER for
+    /// a fixed-WAV or live benchmark. The reference/transcript text is never
+    /// emitted in benchmark JSON.
+    #[arg(long, value_name = "TEXT_FILE")]
+    pub benchmark_reference_file: Option<PathBuf>,
+
     /// Emit --transcribe-file results as JSON.
     #[arg(long)]
     pub json: bool,

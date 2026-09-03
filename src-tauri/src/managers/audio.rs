@@ -418,6 +418,10 @@ impl RecordingReadiness {
         self.receiver.recv().is_ok()
     }
 
+    pub fn wait_timeout(self, timeout: Duration) -> bool {
+        self.receiver.recv_timeout(timeout).is_ok()
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }
