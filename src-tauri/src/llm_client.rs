@@ -7,6 +7,12 @@ use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::sync::{Mutex, OnceLock};
 
+/// Cleanup should never be allowed to generate an unbounded response. The
+/// transcription contract is rewrite-only, so 2K output tokens leaves ample
+/// room for long dictations while preventing a local model from wandering into
+/// lengthy explanations or reasoning when an endpoint ignores prompt guidance.
+const POST_PROCESS_MAX_OUTPUT_TOKENS: u32 = 2048;
+
 #[derive(Debug, Serialize)]
 struct ChatMessage {
     role: String,
@@ -114,6 +120,7 @@ struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessage>,
     stream: bool,
+    max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
     #[serde(flatten)]
@@ -383,6 +390,7 @@ pub async fn send_chat_completion_with_schema(
         model: model.to_string(),
         messages,
         stream: false,
+        max_tokens: POST_PROCESS_MAX_OUTPUT_TOKENS,
         response_format,
         reasoning,
     };
@@ -572,6 +580,7 @@ mod tests {
                 content: "hi".to_string(),
             }],
             stream: false,
+            max_tokens: POST_PROCESS_MAX_OUTPUT_TOKENS,
             response_format: None,
             reasoning,
         };
@@ -666,6 +675,12 @@ mod tests {
     fn requests_explicitly_disable_streaming() {
         let json = request_json(ReasoningParams::default());
         assert_eq!(json["stream"], false);
+    }
+
+    #[test]
+    fn cleanup_requests_have_a_bounded_output_token_budget() {
+        let json = request_json(ReasoningParams::default());
+        assert_eq!(json["max_tokens"], POST_PROCESS_MAX_OUTPUT_TOKENS);
     }
 
     #[test]

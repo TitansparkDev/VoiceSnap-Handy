@@ -61,6 +61,11 @@ struct TranscribeAction {
 /// Field name for structured output JSON schema
 const TRANSCRIPTION_FIELD: &str = "transcription";
 
+/// Non-negotiable cleanup response contract. User prompts may customize how the
+/// transcript is cleaned, but they must not relax the shape or safety of the
+/// returned text.
+const CLEANUP_OUTPUT_CONTRACT: &str = "Return only the cleaned transcription text. Do not add explanations, surrounding quotes, markdown/code fences, JSON/XML wrappers, or invented content.";
+
 /// Strip invisible Unicode characters that some LLMs may insert
 fn strip_invisible_chars(s: &str) -> String {
     s.replace(['\u{200B}', '\u{200C}', '\u{200D}', '\u{FEFF}'], "")
@@ -80,9 +85,53 @@ fn strip_think_block(s: &str) -> &str {
 }
 
 /// Build a system prompt from the user's prompt template.
-/// Removes `${output}` placeholder since the transcription is sent as the user message.
+/// Removes `${output}` placeholder since the transcription is sent as the user message,
+/// then appends the fork's strict output contract so custom prompts cannot silently
+/// opt out of the text-only response shape.
 fn build_system_prompt(prompt_template: &str) -> String {
-    prompt_template.replace("${output}", "").trim().to_string()
+    let prompt = prompt_template.replace("${output}", "").trim().to_string();
+    if prompt.is_empty() {
+        CLEANUP_OUTPUT_CONTRACT.to_string()
+    } else {
+        format!("{prompt}\n\n{CLEANUP_OUTPUT_CONTRACT}")
+    }
+}
+
+fn build_legacy_prompt(prompt_template: &str, transcription: &str) -> String {
+    let prompt = prompt_template.replace("${output}", transcription);
+    format!("{}\n\n{}", prompt.trim(), CLEANUP_OUTPUT_CONTRACT)
+}
+
+/// Normalize a successful cleanup response while enforcing the text-only contract.
+/// Obvious wrappers are treated as malformed and therefore fail open to the raw
+/// transcript at the caller instead of being pasted into the target application.
+fn normalize_cleanup_output(output: &str) -> Option<String> {
+    let output = strip_invisible_chars(strip_think_block(output));
+    let output = output.trim();
+    if output.is_empty() {
+        return None;
+    }
+
+    let fenced = output.starts_with("```") && output.ends_with("```");
+    let quoted = (output.starts_with('"') && output.ends_with('"'))
+        || (output.starts_with('\'') && output.ends_with('\''))
+        || (output.starts_with('`') && output.ends_with('`'));
+    if fenced || quoted {
+        return None;
+    }
+
+    Some(output.to_string())
+}
+
+fn parse_structured_cleanup_output(content: &str) -> Option<String> {
+    let content = strip_think_block(content).trim();
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let object = value.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+
+    normalize_cleanup_output(object.get(TRANSCRIPTION_FIELD)?.as_str()?)
 }
 
 /// Returns `true` when a transcription has no meaningful content to
@@ -227,19 +276,19 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                     &user_content,
                     token_limit,
                 ) {
-                    Ok(result) => {
-                        if result.trim().is_empty() {
-                            debug!("Apple Intelligence returned an empty response");
-                            None
-                        } else {
-                            let result = strip_invisible_chars(&result);
+                    Ok(result) => match normalize_cleanup_output(&result) {
+                        Some(result) => {
                             debug!(
                                 "Apple Intelligence post-processing succeeded. Output length: {} chars",
                                 result.len()
                             );
                             Some(result)
                         }
-                    }
+                        None => {
+                            error!("Apple Intelligence returned malformed cleanup output; falling back to the raw transcription");
+                            None
+                        }
+                    },
                     Err(err) => {
                         error!("Apple Intelligence post-processing failed: {}", err);
                         None
@@ -279,33 +328,20 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
         .await
         {
             Ok(Some(content)) => {
-                // Parse the JSON response to extract the transcription field
-                let content = strip_think_block(&content);
-                match serde_json::from_str::<serde_json::Value>(content) {
-                    Ok(json) => {
-                        if let Some(transcription_value) =
-                            json.get(TRANSCRIPTION_FIELD).and_then(|t| t.as_str())
-                        {
-                            let result = strip_invisible_chars(transcription_value);
-                            debug!(
-                                "Structured output post-processing succeeded for provider '{}'. Output length: {} chars",
-                                provider.id,
-                                result.len()
-                            );
-                            return Some(result);
-                        } else {
-                            error!("Structured output response missing 'transcription' field");
-                            return Some(strip_invisible_chars(content));
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to parse structured output JSON: {}. Returning raw content.",
-                            e
-                        );
-                        return Some(strip_invisible_chars(content));
-                    }
+                if let Some(result) = parse_structured_cleanup_output(&content) {
+                    debug!(
+                        "Structured output post-processing succeeded for provider '{}'. Output length: {} chars",
+                        provider.id,
+                        result.len()
+                    );
+                    return Some(result);
                 }
+
+                error!(
+                    "Structured output response for provider '{}' violated the cleanup contract; falling back to the raw transcription",
+                    provider.id
+                );
+                return None;
             }
             Ok(None) => {
                 error!("LLM API response has no content");
@@ -321,8 +357,9 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
         }
     }
 
-    // Legacy mode: Replace ${output} variable in the prompt with the actual text
-    let processed_prompt = prompt.replace("${output}", transcription);
+    // Legacy mode: replace ${output} with the actual text and append the same
+    // strict response contract used by structured providers.
+    let processed_prompt = build_legacy_prompt(&prompt, transcription);
     debug!("Processed prompt length: {} chars", processed_prompt.len());
 
     match crate::llm_client::send_chat_completion(
@@ -334,15 +371,23 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
     )
     .await
     {
-        Ok(Some(content)) => {
-            let content = strip_invisible_chars(strip_think_block(&content));
-            debug!(
-                "LLM post-processing succeeded for provider '{}'. Output length: {} chars",
-                provider.id,
-                content.len()
-            );
-            Some(content)
-        }
+        Ok(Some(content)) => match normalize_cleanup_output(&content) {
+            Some(content) => {
+                debug!(
+                    "LLM post-processing succeeded for provider '{}'. Output length: {} chars",
+                    provider.id,
+                    content.len()
+                );
+                Some(content)
+            }
+            None => {
+                error!(
+                    "LLM post-processing output for provider '{}' violated the cleanup contract; falling back to the raw transcription",
+                    provider.id
+                );
+                None
+            }
+        },
         Ok(None) => {
             error!("LLM API response has no content");
             None
@@ -970,8 +1015,10 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_unless_cancelled, is_blank_transcription, resolve_stream_or_batch,
-        should_use_streaming_overlay, strip_think_block,
+        build_legacy_prompt, build_system_prompt, complete_unless_cancelled,
+        is_blank_transcription, normalize_cleanup_output, parse_structured_cleanup_output,
+        resolve_stream_or_batch, should_use_streaming_overlay, strip_think_block,
+        CLEANUP_OUTPUT_CONTRACT,
     };
     use crate::settings::OverlayStyle;
     use std::cell::Cell;
@@ -1045,6 +1092,60 @@ mod tests {
         assert_eq!(
             strip_think_block("<think>never closed"),
             "<think>never closed"
+        );
+    }
+
+    #[test]
+    fn cleanup_prompts_always_include_strict_output_contract() {
+        let system = build_system_prompt("Fix punctuation for ${output}");
+        assert!(!system.contains("${output}"));
+        assert!(system.ends_with(CLEANUP_OUTPUT_CONTRACT));
+
+        let legacy = build_legacy_prompt("Clean this: ${output}", "hello world");
+        assert!(legacy.contains("Clean this: hello world"));
+        assert!(legacy.ends_with(CLEANUP_OUTPUT_CONTRACT));
+    }
+
+    #[test]
+    fn cleanup_output_accepts_plain_text_and_strips_reasoning_noise() {
+        assert_eq!(
+            normalize_cleanup_output("<think>ignore me</think>  Cleaned\u{200B} text.  "),
+            Some("Cleaned text.".to_string())
+        );
+    }
+
+    #[test]
+    fn cleanup_output_rejects_empty_or_wrapped_responses() {
+        assert_eq!(normalize_cleanup_output("   "), None);
+        assert_eq!(
+            normalize_cleanup_output("```text\nCleaned text.\n```"),
+            None
+        );
+        assert_eq!(normalize_cleanup_output("\"Cleaned text.\""), None);
+        assert_eq!(normalize_cleanup_output("'Cleaned text.'"), None);
+        assert_eq!(normalize_cleanup_output("`Cleaned text.`"), None);
+    }
+
+    #[test]
+    fn structured_cleanup_requires_exact_transcription_field() {
+        assert_eq!(
+            parse_structured_cleanup_output(r#"{"transcription":"Cleaned text."}"#),
+            Some("Cleaned text.".to_string())
+        );
+        assert_eq!(parse_structured_cleanup_output("not json"), None);
+        assert_eq!(
+            parse_structured_cleanup_output(r#"{"message":"Cleaned text."}"#),
+            None
+        );
+        assert_eq!(
+            parse_structured_cleanup_output(
+                r#"{"transcription":"Cleaned text.","explanation":"extra"}"#
+            ),
+            None
+        );
+        assert_eq!(
+            parse_structured_cleanup_output(r#"{"transcription":"```text\\nwrapped\\n```"}"#),
+            None
         );
     }
 
