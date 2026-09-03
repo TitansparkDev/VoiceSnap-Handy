@@ -14,9 +14,17 @@ pub async fn get_history_entries(
     cursor: Option<i64>,
     limit: Option<usize>,
     search: Option<String>,
+    start_timestamp: Option<i64>,
+    end_timestamp_exclusive: Option<i64>,
 ) -> Result<PaginatedHistory, String> {
     history_manager
-        .get_history_entries(cursor, limit, search.as_deref())
+        .get_history_entries(
+            cursor,
+            limit,
+            search.as_deref(),
+            start_timestamp,
+            end_timestamp_exclusive,
+        )
         .await
         .map_err(|e| e.to_string())
 }

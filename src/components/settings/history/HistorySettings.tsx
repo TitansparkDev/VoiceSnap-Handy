@@ -38,6 +38,16 @@ const IconButton: React.FC<{
 
 const PAGE_SIZE = 30;
 
+const localMidnightTimestamp = (value: string, dayOffset = 0): number | null => {
+  if (!value) return null;
+
+  const [year, month, day] = value.split("-").map(Number);
+  if (!year || !month || !day) return null;
+
+  const date = new Date(year, month - 1, day + dayOffset);
+  return Math.floor(date.getTime() / 1000);
+};
+
 interface OpenRecordingsButtonProps {
   onClick: () => void;
   label: string;
@@ -67,6 +77,8 @@ export const HistorySettings: React.FC = () => {
   const [hasMore, setHasMore] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchTerm, setSearchTerm] = useState("");
+  const [startDate, setStartDate] = useState("");
+  const [endDate, setEndDate] = useState("");
   const sentinelRef = useRef<HTMLDivElement>(null);
   const entriesRef = useRef<HistoryEntry[]>([]);
   const loadingRef = useRef(false);
@@ -94,6 +106,8 @@ export const HistorySettings: React.FC = () => {
           cursor ?? null,
           PAGE_SIZE,
           searchTerm || null,
+          localMidnightTimestamp(startDate),
+          localMidnightTimestamp(endDate, 1),
         );
         if (generation !== requestGenerationRef.current) {
           return;
@@ -118,7 +132,7 @@ export const HistorySettings: React.FC = () => {
         }
       }
     },
-    [searchTerm],
+    [searchTerm, startDate, endDate],
   );
 
   useEffect(() => {
@@ -329,6 +343,28 @@ export const HistorySettings: React.FC = () => {
               })}
               className="mt-2 w-full rounded-md border border-mid-gray/20 bg-background px-3 py-1.5 text-sm text-text outline-none transition-colors placeholder:text-text/35 focus:border-logo-primary/60"
             />
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              <label className="text-[10px] font-medium uppercase tracking-wide text-text/45">
+                {t("settings.history.fromDate", { defaultValue: "From" })}
+                <input
+                  type="date"
+                  value={startDate}
+                  max={endDate || undefined}
+                  onChange={(event) => setStartDate(event.target.value)}
+                  className="mt-1 block w-full rounded-md border border-mid-gray/20 bg-background px-2 py-1.5 text-sm font-normal normal-case tracking-normal text-text outline-none transition-colors focus:border-logo-primary/60"
+                />
+              </label>
+              <label className="text-[10px] font-medium uppercase tracking-wide text-text/45">
+                {t("settings.history.toDate", { defaultValue: "To" })}
+                <input
+                  type="date"
+                  value={endDate}
+                  min={startDate || undefined}
+                  onChange={(event) => setEndDate(event.target.value)}
+                  className="mt-1 block w-full rounded-md border border-mid-gray/20 bg-background px-2 py-1.5 text-sm font-normal normal-case tracking-normal text-text outline-none transition-colors focus:border-logo-primary/60"
+                />
+              </label>
+            </div>
           </div>
           <OpenRecordingsButton
             onClick={openRecordingsFolder}

@@ -452,9 +452,18 @@ impl HistoryManager {
         cursor: Option<i64>,
         limit: Option<usize>,
         search: Option<&str>,
+        start_timestamp: Option<i64>,
+        end_timestamp_exclusive: Option<i64>,
     ) -> Result<PaginatedHistory> {
         let conn = self.get_connection()?;
-        Self::get_history_entries_with_conn(&conn, cursor, limit, search)
+        Self::get_history_entries_with_conn(
+            &conn,
+            cursor,
+            limit,
+            search,
+            start_timestamp,
+            end_timestamp_exclusive,
+        )
     }
 
     fn get_history_entries_with_conn(
@@ -462,6 +471,8 @@ impl HistoryManager {
         cursor: Option<i64>,
         limit: Option<usize>,
         search: Option<&str>,
+        start_timestamp: Option<i64>,
+        end_timestamp_exclusive: Option<i64>,
     ) -> Result<PaginatedHistory> {
         let limit = limit.map(|l| l.min(100));
         let fetch_count = limit
@@ -478,12 +489,20 @@ impl HistoryManager {
                     OR transcription_text LIKE ?2 ESCAPE '\\'
                     OR COALESCE(post_processed_text, '') LIKE ?2 ESCAPE '\\'
                )
+               AND (?3 IS NULL OR timestamp >= ?3)
+               AND (?4 IS NULL OR timestamp < ?4)
              ORDER BY id DESC
-             LIMIT ?3",
+             LIMIT ?5",
         )?;
         let mut entries = stmt
             .query_map(
-                params![cursor, search_pattern, fetch_count],
+                params![
+                    cursor,
+                    search_pattern,
+                    start_timestamp,
+                    end_timestamp_exclusive,
+                    fetch_count
+                ],
                 Self::map_history_entry,
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -750,15 +769,27 @@ mod tests {
         insert_entry(&conn, 200, "different raw", Some("Polished Beta phrase"));
         insert_entry(&conn, 300, "unrelated", None);
 
-        let raw =
-            HistoryManager::get_history_entries_with_conn(&conn, None, Some(10), Some("alpha"))
-                .expect("search raw text");
+        let raw = HistoryManager::get_history_entries_with_conn(
+            &conn,
+            None,
+            Some(10),
+            Some("alpha"),
+            None,
+            None,
+        )
+        .expect("search raw text");
         assert_eq!(raw.entries.len(), 1);
         assert_eq!(raw.entries[0].timestamp, 100);
 
-        let final_text =
-            HistoryManager::get_history_entries_with_conn(&conn, None, Some(10), Some("BETA"))
-                .expect("search final text");
+        let final_text = HistoryManager::get_history_entries_with_conn(
+            &conn,
+            None,
+            Some(10),
+            Some("BETA"),
+            None,
+            None,
+        )
+        .expect("search final text");
         assert_eq!(final_text.entries.len(), 1);
         assert_eq!(final_text.entries[0].timestamp, 200);
     }
@@ -770,9 +801,15 @@ mod tests {
         insert_entry(&conn, 200, "needle 100% second", None);
         insert_entry(&conn, 300, "needle 100 percent unrelated", None);
 
-        let first_page =
-            HistoryManager::get_history_entries_with_conn(&conn, None, Some(1), Some("100%"))
-                .expect("first search page");
+        let first_page = HistoryManager::get_history_entries_with_conn(
+            &conn,
+            None,
+            Some(1),
+            Some("100%"),
+            None,
+            None,
+        )
+        .expect("first search page");
         assert_eq!(first_page.entries.len(), 1);
         assert_eq!(first_page.entries[0].timestamp, 200);
         assert!(first_page.has_more);
@@ -782,10 +819,54 @@ mod tests {
             Some(first_page.entries[0].id),
             Some(1),
             Some("100%"),
+            None,
+            None,
         )
         .expect("second search page");
         assert_eq!(second_page.entries.len(), 1);
         assert_eq!(second_page.entries[0].timestamp, 100);
         assert!(!second_page.has_more);
+    }
+
+    #[test]
+    fn history_date_filter_uses_inclusive_start_and_exclusive_end() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "before", None);
+        insert_entry(&conn, 200, "inside", None);
+        insert_entry(&conn, 300, "at end", None);
+
+        let filtered = HistoryManager::get_history_entries_with_conn(
+            &conn,
+            None,
+            Some(10),
+            None,
+            Some(200),
+            Some(300),
+        )
+        .expect("filter history by date range");
+
+        assert_eq!(filtered.entries.len(), 1);
+        assert_eq!(filtered.entries[0].timestamp, 200);
+    }
+
+    #[test]
+    fn history_date_filter_combines_with_search() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "target before range", None);
+        insert_entry(&conn, 200, "target in range", None);
+        insert_entry(&conn, 250, "different in range", None);
+
+        let filtered = HistoryManager::get_history_entries_with_conn(
+            &conn,
+            None,
+            Some(10),
+            Some("target"),
+            Some(150),
+            Some(250),
+        )
+        .expect("combine search and date range");
+
+        assert_eq!(filtered.entries.len(), 1);
+        assert_eq!(filtered.entries[0].timestamp, 200);
     }
 }
