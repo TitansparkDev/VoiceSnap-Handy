@@ -5,8 +5,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use rusqlite_migration::{Migrations, M};
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use tauri::AppHandle;
 use tauri_specta::Event;
 
@@ -134,8 +135,15 @@ impl HistoryManager {
             db_path,
         };
 
-        // Initialize database and run migrations synchronously
+        // Initialize database and run migrations synchronously.
         manager.init_database()?;
+
+        // Retention is maintenance, not a startup prerequisite. Run it here so
+        // crash leftovers are eventually reclaimed, but never make a cleanup
+        // filesystem problem prevent Handy from opening its history database.
+        if let Err(error) = manager.cleanup_old_entries() {
+            error!("History audio cleanup at startup failed: {error}");
+        }
 
         Ok(manager)
     }
@@ -384,7 +392,11 @@ impl HistoryManager {
 
         debug!("Saved history entry with id {}", entry.id);
 
-        self.cleanup_old_entries()?;
+        // The row is already durable at this point. Retention maintenance must
+        // not turn a successful insert into a reported history-save failure.
+        if let Err(error) = self.cleanup_old_entries() {
+            error!("History audio cleanup after save failed: {error}");
+        }
 
         // Emit typed event for real-time frontend updates
         if let Err(e) = (HistoryUpdatePayload::Added {
@@ -554,122 +566,198 @@ impl HistoryManager {
 
     pub fn cleanup_old_entries(&self) -> Result<()> {
         let retention_period = crate::settings::get_recording_retention_period(&self.app_handle);
-
-        match retention_period {
-            crate::settings::RecordingRetentionPeriod::Never => {
-                // Don't delete anything
-                Ok(())
-            }
-            crate::settings::RecordingRetentionPeriod::PreserveLimit => {
-                // Use the old count-based logic with history_limit
-                let limit = crate::settings::get_history_limit(&self.app_handle);
-                self.cleanup_by_count(limit)
-            }
-            _ => {
-                // Use time-based logic
-                self.cleanup_by_time(retention_period)
-            }
-        }
-    }
-
-    fn delete_entries_and_files(&self, entries: &[(i64, String)]) -> Result<usize> {
-        if entries.is_empty() {
-            return Ok(0);
-        }
-
         let conn = self.get_connection()?;
-        let mut deleted_count = 0;
-
-        for (id, file_name) in entries {
-            // Delete database entry
-            conn.execute(
-                "DELETE FROM transcription_history WHERE id = ?1",
-                params![id],
-            )?;
-
-            // Delete WAV file
-            let file_path = self.recordings_dir.join(file_name);
-            if file_path.exists() {
-                if let Err(e) = fs::remove_file(&file_path) {
-                    error!("Failed to delete WAV file {}: {}", file_name, e);
-                } else {
-                    debug!("Deleted old WAV file: {}", file_name);
-                    deleted_count += 1;
-                }
-            }
-        }
-
-        Ok(deleted_count)
-    }
-
-    fn cleanup_by_count(&self, limit: usize) -> Result<()> {
-        let conn = self.get_connection()?;
-
-        // Get all entries that are not saved, ordered by timestamp desc
-        let mut stmt = conn.prepare(
-            "SELECT id, file_name FROM transcription_history WHERE saved = 0 ORDER BY timestamp DESC"
-        )?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>("id")?, row.get::<_, String>("file_name")?))
-        })?;
-
-        let mut entries: Vec<(i64, String)> = Vec::new();
-        for row in rows {
-            entries.push(row?);
-        }
-
-        if entries.len() > limit {
-            let entries_to_delete = &entries[limit..];
-            let deleted_count = self.delete_entries_and_files(entries_to_delete)?;
-
-            if deleted_count > 0 {
-                debug!("Cleaned up {} old history entries by count", deleted_count);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn cleanup_by_time(
-        &self,
-        retention_period: crate::settings::RecordingRetentionPeriod,
-    ) -> Result<()> {
-        let conn = self.get_connection()?;
-
-        // Calculate cutoff timestamp (current time minus retention period)
         let now = Utc::now().timestamp();
-        let cutoff_timestamp = match retention_period {
-            crate::settings::RecordingRetentionPeriod::Days3 => now - (3 * 24 * 60 * 60), // 3 days in seconds
-            crate::settings::RecordingRetentionPeriod::Weeks2 => now - (2 * 7 * 24 * 60 * 60), // 2 weeks in seconds
-            crate::settings::RecordingRetentionPeriod::Months3 => now - (3 * 30 * 24 * 60 * 60), // 3 months in seconds (approximate)
-            _ => unreachable!("Should not reach here"),
-        };
 
-        // Get all unsaved entries older than the cutoff timestamp
-        let mut stmt = conn.prepare(
-            "SELECT id, file_name FROM transcription_history WHERE saved = 0 AND timestamp < ?1",
-        )?;
-
-        let rows = stmt.query_map(params![cutoff_timestamp], |row| {
-            Ok((row.get::<_, i64>("id")?, row.get::<_, String>("file_name")?))
-        })?;
-
-        let mut entries_to_delete: Vec<(i64, String)> = Vec::new();
-        for row in rows {
-            entries_to_delete.push(row?);
+        // An audio file without a history row cannot be reached from the UI or
+        // retried. Clean stale managed orphans regardless of the selected
+        // retention policy, while leaving very recent files alone so an
+        // in-flight WAV save cannot race a settings change.
+        let orphan_count = Self::cleanup_orphan_audio_with_conn(&conn, &self.recordings_dir, now)?;
+        if orphan_count > 0 {
+            debug!("Cleaned up {} orphaned recording files", orphan_count);
         }
 
-        let deleted_count = self.delete_entries_and_files(&entries_to_delete)?;
+        let deleted_count = match retention_period {
+            crate::settings::RecordingRetentionPeriod::Never => 0,
+            crate::settings::RecordingRetentionPeriod::PreserveLimit => {
+                let limit = crate::settings::get_history_limit(&self.app_handle);
+                Self::cleanup_audio_by_count_with_conn(&conn, &self.recordings_dir, limit)?
+            }
+            _ => Self::cleanup_audio_by_time_with_conn(
+                &conn,
+                &self.recordings_dir,
+                retention_period,
+                now,
+            )?,
+        };
 
         if deleted_count > 0 {
             debug!(
-                "Cleaned up {} old history entries based on retention period",
-                deleted_count
+                "Cleaned up {} retained recording files according to {:?}",
+                deleted_count, retention_period
             );
         }
 
         Ok(())
+    }
+
+    /// Resolve a history-owned recording name without permitting a database
+    /// value to escape the recordings directory.
+    fn retained_audio_path(recordings_dir: &Path, file_name: &str) -> Result<PathBuf> {
+        let mut components = Path::new(file_name).components();
+        match (components.next(), components.next()) {
+            (Some(Component::Normal(_)), None) => Ok(recordings_dir.join(file_name)),
+            _ => Err(anyhow!("Invalid retained audio file name: {file_name}")),
+        }
+    }
+
+    /// Remove one retained recording. A missing file is already in the desired
+    /// state; other filesystem failures are surfaced to callers that need an
+    /// all-or-nothing history deletion.
+    fn remove_retained_audio(recordings_dir: &Path, file_name: &str) -> Result<bool> {
+        let file_path = Self::retained_audio_path(recordings_dir, file_name)?;
+        match fs::remove_file(&file_path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(anyhow!(
+                "Failed to delete retained audio {file_name}: {error}"
+            )),
+        }
+    }
+
+    /// Best-effort policy cleanup deliberately removes only WAV files. The
+    /// transcription_history table remains the single transcript store, so an
+    /// audio retention policy can expire recordings without erasing searchable
+    /// history or creating a shadow transcript database.
+    fn remove_audio_candidates(recordings_dir: &Path, file_names: Vec<String>) -> usize {
+        let mut deleted_count = 0;
+        let mut seen = HashSet::new();
+        for file_name in file_names {
+            if !seen.insert(file_name.clone()) {
+                continue;
+            }
+            match Self::remove_retained_audio(recordings_dir, &file_name) {
+                Ok(true) => {
+                    debug!("Deleted retained WAV file: {}", file_name);
+                    deleted_count += 1;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    // Retention cleanup is fail-safe: a filesystem error must
+                    // never delete or corrupt the history row. A later cleanup
+                    // pass can retry the same path.
+                    error!("{error}");
+                }
+            }
+        }
+        deleted_count
+    }
+
+    fn cleanup_audio_by_count_with_conn(
+        conn: &Connection,
+        recordings_dir: &Path,
+        limit: usize,
+    ) -> Result<usize> {
+        // `saved` protects the history row, not an unlimited WAV. Counting every
+        // row makes the selected recording limit an actual upper bound.
+        let mut stmt = conn.prepare(
+            "SELECT file_name FROM transcription_history ORDER BY timestamp DESC, id DESC",
+        )?;
+        let file_names = stmt
+            .query_map([], |row| row.get::<_, String>("file_name"))?
+            .skip(limit)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(Self::remove_audio_candidates(recordings_dir, file_names))
+    }
+
+    fn cleanup_audio_by_time_with_conn(
+        conn: &Connection,
+        recordings_dir: &Path,
+        retention_period: crate::settings::RecordingRetentionPeriod,
+        now: i64,
+    ) -> Result<usize> {
+        let cutoff_timestamp = match retention_period {
+            crate::settings::RecordingRetentionPeriod::Days3 => now - (3 * 24 * 60 * 60),
+            crate::settings::RecordingRetentionPeriod::Weeks2 => now - (2 * 7 * 24 * 60 * 60),
+            crate::settings::RecordingRetentionPeriod::Months3 => now - (3 * 30 * 24 * 60 * 60),
+            _ => unreachable!("time cleanup requires a time-based retention period"),
+        };
+
+        let mut stmt = conn.prepare(
+            "SELECT file_name FROM transcription_history WHERE timestamp < ?1 ORDER BY timestamp ASC, id ASC",
+        )?;
+        let file_names = stmt
+            .query_map(params![cutoff_timestamp], |row| {
+                row.get::<_, String>("file_name")
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(Self::remove_audio_candidates(recordings_dir, file_names))
+    }
+
+    const ORPHAN_AUDIO_GRACE_SECONDS: i64 = 5 * 60;
+
+    fn managed_recording_timestamp(file_name: &str) -> Option<i64> {
+        let timestamp = file_name.strip_prefix("handy-")?.strip_suffix(".wav")?;
+        if timestamp.is_empty() || !timestamp.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        timestamp.parse().ok()
+    }
+
+    fn cleanup_orphan_audio_with_conn(
+        conn: &Connection,
+        recordings_dir: &Path,
+        now: i64,
+    ) -> Result<usize> {
+        let mut stmt = conn.prepare("SELECT file_name FROM transcription_history")?;
+        let referenced = stmt
+            .query_map([], |row| row.get::<_, String>("file_name"))?
+            .collect::<std::result::Result<HashSet<_>, _>>()?;
+        let stale_before = now.saturating_sub(Self::ORPHAN_AUDIO_GRACE_SECONDS);
+        let mut deleted_count = 0;
+
+        let entries = match fs::read_dir(recordings_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    error!("Failed to inspect recordings directory entry: {error}");
+                    continue;
+                }
+            };
+            if !entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Some(timestamp) = Self::managed_recording_timestamp(&file_name) else {
+                continue;
+            };
+            if timestamp > stale_before || referenced.contains(&file_name) {
+                continue;
+            }
+
+            match Self::remove_retained_audio(recordings_dir, &file_name) {
+                Ok(true) => deleted_count += 1,
+                Ok(false) => {}
+                Err(error) => error!("{error}"),
+            }
+        }
+
+        Ok(deleted_count)
     }
 
     pub async fn get_history_entries(
@@ -960,30 +1048,49 @@ impl HistoryManager {
         Ok(entry)
     }
 
-    pub async fn delete_entry(&self, id: i64) -> Result<()> {
-        let conn = self.get_connection()?;
+    fn delete_entry_with_conn(conn: &Connection, recordings_dir: &Path, id: i64) -> Result<bool> {
+        let file_name = conn
+            .query_row(
+                "SELECT file_name FROM transcription_history WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(file_name) = file_name else {
+            return Ok(false);
+        };
 
-        // Get the entry to find the file name
-        if let Some(entry) = self.get_entry_by_id(id).await? {
-            // Delete the audio file first
-            let file_path = self.get_audio_file_path(&entry.file_name);
-            if file_path.exists() {
-                if let Err(e) = fs::remove_file(&file_path) {
-                    error!("Failed to delete audio file {}: {}", entry.file_name, e);
-                    // Continue with database deletion even if file deletion fails
-                }
-            }
+        // A generated recording name should be unique, but preserve the file if
+        // a legacy/corrupt database has another row pointing at the same WAV.
+        let other_references: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM transcription_history WHERE file_name = ?1 AND id != ?2",
+            params![&file_name, id],
+            |row| row.get(0),
+        )?;
+        if other_references == 0 {
+            // Do not drop the only row that identifies a retained file when the
+            // filesystem refuses deletion. Keeping the row makes the failure
+            // visible/retryable instead of silently creating an orphan.
+            Self::remove_retained_audio(recordings_dir, &file_name)?;
         }
 
-        // Delete from database
         conn.execute(
             "DELETE FROM transcription_history WHERE id = ?1",
             params![id],
         )?;
+        Ok(true)
+    }
 
-        debug!("Deleted history entry with id: {}", id);
+    pub async fn delete_entry(&self, id: i64) -> Result<()> {
+        let conn = self.get_connection()?;
+        let deleted = Self::delete_entry_with_conn(&conn, &self.recordings_dir, id)?;
 
-        // Emit history updated event
+        if deleted {
+            debug!("Deleted history entry with id: {}", id);
+        }
+
+        // Preserve the existing idempotent command contract: deleting a missing
+        // row is a no-op, but the frontend may still discard its stale copy.
         if let Err(e) = (HistoryUpdatePayload::Deleted { id }).emit(&self.app_handle) {
             error!("Failed to emit history-updated event: {}", e);
         }
@@ -1006,6 +1113,7 @@ impl HistoryManager {
 mod tests {
     use super::*;
     use rusqlite::{params, Connection};
+    use tempfile::TempDir;
 
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory db");
@@ -1081,6 +1189,19 @@ mod tests {
             ],
         )
         .expect("insert history entry");
+    }
+
+    fn write_recording(dir: &TempDir, timestamp: i64) -> PathBuf {
+        let path = dir.path().join(format!("handy-{timestamp}.wav"));
+        fs::write(&path, b"wav").expect("write recording fixture");
+        path
+    }
+
+    fn row_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM transcription_history", [], |row| {
+            row.get(0)
+        })
+        .expect("count history rows")
     }
 
     #[test]
@@ -1689,5 +1810,181 @@ mod tests {
         .expect_err("reject unknown history outcome filter");
 
         assert!(error.to_string().contains("Invalid history outcome filter"));
+    }
+
+    #[test]
+    fn count_retention_prunes_audio_without_pruning_history() {
+        let conn = setup_conn();
+        let recordings = tempfile::tempdir().expect("create recordings dir");
+        for timestamp in [100_i64, 200, 300] {
+            insert_entry(&conn, timestamp, &format!("transcript {timestamp}"), None);
+            write_recording(&recordings, timestamp);
+        }
+        conn.execute(
+            "UPDATE transcription_history SET saved = 1 WHERE timestamp = ?1",
+            params![100_i64],
+        )
+        .expect("star oldest history row");
+
+        let deleted = HistoryManager::cleanup_audio_by_count_with_conn(&conn, recordings.path(), 2)
+            .expect("apply count-based audio retention");
+
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            row_count(&conn),
+            3,
+            "audio retention must not erase transcripts"
+        );
+        assert!(!recordings.path().join("handy-100.wav").exists());
+        assert!(recordings.path().join("handy-200.wav").exists());
+        assert!(recordings.path().join("handy-300.wav").exists());
+        let saved: bool = conn
+            .query_row(
+                "SELECT saved FROM transcription_history WHERE timestamp = ?1",
+                params![100_i64],
+                |row| row.get(0),
+            )
+            .expect("saved history row remains");
+        assert!(
+            saved,
+            "starring protects history metadata, not an unbounded WAV"
+        );
+    }
+
+    #[test]
+    fn time_retention_prunes_only_expired_audio_and_keeps_transcripts() {
+        let conn = setup_conn();
+        let recordings = tempfile::tempdir().expect("create recordings dir");
+        let day = 24 * 60 * 60;
+        let now = 10 * day;
+        let old_timestamp = now - (4 * day);
+        let recent_timestamp = now - day;
+        for timestamp in [old_timestamp, recent_timestamp] {
+            insert_entry(&conn, timestamp, &format!("transcript {timestamp}"), None);
+            write_recording(&recordings, timestamp);
+        }
+
+        let deleted = HistoryManager::cleanup_audio_by_time_with_conn(
+            &conn,
+            recordings.path(),
+            crate::settings::RecordingRetentionPeriod::Days3,
+            now,
+        )
+        .expect("apply time-based audio retention");
+
+        assert_eq!(deleted, 1);
+        assert_eq!(row_count(&conn), 2);
+        assert!(!recordings
+            .path()
+            .join(format!("handy-{old_timestamp}.wav"))
+            .exists());
+        assert!(recordings
+            .path()
+            .join(format!("handy-{recent_timestamp}.wav"))
+            .exists());
+    }
+
+    #[test]
+    fn deleting_history_removes_its_retained_audio() {
+        let conn = setup_conn();
+        let recordings = tempfile::tempdir().expect("create recordings dir");
+        insert_entry(&conn, 100, "delete me", None);
+        let audio_path = write_recording(&recordings, 100);
+
+        assert!(
+            HistoryManager::delete_entry_with_conn(&conn, recordings.path(), 1)
+                .expect("delete history and retained audio")
+        );
+        assert_eq!(row_count(&conn), 0);
+        assert!(!audio_path.exists());
+    }
+
+    #[test]
+    fn history_delete_failure_keeps_row_linked_to_undeleted_audio() {
+        let conn = setup_conn();
+        let recordings = tempfile::tempdir().expect("create recordings dir");
+        insert_entry(&conn, 100, "keep on failure", None);
+        let audio_path = recordings.path().join("handy-100.wav");
+        fs::create_dir(&audio_path).expect("make undeletable-as-file fixture");
+
+        let error = HistoryManager::delete_entry_with_conn(&conn, recordings.path(), 1)
+            .expect_err("filesystem deletion failure must stop row deletion");
+
+        assert!(error
+            .to_string()
+            .contains("Failed to delete retained audio"));
+        assert_eq!(
+            row_count(&conn),
+            1,
+            "the row must remain retryable on failure"
+        );
+        assert!(audio_path.is_dir());
+    }
+
+    #[test]
+    fn retention_delete_failure_is_best_effort_and_never_removes_history() {
+        let conn = setup_conn();
+        let recordings = tempfile::tempdir().expect("create recordings dir");
+        insert_entry(&conn, 100, "old transcript", None);
+        insert_entry(&conn, 200, "new transcript", None);
+        let blocked_path = recordings.path().join("handy-100.wav");
+        fs::create_dir(&blocked_path).expect("make undeletable-as-file fixture");
+        write_recording(&recordings, 200);
+
+        let deleted = HistoryManager::cleanup_audio_by_count_with_conn(&conn, recordings.path(), 1)
+            .expect("retention cleanup should fail open on per-file errors");
+
+        assert_eq!(deleted, 0);
+        assert_eq!(row_count(&conn), 2);
+        assert!(blocked_path.is_dir());
+    }
+
+    #[test]
+    fn orphan_cleanup_removes_only_stale_managed_recordings() {
+        let conn = setup_conn();
+        let recordings = tempfile::tempdir().expect("create recordings dir");
+        insert_entry(&conn, 100, "referenced", None);
+        let referenced = write_recording(&recordings, 100);
+        let stale_orphan = write_recording(&recordings, 200);
+        let recent_orphan = write_recording(&recordings, 950);
+        let unmanaged = recordings.path().join("keep-me.wav");
+        fs::write(&unmanaged, b"not managed by history").expect("write unmanaged fixture");
+
+        let deleted =
+            HistoryManager::cleanup_orphan_audio_with_conn(&conn, recordings.path(), 1_000)
+                .expect("clean stale recording orphans");
+
+        assert_eq!(deleted, 1);
+        assert!(referenced.exists());
+        assert!(!stale_orphan.exists());
+        assert!(
+            recent_orphan.exists(),
+            "recent files get an in-flight grace period"
+        );
+        assert!(
+            unmanaged.exists(),
+            "cleanup must not delete unrelated WAV files"
+        );
+        assert_eq!(row_count(&conn), 1);
+    }
+
+    #[test]
+    fn invalid_history_audio_path_fails_closed() {
+        let recordings = tempfile::tempdir().expect("create recordings dir");
+        let outside = recordings
+            .path()
+            .parent()
+            .expect("tempdir parent")
+            .join("outside.wav");
+        fs::write(&outside, b"outside").expect("write outside fixture");
+
+        let error = HistoryManager::remove_retained_audio(recordings.path(), "../outside.wav")
+            .expect_err("path traversal must not be followed");
+
+        assert!(error
+            .to_string()
+            .contains("Invalid retained audio file name"));
+        assert!(outside.exists());
+        let _ = fs::remove_file(outside);
     }
 }
