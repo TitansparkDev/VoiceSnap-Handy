@@ -9,7 +9,7 @@ use crate::managers::model::{EngineType, ModelManager};
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::TranscriptionManager;
 use crate::settings::{
-    get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID,
+    get_settings, AppSettings, InsertionMode, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID,
     LOCAL_CLEANUP_PROVIDER_ID,
 };
 use crate::shortcut;
@@ -29,10 +29,6 @@ use tauri::Manager;
 use tauri::{AppHandle, Emitter};
 
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
-/// Until Wave 3 introduces opt-in live insertion, every recording session uses
-/// the existing one-shot final paste at stop. Persist that product truth in
-/// history rather than inferring it later from overlay/streaming behavior.
-const HISTORY_INSERTION_MODE_AT_STOP: &str = "at_stop";
 
 #[derive(Clone, serde::Serialize)]
 struct RecordingErrorEvent {
@@ -210,6 +206,34 @@ where
 
 fn should_use_streaming_overlay(style: OverlayStyle, is_streaming: bool) -> bool {
     style == OverlayStyle::Live && is_streaming
+}
+
+/// Resolve the persisted insertion preference into the safe mode for this
+/// recording. Non-streaming models retain final-at-stop behavior. A request for
+/// whole-transcript AI cleanup cannot coexist with committed live insertion, so
+/// that session is downgraded to preview-only while cleanup remains available at
+/// stop.
+fn resolve_session_insertion_mode(
+    configured: InsertionMode,
+    experimental_enabled: bool,
+    post_process: bool,
+    model_supports_streaming: bool,
+) -> InsertionMode {
+    if !experimental_enabled || !model_supports_streaming {
+        return InsertionMode::AtStop;
+    }
+    if configured == InsertionMode::LiveCommittedExperimental && post_process {
+        return InsertionMode::PreviewOnly;
+    }
+    configured
+}
+
+fn insertion_mode_history_value(mode: InsertionMode) -> &'static str {
+    match mode {
+        InsertionMode::AtStop => "at_stop",
+        InsertionMode::PreviewOnly => "preview_only",
+        InsertionMode::LiveCommittedExperimental => "live_committed_experimental",
+    }
 }
 
 fn resolve_stream_or_batch<E, F>(
@@ -697,6 +721,19 @@ impl ShortcutAction for TranscribeAction {
         } else {
             VadPolicy::Offline
         };
+        let insertion_mode = resolve_session_insertion_mode(
+            settings.insertion_mode,
+            settings.experimental_enabled,
+            self.post_process,
+            model_supports_streaming,
+        );
+        if settings.insertion_mode == InsertionMode::LiveCommittedExperimental && self.post_process
+        {
+            warn!(
+                "Live committed insertion is incompatible with whole-transcript AI cleanup; using preview-only insertion for this session"
+            );
+        }
+        tm.begin_insertion_session(insertion_mode);
         if model_supports_streaming {
             tm.start_stream();
         }
@@ -843,7 +880,9 @@ impl ShortcutAction for TranscribeAction {
         // the larger panel, but it still switches from listening to a working
         // spinner while the stream finalizes. Non-streaming paths use the
         // compact transcribing pill (None no-ops in show_*).
-        let style = get_settings(app).overlay_style;
+        let stop_settings = get_settings(app);
+        let style = stop_settings.overlay_style;
+        let session_insertion_mode = tm.current_insertion_mode();
         // Capture this before finalizing the stream so every later working state
         // targets the same overlay that was shown for this transcription.
         let use_streaming_overlay = should_use_streaming_overlay(style, tm.is_streaming());
@@ -1026,7 +1065,10 @@ impl ShortcutAction for TranscribeAction {
                                     history_model_id,
                                     history_engine_type,
                                     history_language.clone(),
-                                    Some(HISTORY_INSERTION_MODE_AT_STOP.to_string()),
+                                    Some(
+                                        insertion_mode_history_value(session_insertion_mode)
+                                            .to_string(),
+                                    ),
                                     history_backend.clone(),
                                     history_device.clone(),
                                     history_saved_accelerator,
@@ -1117,7 +1159,10 @@ impl ShortcutAction for TranscribeAction {
                                     selected_history_model_id,
                                     history_engine_type,
                                     history_language,
-                                    Some(HISTORY_INSERTION_MODE_AT_STOP.to_string()),
+                                    Some(
+                                        insertion_mode_history_value(session_insertion_mode)
+                                            .to_string(),
+                                    ),
                                     history_backend,
                                     history_device,
                                     history_saved_accelerator,
@@ -1221,12 +1266,13 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 mod tests {
     use super::{
         apply_cleanup_fail_open, build_legacy_prompt, build_system_prompt,
-        complete_unless_cancelled, is_blank_transcription, normalize_cleanup_output,
-        parse_structured_cleanup_output, resolve_history_cleanup_mode,
-        resolve_history_compute_plan, resolve_stream_or_batch, should_use_streaming_overlay,
-        strip_think_block, CLEANUP_MAX_OUTPUT_CHARS, CLEANUP_OUTPUT_CONTRACT,
+        complete_unless_cancelled, insertion_mode_history_value, is_blank_transcription,
+        normalize_cleanup_output, parse_structured_cleanup_output, resolve_history_cleanup_mode,
+        resolve_history_compute_plan, resolve_session_insertion_mode, resolve_stream_or_batch,
+        should_use_streaming_overlay, strip_think_block, CLEANUP_MAX_OUTPUT_CHARS,
+        CLEANUP_OUTPUT_CONTRACT,
     };
-    use crate::settings::{AppSettings, OverlayStyle};
+    use crate::settings::{AppSettings, InsertionMode, OverlayStyle};
     use std::cell::Cell;
     use std::future;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1451,6 +1497,76 @@ mod tests {
         assert!(!should_use_streaming_overlay(OverlayStyle::Live, false));
         assert!(!should_use_streaming_overlay(OverlayStyle::Minimal, true));
         assert!(!should_use_streaming_overlay(OverlayStyle::None, true));
+    }
+
+    #[test]
+    fn insertion_mode_defaults_and_history_values_are_stable() {
+        assert_eq!(InsertionMode::default(), InsertionMode::AtStop);
+        assert_eq!(
+            insertion_mode_history_value(InsertionMode::AtStop),
+            "at_stop"
+        );
+        assert_eq!(
+            insertion_mode_history_value(InsertionMode::PreviewOnly),
+            "preview_only"
+        );
+        assert_eq!(
+            insertion_mode_history_value(InsertionMode::LiveCommittedExperimental),
+            "live_committed_experimental"
+        );
+    }
+
+    #[test]
+    fn live_committed_mode_downgrades_to_preview_for_whole_transcript_cleanup() {
+        assert_eq!(
+            resolve_session_insertion_mode(
+                InsertionMode::LiveCommittedExperimental,
+                true,
+                true,
+                true
+            ),
+            InsertionMode::PreviewOnly
+        );
+        assert_eq!(
+            resolve_session_insertion_mode(
+                InsertionMode::LiveCommittedExperimental,
+                true,
+                false,
+                true
+            ),
+            InsertionMode::LiveCommittedExperimental
+        );
+    }
+
+    #[test]
+    fn insertion_modes_require_the_experimental_master_switch() {
+        assert_eq!(
+            resolve_session_insertion_mode(
+                InsertionMode::LiveCommittedExperimental,
+                false,
+                false,
+                true
+            ),
+            InsertionMode::AtStop
+        );
+        assert_eq!(
+            resolve_session_insertion_mode(InsertionMode::PreviewOnly, false, false, true),
+            InsertionMode::AtStop
+        );
+    }
+
+    #[test]
+    fn insertion_modes_fall_back_to_at_stop_without_streaming_support() {
+        for mode in [
+            InsertionMode::AtStop,
+            InsertionMode::PreviewOnly,
+            InsertionMode::LiveCommittedExperimental,
+        ] {
+            assert_eq!(
+                resolve_session_insertion_mode(mode, true, false, false),
+                InsertionMode::AtStop
+            );
+        }
     }
 
     #[test]

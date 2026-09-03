@@ -1,6 +1,6 @@
 use crate::actions::ACTION_MAP;
 use crate::managers::audio::AudioRecordingManager;
-use crate::settings::ShortcutActivation;
+use crate::settings::{InsertionMode, ShortcutActivation};
 use log::{debug, error, warn};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
@@ -10,21 +10,6 @@ use tauri::{AppHandle, Manager};
 
 const DEBOUNCE: Duration = Duration::from_millis(30);
 const RELEASE_GRACE: Duration = Duration::from_millis(50);
-
-/// When text is allowed to leave Handy during a streaming session.
-///
-/// `AtStop` remains the safe default. `PreviewOnly` exposes committed/tentative
-/// text only in Handy's overlay. `LiveCommittedExperimental` is deliberately an
-/// explicit opt-in and may insert committed deltas only through
-/// [`LiveInsertionLedger`].
-#[allow(dead_code)] // activated by the later steward-owned settings/action slice
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum InsertionMode {
-    #[default]
-    AtStop,
-    PreviewOnly,
-    LiveCommittedExperimental,
-}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

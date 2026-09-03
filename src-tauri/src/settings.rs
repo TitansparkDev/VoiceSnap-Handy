@@ -136,6 +136,18 @@ pub enum OverlayStyle {
     Live,
 }
 
+/// Controls when transcription text may leave Handy during a recording session.
+/// `AtStop` is the stable default. The live committed mode is intentionally an
+/// explicit experimental opt-in because already-inserted text is append-only.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InsertionMode {
+    #[default]
+    AtStop,
+    PreviewOnly,
+    LiveCommittedExperimental,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelUnloadTimeout {
@@ -531,6 +543,10 @@ pub struct AppSettings {
     /// `overlay_position` (position `none` → style `None`).
     #[serde(default = "default_overlay_style")]
     pub overlay_style: OverlayStyle,
+    /// Stable default is final insertion at stop. Preview-only and committed-live
+    /// modes are explicit opt-ins exposed under Experimental settings.
+    #[serde(default)]
+    pub insertion_mode: InsertionMode,
 }
 
 fn default_model() -> String {
@@ -1003,6 +1019,7 @@ pub fn get_default_settings() -> AppSettings {
         vad_enabled: default_vad_enabled(),
         vad_backend: VadBackend::default(),
         overlay_style: default_overlay_style(),
+        insertion_mode: InsertionMode::default(),
     }
 }
 
@@ -1292,8 +1309,15 @@ mod tests {
         assert_eq!(settings.hold_threshold_ms, default_hold_threshold_ms());
         assert!(!settings.audio_feedback);
         assert!(settings.filler_word_removal_enabled);
+        assert_eq!(settings.insertion_mode, InsertionMode::AtStop);
         // Bindings default to empty; the load path merges the real defaults in.
         assert!(settings.bindings.is_empty());
+    }
+
+    #[test]
+    fn default_store_persists_at_stop_insertion_mode() {
+        let settings = default_settings_json();
+        assert_eq!(settings["insertion_mode"], serde_json::json!("at_stop"));
     }
 
     /// Frozen snapshot of a real v0.9.0-era settings store, as written to
@@ -1415,6 +1439,7 @@ mod tests {
         assert_eq!(settings.selected_microphone_id, None);
         assert_eq!(settings.clamshell_microphone_id, None);
         assert!(!settings.pause_media_while_recording);
+        assert_eq!(settings.insertion_mode, InsertionMode::AtStop);
 
         // The 0.1 integer device index is cleared once for transcribe.cpp 0.2.
         // Without an exact device, the retired generic GPU choice becomes Auto.

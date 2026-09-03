@@ -7,6 +7,7 @@ import type {
   TranscribeAcceleratorSetting,
   OrtAcceleratorSetting,
   ShortcutActivation,
+  InsertionMode,
   VadBackend,
 } from "@/bindings";
 import { commands } from "@/bindings";
@@ -156,6 +157,8 @@ const settingUpdaters: {
   auto_submit: (value) => commands.changeAutoSubmitSetting(value as boolean),
   auto_submit_key: (value) =>
     commands.changeAutoSubmitKeySetting(value as string),
+  insertion_mode: (value) =>
+    commands.changeInsertionModeSetting(value as InsertionMode),
   history_limit: (value) => commands.updateHistoryLimit(value as number),
   post_process_enabled: (value) =>
     commands.changePostProcessEnabledSetting(value as boolean),

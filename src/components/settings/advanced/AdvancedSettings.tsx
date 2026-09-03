@@ -23,6 +23,7 @@ import { AccelerationSelector } from "../AccelerationSelector";
 import { LazyStreamClose } from "../LazyStreamClose";
 import { FillerWordRemoval } from "../FillerWordRemoval";
 import { VadBackendSelector } from "../VadBackendSelector";
+import { InsertionModeSetting } from "../InsertionModeSetting";
 
 export const AdvancedSettings: React.FC = () => {
   const { t } = useTranslation();
@@ -64,6 +65,7 @@ export const AdvancedSettings: React.FC = () => {
 
       {experimentalEnabled && (
         <SettingsGroup title={t("settings.advanced.groups.experimental")}>
+          <InsertionModeSetting descriptionMode="tooltip" grouped={true} />
           <PostProcessingToggle descriptionMode="tooltip" grouped={true} />
           <KeyboardImplementationSelector
             descriptionMode="tooltip"

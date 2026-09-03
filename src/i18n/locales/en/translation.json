@@ -274,6 +274,16 @@
         "label": "Keep Mic Open Between Transcriptions",
         "description": "Keeps the microphone stream open for 30 seconds after recording stops, reducing latency for back-to-back transcriptions. May degrade Bluetooth audio quality while active."
       },
+      "insertionMode": {
+        "title": "Text Insertion",
+        "description": "Choose when transcription text is inserted. At stop keeps the stable final-paste behavior; Preview only shows live text without inserting it; Live committed inserts only committed streaming text as you speak.",
+        "options": {
+          "atStop": "At stop (default)",
+          "previewOnly": "Preview only",
+          "liveCommittedExperimental": "Live committed (experimental)"
+        },
+        "liveWarning": "Experimental: committed text is inserted into the target application while you speak and cannot be safely revised after insertion. Focus or target changes stop live insertion. Whole-transcript AI post-processing is not applied to live committed sessions; the post-processing shortcut uses preview-only insertion for that session."
+      },
       "acceleration": {
         "transcribe": {
           "title": "transcribe.cpp Acceleration",

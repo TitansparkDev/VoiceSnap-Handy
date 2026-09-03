@@ -5,11 +5,11 @@ use crate::audio_toolkit::{
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::model::{EngineType, ModelManager};
 use crate::settings::{
-    get_settings, AppSettings, ModelUnloadTimeout, OrtAcceleratorSetting,
+    get_settings, AppSettings, InsertionMode, ModelUnloadTimeout, OrtAcceleratorSetting,
     TranscribeAcceleratorSetting,
 };
 use crate::transcription_coordinator::{
-    InsertionMode, LiveInsertionAttempt, LiveInsertionLedger, LiveInsertionOutcome,
+    LiveInsertionAttempt, LiveInsertionLedger, LiveInsertionOutcome,
 };
 use anyhow::Result;
 use log::{debug, error, info, warn};
@@ -942,6 +942,18 @@ impl TranscriptionManager {
             .then(crate::paste_tx::capture_target_identity)
             .flatten();
         *self.live_insertion.lock().unwrap() = Some(LiveInsertionLedger::new(mode, target));
+    }
+
+    /// Mode fixed at session start. Callers use this for history/final-output
+    /// handling so changing settings while recording cannot retroactively change
+    /// the safety contract of the active session.
+    pub(crate) fn current_insertion_mode(&self) -> InsertionMode {
+        self.live_insertion
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(LiveInsertionLedger::mode)
+            .unwrap_or_default()
     }
 
     /// Feed only the committed part of a stream snapshot into the live ledger.
