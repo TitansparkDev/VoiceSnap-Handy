@@ -126,7 +126,7 @@ export function summarizeSamples(samples) {
   };
 }
 
-async function evaluate(options, fixture, model) {
+export async function evaluate(options, fixture, model, processRunner = runProcess) {
   const identity = fixtureIdentity(fixture);
   const args = [
     "--transcribe-file", fixture.path,
@@ -137,7 +137,7 @@ async function evaluate(options, fixture, model) {
     "--json",
   ];
   if (options.deviceIndex !== null) args.push("--device-index", String(options.deviceIndex));
-  const result = await runProcess(options.binary, args);
+  const result = await processRunner(options.binary, args);
   if (result.code !== 0) {
     return { ...identity, model, success: false, error: "benchmark_process_failed" };
   }
@@ -160,6 +160,16 @@ async function evaluate(options, fixture, model) {
     bound_backend: parsed.bound_backend ?? null,
     ...summary,
   };
+}
+
+export async function evaluateBenchmarkMatrix(options, processRunner = runProcess) {
+  const results = [];
+  for (const fixture of options.fixtures) {
+    for (const model of options.models) {
+      results.push(await evaluate(options, fixture, model, processRunner));
+    }
+  }
+  return results;
 }
 
 function printResults(results) {
@@ -191,11 +201,8 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     fixture_set: "fixed-wav-sha256",
     runs_per_fixture: options.runs,
     frame_ms: options.frameMs,
-    results: [],
+    results: await evaluateBenchmarkMatrix(options),
   };
-  for (const fixture of options.fixtures) {
-    for (const model of options.models) results.results.push(await evaluate(options, fixture, model));
-  }
   printResults(results);
   if (options.jsonPath) await writeFile(options.jsonPath, `${JSON.stringify(results, null, 2)}\n`, "utf8");
   return results.results.every((result) => result.success) ? 0 : 1;

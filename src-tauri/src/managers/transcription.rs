@@ -41,6 +41,7 @@ use transcribe_rs::{
 
 const STREAM_PERF_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const STREAM_FINALIZE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+const STREAM_WORKER_QUIESCE_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
@@ -544,6 +545,17 @@ impl TranscriptionManager {
         model_id: &str,
         device_index: Option<usize>,
     ) -> Result<()> {
+        // A model transition must not race an old streaming worker that still
+        // owns the engine lease. Cancel any open route and wait boundedly for
+        // the worker guard to return/drop its engine before replacing the model.
+        if !self.quiesce_stream_worker(STREAM_WORKER_QUIESCE_TIMEOUT) {
+            return Err(anyhow::anyhow!(
+                "Timed out waiting {:?} for the previous streaming worker before loading model '{}'",
+                STREAM_WORKER_QUIESCE_TIMEOUT,
+                model_id
+            ));
+        }
+
         apply_accelerator_settings(&self.app_handle);
 
         let load_start = std::time::Instant::now();
@@ -1040,8 +1052,17 @@ impl TranscriptionManager {
     /// `None` so the caller falls back to batch transcription. Frames sent
     /// before the stream begins queue on the channel and are not lost.
     pub fn start_stream(&self) {
-        if self.router.is_open() || self.active_stream_worker.load(Ordering::Acquire) != 0 {
-            warn!("start_stream called while a stream worker is already active");
+        if self.router.is_open() {
+            warn!("start_stream called while a stream route is already open");
+            return;
+        }
+        // Finalize/cancel closes the route before the detached worker returns
+        // its engine lease. Give that bounded cleanup a chance to finish so an
+        // immediately following dictation is usable instead of being dropped.
+        if self.active_stream_worker.load(Ordering::Acquire) != 0
+            && !self.wait_for_stream_worker_release(STREAM_WORKER_QUIESCE_TIMEOUT)
+        {
+            warn!("start_stream timed out waiting for the previous streaming worker to release");
             return;
         }
         let worker_id = self.next_stream_worker_id.fetch_add(1, Ordering::Relaxed);
@@ -1417,19 +1438,22 @@ impl TranscriptionManager {
     }
 
     fn wait_for_stream_worker_release(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let released = !self.router.is_open()
-                && self.active_stream_worker.load(Ordering::Acquire) == 0
-                && self.active_engine_lease.load(Ordering::Acquire) == 0;
-            if released {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
+        wait_for_stream_worker_release_state(
+            self.router.as_ref(),
+            self.active_stream_worker.as_ref(),
+            self.active_engine_lease.as_ref(),
+            timeout,
+        )
+    }
+
+    fn quiesce_stream_worker(&self, timeout: Duration) -> bool {
+        quiesce_stream_state(
+            self.router.as_ref(),
+            self.active_stream_worker.as_ref(),
+            self.active_engine_lease.as_ref(),
+            self.stream_active.as_ref(),
+            timeout,
+        )
     }
 
     /// Feed a fixed 16 kHz WAV buffer through the same streaming route used by
@@ -1488,11 +1512,13 @@ impl TranscriptionManager {
 
     /// Abandon any active stream without producing text (e.g. on cancel).
     pub fn cancel_stream(&self) {
-        if let Some(tx) = self.router.take() {
-            let _ = tx.send(StreamCmd::Cancel);
+        if !self.quiesce_stream_worker(STREAM_WORKER_QUIESCE_TIMEOUT) {
+            warn!(
+                "Timed out waiting {:?} for cancelled streaming worker to release",
+                STREAM_WORKER_QUIESCE_TIMEOUT
+            );
         }
         self.cancel_live_insertion();
-        self.stream_active.store(false, Ordering::Release);
     }
 
     /// Emit a working-phase event to the streaming overlay (spinner + label).
@@ -2263,6 +2289,45 @@ fn drain_until_finalize(rx: mpsc::Receiver<StreamCmd>) {
     }
 }
 
+fn request_stream_cancel(router: &StreamRouter, stream_active: &AtomicBool) {
+    if let Some(tx) = router.take() {
+        let _ = tx.send(StreamCmd::Cancel);
+    }
+    stream_active.store(false, Ordering::Release);
+}
+
+fn wait_for_stream_worker_release_state(
+    router: &StreamRouter,
+    active_stream_worker: &AtomicU64,
+    active_engine_lease: &AtomicU64,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let released = !router.is_open()
+            && active_stream_worker.load(Ordering::Acquire) == 0
+            && active_engine_lease.load(Ordering::Acquire) == 0;
+        if released {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn quiesce_stream_state(
+    router: &StreamRouter,
+    active_stream_worker: &AtomicU64,
+    active_engine_lease: &AtomicU64,
+    stream_active: &AtomicBool,
+    timeout: Duration,
+) -> bool {
+    request_stream_cancel(router, stream_active);
+    wait_for_stream_worker_release_state(router, active_stream_worker, active_engine_lease, timeout)
+}
+
 /// Initialize the transcribe-cpp native backend once at startup: route native +
 /// ggml diagnostics into the `log` facade and register compute backend modules.
 /// In a static build (macOS Metal) `init_backends_default` is a harmless no-op;
@@ -2682,6 +2747,19 @@ mod tests {
     }
 
     #[test]
+    fn stream_text_event_serializes_committed_and_tentative_as_distinct_fields() {
+        let event = StreamTextEvent {
+            committed: "stable prefix".to_string(),
+            tentative: " volatile suffix".to_string(),
+        };
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(value["committed"], "stable prefix");
+        assert_eq!(value["tentative"], " volatile suffix");
+        assert_ne!(value["committed"], value["tentative"]);
+    }
+
+    #[test]
     fn stream_worker_guard_releases_cancelled_worker_state() {
         let active_stream_worker = Arc::new(AtomicU64::new(7));
         let active_engine_lease = Arc::new(AtomicU64::new(7));
@@ -2721,6 +2799,102 @@ mod tests {
         {
             let _current_guard = StreamWorkerGuard {
                 worker_id: 2,
+                active_stream_worker: Arc::clone(&active_stream_worker),
+                active_engine_lease: Arc::clone(&active_engine_lease),
+                stream_active: Arc::clone(&stream_active),
+            };
+        }
+        assert_eq!(active_stream_worker.load(Ordering::Acquire), 0);
+        assert_eq!(active_engine_lease.load(Ordering::Acquire), 0);
+        assert!(!stream_active.load(Ordering::Acquire));
+    }
+
+    fn spawn_test_stream_worker(
+        router: &StreamRouter,
+        worker_id: u64,
+        active_stream_worker: Arc<AtomicU64>,
+        active_engine_lease: Arc<AtomicU64>,
+        stream_active: Arc<AtomicBool>,
+    ) -> thread::JoinHandle<()> {
+        let rx = router.open();
+        active_stream_worker.store(worker_id, Ordering::Release);
+        active_engine_lease.store(worker_id, Ordering::Release);
+        stream_active.store(true, Ordering::Release);
+        thread::spawn(move || {
+            let _guard = StreamWorkerGuard {
+                worker_id,
+                active_stream_worker,
+                active_engine_lease,
+                stream_active,
+            };
+            assert!(matches!(rx.recv(), Ok(StreamCmd::Cancel)));
+        })
+    }
+
+    #[test]
+    fn cancellation_quiesces_worker_and_allows_next_session_reservation() {
+        let router = StreamRouter::new();
+        let active_stream_worker = Arc::new(AtomicU64::new(0));
+        let active_engine_lease = Arc::new(AtomicU64::new(0));
+        let stream_active = Arc::new(AtomicBool::new(false));
+        let worker = spawn_test_stream_worker(
+            &router,
+            41,
+            Arc::clone(&active_stream_worker),
+            Arc::clone(&active_engine_lease),
+            Arc::clone(&stream_active),
+        );
+
+        assert!(quiesce_stream_state(
+            &router,
+            active_stream_worker.as_ref(),
+            active_engine_lease.as_ref(),
+            stream_active.as_ref(),
+            Duration::from_secs(1),
+        ));
+        worker.join().unwrap();
+        assert!(!router.is_open());
+        assert!(!stream_active.load(Ordering::Acquire));
+        assert_eq!(active_engine_lease.load(Ordering::Acquire), 0);
+        assert!(active_stream_worker
+            .compare_exchange(0, 42, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok());
+    }
+
+    #[test]
+    fn model_switch_quiesce_releases_old_lease_before_new_worker_generation() {
+        let router = StreamRouter::new();
+        let active_stream_worker = Arc::new(AtomicU64::new(0));
+        let active_engine_lease = Arc::new(AtomicU64::new(0));
+        let stream_active = Arc::new(AtomicBool::new(false));
+        let worker = spawn_test_stream_worker(
+            &router,
+            7,
+            Arc::clone(&active_stream_worker),
+            Arc::clone(&active_engine_lease),
+            Arc::clone(&stream_active),
+        );
+
+        assert!(quiesce_stream_state(
+            &router,
+            active_stream_worker.as_ref(),
+            active_engine_lease.as_ref(),
+            stream_active.as_ref(),
+            Duration::from_secs(1),
+        ));
+        worker.join().unwrap();
+        assert_eq!(active_stream_worker.load(Ordering::Acquire), 0);
+        assert_eq!(active_engine_lease.load(Ordering::Acquire), 0);
+
+        let new_worker_id = 8;
+        assert!(active_stream_worker
+            .compare_exchange(0, new_worker_id, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok());
+        active_engine_lease.store(new_worker_id, Ordering::Release);
+        stream_active.store(true, Ordering::Release);
+        {
+            let _new_guard = StreamWorkerGuard {
+                worker_id: new_worker_id,
                 active_stream_worker: Arc::clone(&active_stream_worker),
                 active_engine_lease: Arc::clone(&active_engine_lease),
                 stream_active: Arc::clone(&stream_active),
