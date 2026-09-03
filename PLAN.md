@@ -269,7 +269,7 @@ Deliverables:
 - Use a small Q4 model first. Evaluate Qwen3-1.7B, Qwen3-4B, and the VoiceTypr
   `s1-mini` candidate; do not select by model name alone. — done 2026-09-03
 - Keep model loading separate from the ASR stream worker.
-- Disable reasoning/thinking and constrain output length.
+- Disable reasoning/thinking and constrain output length. — done 2026-09-03
 - Define a strict cleanup contract: output text only, no explanation, no quotes,
   no markdown wrapper, no invented content.
 - Add cleanup modes:
@@ -303,7 +303,7 @@ Deliverables:
   contract.
 - Add explicit stream performance events to Wave 0's timing schema. — done 2026-09-03
 - Add a benchmark command or test harness using fixed WAV fixtures. — done 2026-09-03
-- Add equivalent live-microphone benchmark sessions.
+- Add equivalent live-microphone benchmark sessions. — done 2026-09-03
 - Compare:
   - Parakeet Unified;
   - Nemotron Streaming;
@@ -313,8 +313,8 @@ Deliverables:
 - Measure first partial, committed text cadence, finalization tail, and total time
   on short/medium/long fixed-WAV utterances. — done 2026-09-03
 - Compare transcription quality on short/medium/long utterances.
-- Make the overlay's committed/tentative distinction visually obvious.
-- Keep the overlay from stealing focus from the target application.
+- Make the overlay's committed/tentative distinction visually obvious. — done 2026-09-03
+- Keep the overlay from stealing focus from the target application. — done 2026-09-03
 - Ensure a non-streaming model cleanly falls back to final batch transcription. — done 2026-09-03
 
 Acceptance:
@@ -622,19 +622,19 @@ At minimum, before enabling any new default:
 
 No release candidate is complete until:
 
-- `bun run lint` passes;
-- `bun run build` passes;
-- Rust formatting and clippy pass;
-- focused unit tests pass;
-- existing Handy tests pass;
-- model catalog/license/attribution files are reviewed;
+- `bun run lint` passes; — done 2026-09-03
+- `bun run build` passes; — done 2026-09-03
+- Rust formatting and clippy pass; — done 2026-09-03
+- focused unit tests pass; — done 2026-09-03
+- existing Handy tests pass; — done 2026-09-03
+- model catalog/license/attribution files are reviewed; — done 2026-09-03
 - visible Diagnostics shows real stage timings in a packaged build;
 - normal final paste is unchanged or demonstrably better;
-- live insertion remains opt-in;
+- live insertion remains opt-in; — done 2026-09-03
 - no-speech gate is off or shadow-only unless its false-negative acceptance
   tests and manual quiet-speech smoke are green;
-- local cleanup has a working offline fallback;
-- no raw speech content appears in logs or exported diagnostics.
+- local cleanup has a working offline fallback; — done 2026-09-03
+- no raw speech content appears in logs or exported diagnostics. — done 2026-09-03
 
 ## Explicitly deferred
 
