@@ -672,6 +672,8 @@
     },
     "noInputDeviceTitle": "No Microphone Found",
     "noInputDevice": "No audio input device was detected. Please connect a microphone or headset and try again.",
+    "selectedMicrophoneUnavailableTitle": "Selected Microphone Unavailable",
+    "selectedMicrophoneUnavailable": "Handy could not open the selected microphone ‘{{microphone}}’. Reconnect it or choose another microphone in Settings. Your saved selection was not changed.",
     "recordingFailed": "Failed to start recording: {{error}}",
     "modelLoadFailed": "Failed to load model: {{model}}",
     "modelLoadFailedUnknown": "unknown model",

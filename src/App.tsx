@@ -110,6 +110,12 @@ function App() {
           defaultValue: t("errors.micPermissionDenied.generic"),
         });
         toast.error(t("errors.micPermissionDeniedTitle"), { description });
+      } else if (error_type === "selected_microphone_unavailable") {
+        toast.error(t("errors.selectedMicrophoneUnavailableTitle"), {
+          description: detail
+            ? t("errors.selectedMicrophoneUnavailable", { microphone: detail })
+            : t("errors.noInputDevice"),
+        });
       } else if (error_type === "no_input_device") {
         toast.error(t("errors.noInputDeviceTitle"), {
           description: t("errors.noInputDevice"),

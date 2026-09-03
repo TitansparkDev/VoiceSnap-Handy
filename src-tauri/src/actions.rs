@@ -32,6 +32,34 @@ struct RecordingErrorEvent {
     detail: Option<String>,
 }
 
+fn recording_error_event(error: &str, selected_microphone: Option<&str>) -> RecordingErrorEvent {
+    if is_microphone_access_denied(error) {
+        return RecordingErrorEvent {
+            error_type: "microphone_permission_denied".to_string(),
+            detail: Some(error.to_string()),
+        };
+    }
+
+    if is_no_input_device_error(error) {
+        if let Some(selected_microphone) = selected_microphone {
+            return RecordingErrorEvent {
+                error_type: "selected_microphone_unavailable".to_string(),
+                detail: Some(selected_microphone.to_string()),
+            };
+        }
+
+        return RecordingErrorEvent {
+            error_type: "no_input_device".to_string(),
+            detail: Some(error.to_string()),
+        };
+    }
+
+    RecordingErrorEvent {
+        error_type: "unknown".to_string(),
+        detail: Some(error.to_string()),
+    }
+}
+
 /// Drop guard that notifies the [`TranscriptionCoordinator`] when the
 /// transcription pipeline finishes — whether it completes normally or panics.
 struct FinishGuard(AppHandle);
@@ -665,19 +693,9 @@ impl ShortcutAction for TranscribeAction {
             utils::hide_recording_overlay(app);
             set_tray_state(app, TrayIconState::Idle);
             if let Some(err) = recording_error {
-                let error_type = if is_microphone_access_denied(&err) {
-                    "microphone_permission_denied"
-                } else if is_no_input_device_error(&err) {
-                    "no_input_device"
-                } else {
-                    "unknown"
-                };
                 let _ = app.emit(
                     "recording-error",
-                    RecordingErrorEvent {
-                        error_type: error_type.to_string(),
-                        detail: Some(err),
-                    },
+                    recording_error_event(&err, settings.selected_microphone.as_deref()),
                 );
             }
         }
@@ -811,10 +829,9 @@ impl ShortcutAction for TranscribeAction {
                         let selected_model = get_settings(&ah).selected_model;
                         (!selected_model.is_empty()).then_some(selected_model)
                     };
-                    let history_duration_ms = i64::try_from(
-                        sample_count.saturating_mul(1000) / 16_000,
-                    )
-                    .unwrap_or(i64::MAX);
+                    let history_duration_ms =
+                        i64::try_from(sample_count.saturating_mul(1000) / 16_000)
+                            .unwrap_or(i64::MAX);
 
                     if rm.was_cancelled_since(cancel_generation) {
                         debug!("Transcription operation cancelled before output handling");
@@ -1023,8 +1040,8 @@ mod tests {
     use super::{
         build_legacy_prompt, build_system_prompt, complete_unless_cancelled,
         is_blank_transcription, normalize_cleanup_output, parse_structured_cleanup_output,
-        resolve_stream_or_batch, should_use_streaming_overlay, strip_think_block,
-        CLEANUP_OUTPUT_CONTRACT,
+        recording_error_event, resolve_stream_or_batch, should_use_streaming_overlay,
+        strip_think_block, CLEANUP_OUTPUT_CONTRACT,
     };
     use crate::settings::OverlayStyle;
     use std::cell::Cell;
@@ -1033,6 +1050,36 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn selected_microphone_failure_is_distinct_and_names_the_preserved_preference() {
+        let event = recording_error_event(
+            "No input device found: requested microphone 'USB Mic' is unavailable",
+            Some("USB Mic"),
+        );
+
+        assert_eq!(event.error_type, "selected_microphone_unavailable");
+        assert_eq!(event.detail.as_deref(), Some("USB Mic"));
+    }
+
+    #[test]
+    fn no_input_device_without_saved_selection_keeps_generic_recovery_path() {
+        let event = recording_error_event("No input device found", None);
+
+        assert_eq!(event.error_type, "no_input_device");
+        assert_eq!(event.detail.as_deref(), Some("No input device found"));
+    }
+
+    #[test]
+    fn permission_denial_takes_priority_over_saved_microphone_recovery() {
+        let event = recording_error_event("Microphone permission denied", Some("USB Mic"));
+
+        assert_eq!(event.error_type, "microphone_permission_denied");
+        assert_eq!(
+            event.detail.as_deref(),
+            Some("Microphone permission denied")
+        );
+    }
 
     #[test]
     fn blank_transcription_is_detected() {
