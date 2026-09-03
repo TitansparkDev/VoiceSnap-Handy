@@ -6,7 +6,7 @@ Wave 2 uses the real headless transcription path to compare live-capable models 
 
 Build Handy first, then prepare fixed 16 kHz mono 16-bit PCM WAV files. Keep the same files for every candidate. The harness records each fixture's SHA-256 so results from different machines/runs can be checked against the same audio without exporting transcript content.
 
-A useful fixture set contains short (under 2 seconds), normal (5–15 seconds), and long (30–120 seconds) speech. The WAV files may live outside the repository; pass stable labels such as `short`, `normal`, and `long`.
+A useful fixture set contains short (under 2 seconds), medium (5–15 seconds), and long (30–120 seconds) speech. The WAV files may live outside the repository; pass stable labels such as `short`, `medium`, and `long`.
 
 ## One model directly
 
@@ -41,7 +41,7 @@ Use the aggregate harness to run identical fixed WAVs through the current Wave 2
 npm run bench:stream -- \
   --binary /path/to/handy \
   --fixture short=/bench/short.wav \
-  --fixture normal=/bench/normal.wav \
+  --fixture medium=/bench/medium.wav \
   --fixture long=/bench/long.wav \
   --wave2-models \
   --runs 3 \
@@ -67,8 +67,10 @@ The benchmark does not download models. Every requested model must already be in
 
 ```bash
 node --test scripts/stream-benchmark.test.mjs
-cargo test --manifest-path src-tauri/Cargo.toml stream_worker_guard_releases_cancelled_worker_state
+cargo test --manifest-path src-tauri/Cargo.toml cancellation_quiesces_worker_and_allows_next_session_reservation
+cargo test --manifest-path src-tauri/Cargo.toml model_switch_quiesce_releases_old_lease_before_new_worker_generation
 cargo test --manifest-path src-tauri/Cargo.toml stale_stream_worker_cannot_clear_new_model_switch_worker
+cargo test --manifest-path src-tauri/Cargo.toml stream_text_event_serializes_committed_and_tentative_as_distinct_fields
 cargo test --manifest-path src-tauri/Cargo.toml stream_perf_records_timing_only_and_committed_cadence
 ```
 
