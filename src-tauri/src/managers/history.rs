@@ -1007,8 +1007,13 @@ impl HistoryManager {
         Ok(())
     }
 
-    pub fn get_audio_file_path(&self, file_name: &str) -> PathBuf {
-        self.recordings_dir.join(file_name)
+    pub fn get_audio_file_path(&self, file_name: &str) -> Result<PathBuf> {
+        let path = Self::retained_audio_path(&self.recordings_dir, file_name)?;
+        if path.is_file() {
+            Ok(path)
+        } else {
+            Err(anyhow!("Recording audio is no longer retained"))
+        }
     }
 
     pub async fn get_entry_by_id(&self, id: i64) -> Result<Option<HistoryEntry>> {
