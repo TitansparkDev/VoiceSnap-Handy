@@ -691,6 +691,7 @@ mod tests {
             insertion_mode: None,
             backend: None,
             device: None,
+            recovery_reason: None,
             saved_accelerator: None,
             saved_gpu_device: None,
             recommended_backend: None,

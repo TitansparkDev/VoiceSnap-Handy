@@ -49,6 +49,7 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN recommended_device TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN cleanup_prompt_id TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN cleanup_model_id TEXT;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN recovery_reason TEXT;"),
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -100,6 +101,8 @@ pub struct HistoryEntry {
     pub backend: Option<String>,
     /// Actual runtime compute device used by the transcription engine.
     pub device: Option<String>,
+    /// Stable reason code when acceleration was downgraded for this session/run.
+    pub recovery_reason: Option<String>,
     /// Saved transcribe.cpp accelerator preference for this session.
     pub saved_accelerator: Option<String>,
     /// Stable saved GPU device identity when the preference selected one exactly.
@@ -276,6 +279,7 @@ impl HistoryManager {
             insertion_mode: row.get("insertion_mode")?,
             backend: row.get("backend")?,
             device: row.get("device")?,
+            recovery_reason: row.get("recovery_reason")?,
             saved_accelerator: row.get("saved_accelerator")?,
             saved_gpu_device: row.get("saved_gpu_device")?,
             recommended_backend: row.get("recommended_backend")?,
@@ -308,6 +312,7 @@ impl HistoryManager {
         insertion_mode: Option<String>,
         backend: Option<String>,
         device: Option<String>,
+        recovery_reason: Option<String>,
         saved_accelerator: Option<String>,
         saved_gpu_device: Option<String>,
         recommended_backend: Option<String>,
@@ -348,8 +353,9 @@ impl HistoryManager {
                 outcome,
                 transcription_total_ms,
                 cleanup_total_ms,
-                duration_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                duration_ms,
+                recovery_reason
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             params![
                 &file_name,
                 timestamp,
@@ -376,6 +382,7 @@ impl HistoryManager {
                 transcription_total_ms,
                 cleanup_total_ms,
                 duration_ms,
+                &recovery_reason,
             ],
         )?;
 
@@ -398,6 +405,7 @@ impl HistoryManager {
             insertion_mode,
             backend,
             device,
+            recovery_reason,
             saved_accelerator,
             saved_gpu_device,
             recommended_backend,
@@ -440,6 +448,7 @@ impl HistoryManager {
         language: Option<String>,
         backend: Option<String>,
         device: Option<String>,
+        recovery_reason: Option<String>,
         saved_accelerator: Option<String>,
         saved_gpu_device: Option<String>,
         recommended_backend: Option<String>,
@@ -468,8 +477,9 @@ impl HistoryManager {
                  cleanup_mode = ?13,
                  transcription_total_ms = ?14,
                  cleanup_total_ms = ?15,
+                 recovery_reason = ?16,
                  outcome = 'success'
-             WHERE id = ?16",
+             WHERE id = ?17",
             params![
                 transcription_text,
                 post_processed_text,
@@ -486,6 +496,7 @@ impl HistoryManager {
                 cleanup_mode,
                 transcription_total_ms,
                 cleanup_total_ms,
+                recovery_reason,
                 id
             ],
         )?;
@@ -496,7 +507,7 @@ impl HistoryManager {
 
         let entry = conn
             .query_row(
-                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms
+                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms, recovery_reason
                  FROM transcription_history WHERE id = ?1",
                 params![id],
                 Self::map_history_entry,
@@ -586,7 +597,7 @@ impl HistoryManager {
         }
 
         conn.query_row(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms, recovery_reason
              FROM transcription_history WHERE id = ?1",
             params![id],
             Self::map_history_entry,
@@ -868,7 +879,7 @@ impl HistoryManager {
         };
 
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms, recovery_reason
              FROM transcription_history
              WHERE (?1 IS NULL OR id < ?1)
                AND (
@@ -959,7 +970,8 @@ impl HistoryManager {
                 cleanup_mode,
                 outcome,
                 transcription_total_ms,
-                cleanup_total_ms
+                cleanup_total_ms,
+                recovery_reason
              FROM transcription_history
              ORDER BY timestamp DESC
              LIMIT 1",
@@ -1003,7 +1015,8 @@ impl HistoryManager {
                 cleanup_mode,
                 outcome,
                 transcription_total_ms,
-                cleanup_total_ms
+                cleanup_total_ms,
+                recovery_reason
              FROM transcription_history
              WHERE transcription_text != ''
              ORDER BY timestamp DESC
@@ -1079,7 +1092,8 @@ impl HistoryManager {
                 cleanup_mode,
                 outcome,
                 transcription_total_ms,
-                cleanup_total_ms
+                cleanup_total_ms,
+                recovery_reason
              FROM transcription_history
              WHERE id = ?1",
         )?;
@@ -1185,7 +1199,8 @@ mod tests {
                 cleanup_mode TEXT,
                 outcome TEXT,
                 transcription_total_ms INTEGER,
-                cleanup_total_ms INTEGER
+                cleanup_total_ms INTEGER,
+                recovery_reason TEXT
             );",
         )
         .expect("create transcription_history table");
@@ -1301,6 +1316,7 @@ mod tests {
         assert!(entry.insertion_mode.is_none());
         assert!(entry.backend.is_none());
         assert!(entry.device.is_none());
+        assert!(entry.recovery_reason.is_none());
         assert!(entry.saved_accelerator.is_none());
         assert!(entry.saved_gpu_device.is_none());
         assert!(entry.recommended_backend.is_none());
@@ -1366,8 +1382,8 @@ mod tests {
         let conn = setup_conn();
         insert_entry(&conn, 100, "compute-plan-tagged recording", None);
         conn.execute(
-            "UPDATE transcription_history SET saved_accelerator = ?1, saved_gpu_device = ?2, recommended_backend = ?3, recommended_device = ?4, backend = ?5, device = ?6 WHERE timestamp = ?7",
-            params!["gpu", "stable-device-id", "auto", "Discrete GPU", "vulkan", "gpu-0", 100_i64],
+            "UPDATE transcription_history SET saved_accelerator = ?1, saved_gpu_device = ?2, recommended_backend = ?3, recommended_device = ?4, backend = ?5, device = ?6, recovery_reason = ?7 WHERE timestamp = ?8",
+            params!["gpu", "stable-device-id", "auto", "Discrete GPU", "vulkan", "gpu-0", "runtime_health_failure", 100_i64],
         )
         .expect("store compute-plan metadata");
 
@@ -1380,6 +1396,10 @@ mod tests {
         assert_eq!(entry.recommended_device.as_deref(), Some("Discrete GPU"));
         assert_eq!(entry.backend.as_deref(), Some("vulkan"));
         assert_eq!(entry.device.as_deref(), Some("gpu-0"));
+        assert_eq!(
+            entry.recovery_reason.as_deref(),
+            Some("runtime_health_failure")
+        );
     }
 
     #[test]

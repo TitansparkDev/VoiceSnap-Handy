@@ -309,6 +309,28 @@ pub struct TranscribeSelectionPlanMetadata {
     pub recommended_device: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscribeRuntimeMetadata {
+    /// Backend the loaded transcribe.cpp model was actually bound to.
+    pub backend: String,
+    /// Readable device the loaded transcribe.cpp model actually used.
+    pub device: Option<String>,
+    /// Stable recovery cause when acceleration was downgraded for this run.
+    pub recovery_reason: Option<String>,
+}
+
+fn transcribe_runtime_metadata(
+    backend: String,
+    device: Option<String>,
+    recovery_reason: Option<String>,
+) -> TranscribeRuntimeMetadata {
+    TranscribeRuntimeMetadata {
+        backend,
+        device,
+        recovery_reason,
+    }
+}
+
 enum LoadedEngine {
     /// Whisper-family models (whisper, breeze-asr, custom .bin/.gguf) via
     /// transcribe-cpp. Holds the live `Session`, which keeps its `Model` alive
@@ -411,8 +433,13 @@ pub struct TranscriptionManager {
     /// while the worker holds it.
     active_engine_lease: Arc<AtomicU64>,
     /// Plan-time accelerator metadata for the most recent transcribe.cpp load.
-    /// Kept separate from `current_backend`/`current_device`, which are runtime truth.
+    /// Kept separate from runtime truth so persisted intent and recommendation do
+    /// not get rewritten when the loaded backend falls back.
     selection_plan: Arc<Mutex<Option<TranscribeSelectionPlanMetadata>>>,
+    /// Actual backend/device bound by the most recent transcribe.cpp load. This
+    /// survives an unhealthy engine being dropped so failed sessions still retain
+    /// truthful runtime diagnostics.
+    runtime_metadata: Arc<Mutex<Option<TranscribeRuntimeMetadata>>>,
     /// Process-local health latch. Once an accelerated transcribe.cpp session
     /// fails during inference, later persisted loads use CPU for this app run
     /// without rewriting the user's saved accelerator preference.
@@ -446,6 +473,7 @@ impl TranscriptionManager {
             active_stream_worker: Arc::new(AtomicU64::new(0)),
             active_engine_lease: Arc::new(AtomicU64::new(0)),
             selection_plan: Arc::new(Mutex::new(None)),
+            runtime_metadata: Arc::new(Mutex::new(None)),
             force_cpu_for_run: Arc::new(AtomicBool::new(false)),
             live_insertion: Arc::new(Mutex::new(None)),
             live_insertion_blocks_final_paste_after_clear: Arc::new(AtomicBool::new(false)),
@@ -728,9 +756,10 @@ impl TranscriptionManager {
             let mut current_model = self.current_model_id.lock().unwrap();
             *current_model = None;
         }
-        // A new load supersedes the previous planning metadata. Non-transcribe
-        // engines intentionally leave this empty.
+        // A new load supersedes the previous planning/runtime metadata. Non-
+        // transcribe engines intentionally leave these empty.
         *self.selection_plan.lock().unwrap() = None;
+        *self.runtime_metadata.lock().unwrap() = None;
 
         // Create appropriate engine based on model type
         let emit_loading_failed = |error_msg: &str| {
@@ -752,7 +781,8 @@ impl TranscriptionManager {
                 // --device-index flag) hard-select that registered device;
                 // otherwise re-read the persisted accelerator preference (so an
                 // accelerator change marked for reload takes effect here).
-                let (backend, device, selection_plan) = match device_index {
+                let (backend, device, selection_plan, planned_recovery_reason) = match device_index
+                {
                     Some(index) => {
                         let (backend, device) = resolve_device_index(index).inspect_err(|e| {
                             emit_loading_failed(&e.to_string());
@@ -768,6 +798,7 @@ impl TranscriptionManager {
                                     .to_string(),
                                 recommended_device,
                             },
+                            None,
                         )
                     }
                     None => {
@@ -803,6 +834,7 @@ impl TranscriptionManager {
                                 .to_string(),
                                 recommended_device: recommended_device_label,
                             },
+                            force_cpu.then(|| "runtime_health_fallback".to_string()),
                         )
                     }
                 };
@@ -813,8 +845,8 @@ impl TranscriptionManager {
                     .unwrap_or_else(|| "automatic".to_string());
                 let allow_cpu_fallback = should_retry_transcribe_load_on_cpu(device_index, backend);
                 let model_options = ModelOptions { backend, device };
-                let model = match Model::load_with(&model_path, &model_options) {
-                    Ok(model) => model,
+                let (model, recovery_reason) = match Model::load_with(&model_path, &model_options) {
+                    Ok(model) => (model, planned_recovery_reason),
                     Err(primary_err) if allow_cpu_fallback => {
                         warn!(
                             "Failed to load whisper model '{}' with requested backend {:?} and device '{}': {}; retrying on CPU for this run without changing the saved accelerator preference",
@@ -824,14 +856,15 @@ impl TranscriptionManager {
                             backend: Backend::Cpu,
                             device: None,
                         };
-                        Model::load_with(&model_path, &cpu_options).map_err(|cpu_err| {
+                        let model = Model::load_with(&model_path, &cpu_options).map_err(|cpu_err| {
                             let error_msg = format!(
                                 "Failed to load whisper model {} with requested acceleration ({}), then CPU fallback also failed: {}",
                                 model_id, primary_err, cpu_err
                             );
                             emit_loading_failed(&error_msg);
                             anyhow::anyhow!(error_msg)
-                        })?
+                        })?;
+                        (model, Some("startup_gpu_fallback".to_string()))
                     }
                     Err(e) => {
                         let error_msg = format!("Failed to load whisper model {}: {}", model_id, e);
@@ -840,8 +873,18 @@ impl TranscriptionManager {
                     }
                 };
                 // The bound backend may differ from the request (e.g. CPU
-                // fallback under Auto); log what actually loaded.
-                let bound_backend = model.backend();
+                // fallback under Auto). Snapshot it before session creation so a
+                // later runtime-health failure cannot erase the actual device used.
+                let bound_backend = model.backend().to_string();
+                let bound_device = model
+                    .device()
+                    .ok()
+                    .map(|device| transcribe_device_label(&device));
+                *self.runtime_metadata.lock().unwrap() = Some(transcribe_runtime_metadata(
+                    bound_backend.clone(),
+                    bound_device.clone(),
+                    recovery_reason,
+                ));
                 let session = model.session().map_err(|e| {
                     let error_msg = format!(
                         "Failed to create session for whisper model {}: {}",
@@ -862,10 +905,6 @@ impl TranscriptionManager {
                     caps.supports_language_detect,
                     caps.languages.clone(),
                 );
-                let bound_device = model
-                    .device()
-                    .map(|device| transcribe_device_label(&device))
-                    .unwrap_or_else(|_| "unknown".to_string());
                 info!(
                     "Loaded whisper model '{}' (requested {:?}, requested device '{}', \
                      bound backend '{}', bound device '{}', supports_streaming={}, \
@@ -874,7 +913,7 @@ impl TranscriptionManager {
                     backend,
                     requested_device,
                     bound_backend,
-                    bound_device,
+                    bound_device.as_deref().unwrap_or("unknown"),
                     caps.supports_streaming,
                     caps.supports_translate,
                     caps.supports_language_detect
@@ -1054,6 +1093,20 @@ impl TranscriptionManager {
     /// survives model unload so the just-completed session can persist it.
     pub fn selection_plan_metadata(&self) -> Option<TranscribeSelectionPlanMetadata> {
         self.selection_plan.lock().unwrap().clone()
+    }
+
+    /// Runtime truth for history/diagnostics. transcribe.cpp snapshots survive an
+    /// unhealthy engine being dropped; other engines fall back to the live engine
+    /// getters because they do not use the transcribe.cpp recovery path.
+    pub fn runtime_metadata(&self) -> (Option<String>, Option<String>, Option<String>) {
+        if let Some(metadata) = self.runtime_metadata.lock().unwrap().clone() {
+            return (
+                Some(metadata.backend),
+                metadata.device,
+                metadata.recovery_reason,
+            );
+        }
+        (self.current_backend(), self.current_device(), None)
     }
 
     /// Whether a live streaming run is currently in flight.
@@ -1570,10 +1623,15 @@ impl TranscriptionManager {
     /// Returns true when the caller should drop the current engine rather than
     /// returning it to the pool. Saved settings are never changed.
     fn arm_runtime_cpu_fallback(&self, model_id: &str, backend: Option<&str>) -> bool {
-        let Some(backend) = backend.filter(|backend| runtime_backend_needs_cpu_fallback(backend))
-        else {
+        let mut runtime_metadata = self
+            .runtime_metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !mark_runtime_health_failure(&mut runtime_metadata, backend) {
             return false;
-        };
+        }
+        drop(runtime_metadata);
+        let backend = backend.expect("runtime fallback requires an accelerated backend");
 
         self.force_cpu_for_run.store(true, Ordering::Release);
         let mut current_model = self
@@ -2882,6 +2940,19 @@ fn runtime_backend_needs_cpu_fallback(backend: &str) -> bool {
     !backend.eq_ignore_ascii_case("cpu")
 }
 
+fn mark_runtime_health_failure(
+    runtime_metadata: &mut Option<TranscribeRuntimeMetadata>,
+    backend: Option<&str>,
+) -> bool {
+    if !backend.is_some_and(runtime_backend_needs_cpu_fallback) {
+        return false;
+    }
+    if let Some(runtime) = runtime_metadata.as_mut() {
+        runtime.recovery_reason = Some("runtime_health_failure".to_string());
+    }
+    true
+}
+
 /// Apply the user's ORT accelerator preference to the transcribe-rs global.
 /// Called on startup and before loading a model.
 ///
@@ -3371,6 +3442,10 @@ mod tests {
             select_transcribe_backend_for_topology(settings.transcribe_accelerator, false, false);
         assert_eq!(recommended, Backend::Cpu);
         assert!(!should_retry_transcribe_load_on_cpu(None, recommended));
+        let runtime = transcribe_runtime_metadata("cpu".to_string(), None, None);
+        assert_eq!(runtime.backend, "cpu");
+        assert!(runtime.device.is_none());
+        assert!(runtime.recovery_reason.is_none());
         assert_eq!(describe_saved_transcribe_preference(&settings), saved);
         assert_eq!(saved.0, "gpu");
         assert_eq!(
@@ -3399,6 +3474,17 @@ mod tests {
         // The retry is a load-time CPU decision, not a settings migration.
         let fallback_backend = Backend::Cpu;
         assert_eq!(fallback_backend, Backend::Cpu);
+        let runtime = transcribe_runtime_metadata(
+            "cpu".to_string(),
+            None,
+            Some("startup_gpu_fallback".to_string()),
+        );
+        assert_eq!(runtime.backend, "cpu");
+        assert!(runtime.device.is_none());
+        assert_eq!(
+            runtime.recovery_reason.as_deref(),
+            Some("startup_gpu_fallback")
+        );
         assert_eq!(
             describe_saved_transcribe_preference(&settings),
             saved_before
@@ -3454,12 +3540,42 @@ mod tests {
     }
 
     #[test]
+    fn runtime_health_downgrade_preserves_actual_runtime_and_saved_preference() {
+        let mut settings = AppSettings::default();
+        settings.transcribe_accelerator = TranscribeAcceleratorSetting::Gpu;
+        settings.transcribe_gpu_device = Some("stable-discrete-gpu".to_string());
+        let saved = describe_saved_transcribe_preference(&settings);
+        let mut runtime = Some(transcribe_runtime_metadata(
+            "vulkan".to_string(),
+            Some("Discrete GPU".to_string()),
+            None,
+        ));
+
+        assert!(mark_runtime_health_failure(&mut runtime, Some("vulkan")));
+        let runtime = runtime.expect("runtime snapshot survives engine drop");
+        assert_eq!(runtime.backend, "vulkan");
+        assert_eq!(runtime.device.as_deref(), Some("Discrete GPU"));
+        assert_eq!(
+            runtime.recovery_reason.as_deref(),
+            Some("runtime_health_failure")
+        );
+        assert_eq!(describe_saved_transcribe_preference(&settings), saved);
+    }
+
+    #[test]
     fn runtime_health_downgrade_ignores_cpu_failures() {
         assert!(runtime_backend_needs_cpu_fallback("vulkan"));
         assert!(runtime_backend_needs_cpu_fallback("cuda"));
         assert!(runtime_backend_needs_cpu_fallback("metal"));
         assert!(!runtime_backend_needs_cpu_fallback("cpu"));
         assert!(!runtime_backend_needs_cpu_fallback("CPU"));
+        let mut runtime = Some(transcribe_runtime_metadata(
+            "cpu".to_string(),
+            Some("cpu".to_string()),
+            None,
+        ));
+        assert!(!mark_runtime_health_failure(&mut runtime, Some("cpu")));
+        assert!(runtime.unwrap().recovery_reason.is_none());
     }
 
     #[test]

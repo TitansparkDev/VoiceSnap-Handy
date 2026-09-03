@@ -167,8 +167,7 @@ pub async fn retry_history_entry_transcription(
         );
     let language = crate::actions::resolve_effective_language(&app, &history_settings);
     let language = (!language.is_empty()).then_some(language);
-    let backend = transcription_manager.current_backend();
-    let device = transcription_manager.current_device();
+    let (backend, device, recovery_reason) = transcription_manager.runtime_metadata();
     // Re-transcription is intentionally independent from re-cleanup. A retry
     // replaces the raw ASR result and applies only the normal deterministic
     // output transforms; an AI cleanup is a separate explicit user action.
@@ -187,6 +186,7 @@ pub async fn retry_history_entry_transcription(
             language,
             backend,
             device,
+            recovery_reason,
             saved_accelerator,
             saved_gpu_device,
             recommended_backend,

@@ -95,6 +95,8 @@ const runtimeLabel = (
 ): string | null => [backend, device].filter(Boolean).join(" · ") || null;
 
 const runtimeRecoveryOccurred = (entry: HistoryEntry): boolean => {
+  if (entry.recovery_reason) return true;
+
   const recommendedBackend = entry.recommended_backend?.trim().toLowerCase();
   const actualBackend = entry.backend?.trim().toLowerCase();
   const recommendedDevice = entry.recommended_device?.trim().toLowerCase();
@@ -110,6 +112,30 @@ const runtimeRecoveryOccurred = (entry: HistoryEntry): boolean => {
     recommendedDevice !== actualDevice;
 
   return recoveredToCpu || recoveredToDifferentDevice;
+};
+
+const runtimeRecoveryReason = (
+  entry: HistoryEntry,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): string | null => {
+  switch (entry.recovery_reason) {
+    case "startup_gpu_fallback":
+      return t("settings.history.recoveryStartupGpuFallback", {
+        defaultValue: "GPU startup failed, so this run retried on CPU.",
+      });
+    case "runtime_health_failure":
+      return t("settings.history.recoveryRuntimeHealthFailure", {
+        defaultValue:
+          "The accelerated runtime became unhealthy during this session; CPU fallback is armed for the next run.",
+      });
+    case "runtime_health_fallback":
+      return t("settings.history.recoveryRuntimeHealthFallback", {
+        defaultValue:
+          "A previous accelerated run became unhealthy, so this session used CPU for the current app run.",
+      });
+    default:
+      return null;
+  }
 };
 
 interface OpenRecordingsButtonProps {
@@ -663,6 +689,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
     entry.recommended_device,
   );
   const recoveredRuntime = runtimeRecoveryOccurred(entry);
+  const recoveryReasonLabel = runtimeRecoveryReason(entry, t);
   const cleanupModeLabel = entry.cleanup_mode
     ? entry.cleanup_mode === "off"
       ? t("settings.history.cleanupNotRequested", {
@@ -858,12 +885,15 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
 
       {recoveredRuntime && recommendedRuntimeLabel && actualRuntimeLabel && (
         <div className="rounded-md border border-logo-primary/20 bg-logo-primary/5 px-3 py-2 text-[11px] text-text/70">
-          {t("settings.history.hardwareRecovery", {
-            defaultValue:
-              "Hardware recovery: Handy planned {{planned}}, but this session used {{actual}}. Your saved accelerator preference was not changed.",
-            planned: recommendedRuntimeLabel,
-            actual: actualRuntimeLabel,
-          })}
+          <p>
+            {t("settings.history.hardwareRecovery", {
+              defaultValue:
+                "Hardware recovery: Handy planned {{planned}}, but this session used {{actual}}. Your saved accelerator preference was not changed.",
+              planned: recommendedRuntimeLabel,
+              actual: actualRuntimeLabel,
+            })}
+          </p>
+          {recoveryReasonLabel && <p className="mt-1">{recoveryReasonLabel}</p>}
         </div>
       )}
 

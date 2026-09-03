@@ -1092,6 +1092,10 @@ backend: string | null;
  */
 device: string | null; 
 /**
+ * Stable reason code when acceleration was downgraded for this session/run.
+ */
+recovery_reason: string | null;
+/**
  * Saved transcribe.cpp accelerator preference for this session.
  */
 saved_accelerator: string | null; 

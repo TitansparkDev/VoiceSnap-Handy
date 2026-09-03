@@ -1032,8 +1032,8 @@ impl ShortcutAction for TranscribeAction {
                     let history_duration_ms =
                         i64::try_from(sample_count.saturating_mul(1000) / 16_000)
                             .unwrap_or(i64::MAX);
-                    let history_backend = tm.current_backend();
-                    let history_device = tm.current_device();
+                    let (history_backend, history_device, history_recovery_reason) =
+                        tm.runtime_metadata();
                     let history_selection_plan = tm.selection_plan_metadata();
 
                     if rm.was_cancelled_since(cancel_generation) {
@@ -1115,6 +1115,7 @@ impl ShortcutAction for TranscribeAction {
                                     ),
                                     history_backend.clone(),
                                     history_device.clone(),
+                                    history_recovery_reason.clone(),
                                     history_saved_accelerator,
                                     history_saved_gpu_device,
                                     history_recommended_backend,
@@ -1222,6 +1223,7 @@ impl ShortcutAction for TranscribeAction {
                                     ),
                                     history_backend,
                                     history_device,
+                                    history_recovery_reason,
                                     history_saved_accelerator,
                                     history_saved_gpu_device,
                                     history_recommended_backend,
