@@ -472,6 +472,10 @@ pub struct AppSettings {
     pub post_process_selected_prompt_id: Option<String>,
     #[serde(default)]
     pub mute_while_recording: bool,
+    /// Optional system-media pause/resume while a recording is active. This is
+    /// deliberately opt-in so existing recording behavior remains unchanged.
+    #[serde(default)]
+    pub pause_media_while_recording: bool,
     #[serde(default)]
     pub append_trailing_space: bool,
     #[serde(default = "default_app_language")]
@@ -977,6 +981,7 @@ pub fn get_default_settings() -> AppSettings {
         post_process_prompts: default_post_process_prompts(),
         post_process_selected_prompt_id: None,
         mute_while_recording: false,
+        pause_media_while_recording: false,
         append_trailing_space: false,
         app_language: default_app_language(),
         theme: default_theme(),
@@ -1409,6 +1414,7 @@ mod tests {
         assert_eq!(settings.vad_backend, VadBackend::Silero);
         assert_eq!(settings.selected_microphone_id, None);
         assert_eq!(settings.clamshell_microphone_id, None);
+        assert!(!settings.pause_media_while_recording);
 
         // The 0.1 integer device index is cleared once for transcribe.cpp 0.2.
         // Without an exact device, the retired generic GPU choice becomes Auto.

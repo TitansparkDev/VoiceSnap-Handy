@@ -3,7 +3,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::Duration,
@@ -81,6 +81,213 @@ pub trait MediaBackend: Send + Sync + 'static {
     fn resume(&self) -> MediaFuture<'_, MediaSnapshot>;
 }
 
+/// Construct the app-facing controller with the best native adapter available
+/// on this platform. Unsupported platforms deliberately fail open through an
+/// unavailable backend rather than changing recording behavior.
+pub fn system_recording_media_controller() -> RecordingMediaController {
+    RecordingMediaController::new(MediaSessionController::new(system_media_backend()))
+}
+
+fn system_media_backend() -> Arc<dyn MediaBackend> {
+    #[cfg(target_os = "linux")]
+    {
+        return Arc::new(MprisMediaBackend::default());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Arc::new(UnavailableMediaBackend)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+struct UnavailableMediaBackend;
+
+#[cfg(not(target_os = "linux"))]
+impl MediaBackend for UnavailableMediaBackend {
+    fn snapshot(&self) -> MediaFuture<'_, MediaSnapshot> {
+        Box::pin(async { Err(MediaControlError::Unavailable) })
+    }
+
+    fn pause(&self) -> MediaFuture<'_, MediaSnapshot> {
+        Box::pin(async { Err(MediaControlError::Unavailable) })
+    }
+
+    fn resume(&self) -> MediaFuture<'_, MediaSnapshot> {
+        Box::pin(async { Err(MediaControlError::Unavailable) })
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct MprisMediaBackend {
+    selected_player: Mutex<Option<String>>,
+}
+
+#[cfg(target_os = "linux")]
+impl MprisMediaBackend {
+    async fn connection() -> Result<zbus::Connection, MediaControlError> {
+        zbus::Connection::session()
+            .await
+            .map_err(|error| MediaControlError::Failed(error.to_string()))
+    }
+
+    async fn list_players(connection: &zbus::Connection) -> Result<Vec<String>, MediaControlError> {
+        let proxy = zbus::Proxy::new(
+            connection,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        )
+        .await
+        .map_err(|error| MediaControlError::Failed(error.to_string()))?;
+        let names: Vec<zbus::names::OwnedBusName> = proxy
+            .call("ListNames", &())
+            .await
+            .map_err(|error| MediaControlError::Failed(error.to_string()))?;
+        Ok(names
+            .into_iter()
+            .map(|name| name.to_string())
+            .filter(|name| name.starts_with("org.mpris.MediaPlayer2."))
+            .collect())
+    }
+
+    async fn player_proxy<'a>(
+        connection: &'a zbus::Connection,
+        player: &'a str,
+    ) -> Result<zbus::Proxy<'a>, MediaControlError> {
+        zbus::Proxy::new(
+            connection,
+            player,
+            "/org/mpris/MediaPlayer2",
+            "org.mpris.MediaPlayer2.Player",
+        )
+        .await
+        .map_err(|error| MediaControlError::Failed(error.to_string()))
+    }
+
+    async fn player_snapshot(
+        connection: &zbus::Connection,
+        player: &str,
+    ) -> Result<MediaSnapshot, MediaControlError> {
+        let proxy = Self::player_proxy(connection, player).await?;
+        let status: String = proxy
+            .get_property("PlaybackStatus")
+            .await
+            .map_err(|error| MediaControlError::Failed(error.to_string()))?;
+        let state = match status.as_str() {
+            "Playing" => MediaPlaybackState::Playing,
+            "Paused" => MediaPlaybackState::Paused,
+            "Stopped" => MediaPlaybackState::Stopped,
+            _ => MediaPlaybackState::Unknown,
+        };
+        let state_revision = proxy
+            .get_property::<i64>("Position")
+            .await
+            .ok()
+            .and_then(|position| u64::try_from(position).ok());
+
+        Ok(MediaSnapshot {
+            state,
+            session_key: Some(opaque_player_key(player)),
+            state_revision,
+        })
+    }
+
+    fn selected_player(&self) -> Option<String> {
+        self.selected_player
+            .lock()
+            .expect("MPRIS player mutex poisoned")
+            .clone()
+    }
+
+    fn set_selected_player(&self, player: Option<String>) {
+        *self
+            .selected_player
+            .lock()
+            .expect("MPRIS player mutex poisoned") = player;
+    }
+
+    async fn snapshot_current(&self) -> Result<MediaSnapshot, MediaControlError> {
+        let connection = Self::connection().await?;
+        let players = Self::list_players(&connection).await?;
+        let selected = self.selected_player();
+        let mut selected_snapshot = None;
+
+        // Prefer any player that is actively playing. That lets a newly-active
+        // player supersede a stale paused selection while still preserving the
+        // selected paused player for the resume check when nothing else is active.
+        for player in players {
+            let Ok(snapshot) = Self::player_snapshot(&connection, &player).await else {
+                continue;
+            };
+            if snapshot.state == MediaPlaybackState::Playing {
+                self.set_selected_player(Some(player));
+                return Ok(snapshot);
+            }
+            if selected.as_deref() == Some(player.as_str()) {
+                selected_snapshot = Some(snapshot);
+            }
+        }
+
+        if let Some(snapshot) = selected_snapshot {
+            return Ok(snapshot);
+        }
+
+        self.set_selected_player(None);
+        Ok(MediaSnapshot::state_only(MediaPlaybackState::Unknown))
+    }
+
+    async fn send_selected_command(
+        &self,
+        method: &str,
+    ) -> Result<MediaSnapshot, MediaControlError> {
+        let player = self
+            .selected_player()
+            .ok_or(MediaControlError::Unavailable)?;
+        let connection = Self::connection().await?;
+        let proxy = Self::player_proxy(&connection, &player).await?;
+        let _: () = proxy
+            .call(method, &())
+            .await
+            .map_err(|error| MediaControlError::Failed(error.to_string()))?;
+        Self::player_snapshot(&connection, &player).await
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl MediaBackend for MprisMediaBackend {
+    fn snapshot(&self) -> MediaFuture<'_, MediaSnapshot> {
+        Box::pin(async move { self.snapshot_current().await })
+    }
+
+    fn pause(&self) -> MediaFuture<'_, MediaSnapshot> {
+        Box::pin(async move { self.send_selected_command("Pause").await })
+    }
+
+    fn resume(&self) -> MediaFuture<'_, MediaSnapshot> {
+        Box::pin(async move {
+            let result = self.send_selected_command("Play").await;
+            if result.is_ok() {
+                self.set_selected_player(None);
+            }
+            result
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn opaque_player_key(player: &str) -> u64 {
+    // FNV-1a is sufficient here: this is only an in-memory equality token and
+    // never leaves the controller or enters diagnostics/history.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in player.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaSession {
     generation: u64,
@@ -95,6 +302,71 @@ impl MediaSession {
 #[derive(Clone)]
 pub struct MediaSessionController {
     inner: Arc<ControllerInner>,
+}
+
+/// App-facing recording lifecycle wrapper around the asynchronous media worker.
+///
+/// The active token is kept separately from the controller's generation ledger so
+/// callers never block on platform media APIs. Disabled sessions are a true no-op.
+#[derive(Clone)]
+pub struct RecordingMediaController {
+    controller: MediaSessionController,
+    active_session: Arc<Mutex<Option<MediaSession>>>,
+}
+
+impl RecordingMediaController {
+    pub fn new(controller: MediaSessionController) -> Self {
+        Self {
+            controller,
+            active_session: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn begin_recording(&self, enabled: bool) {
+        if !enabled {
+            log_media_diagnostic("begin", "disabled", None);
+            return;
+        }
+
+        let session = self.controller.begin_session();
+        let previous = self
+            .active_session
+            .lock()
+            .expect("recording media session mutex poisoned")
+            .replace(session);
+
+        // A second recording generation can supersede an older token before its
+        // stop reaches us. Queueing the stale end is safe: the controller fences
+        // it against the newer active generation and transfers pause ownership.
+        if let Some(previous) = previous {
+            self.controller.finish_session(previous);
+        }
+        log_media_diagnostic("begin", "queued", Some(session.generation()));
+    }
+
+    pub fn finish_recording(&self) {
+        let session = self
+            .active_session
+            .lock()
+            .expect("recording media session mutex poisoned")
+            .take();
+        if let Some(session) = session {
+            self.controller.finish_session(session);
+            log_media_diagnostic("finish", "queued", Some(session.generation()));
+        }
+    }
+
+    pub fn cancel_recording(&self) {
+        let session = self
+            .active_session
+            .lock()
+            .expect("recording media session mutex poisoned")
+            .take();
+        if let Some(session) = session {
+            self.controller.cancel_session(session);
+            log_media_diagnostic("cancel", "queued", Some(session.generation()));
+        }
+    }
 }
 
 struct ControllerInner {
@@ -255,7 +527,7 @@ async fn handle_begin(
     let before = match call_with_timeout(timeout, backend.snapshot()).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            log_nonfatal("inspect before pause", generation, &error);
+            log_nonfatal("inspect_before_pause", generation, &error);
             return;
         }
     };
@@ -268,11 +540,8 @@ async fn handle_begin(
 
     let paused = match call_with_timeout(timeout, backend.pause()).await {
         Ok(snapshot) if snapshot.state == MediaPlaybackState::Paused => snapshot,
-        Ok(snapshot) => {
-            log::debug!(
-                "Media pause for generation {generation} returned state {:?}; leaving playback unowned",
-                snapshot.state
-            );
+        Ok(_) => {
+            log_media_diagnostic("pause", "unexpected_state", Some(generation));
             return;
         }
         Err(error) => {
@@ -295,7 +564,7 @@ async fn handle_begin(
     // never resume playback out from underneath the newer recording.
     ledger.paused_owner = Some(active_now);
     ledger.pause_snapshot = Some(paused);
-    log::debug!("Paused media for recording generation {active_now}");
+    log_media_diagnostic("pause", "success", Some(active_now));
 }
 
 async fn handle_end(
@@ -340,22 +609,20 @@ async fn resume_if_unchanged(
     let current = match call_with_timeout(timeout, backend.snapshot()).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            log_nonfatal("inspect before resume", generation, &error);
+            log_nonfatal("inspect_before_resume", generation, &error);
             return;
         }
     };
 
     if current.state != MediaPlaybackState::Paused || media_state_was_changed(paused, current) {
-        log::debug!(
-            "Skipping media resume for generation {generation}: playback no longer matches the controller-owned pause"
-        );
+        log_media_diagnostic("resume", "skipped_state_changed", Some(generation));
         return;
     }
 
     if let Err(error) = call_with_timeout(timeout, backend.resume()).await {
         log_nonfatal("resume", generation, &error);
     } else {
-        log::debug!("Resumed media for recording generation {generation}");
+        log_media_diagnostic("resume", "success", Some(generation));
     }
 }
 
@@ -378,9 +645,22 @@ fn media_state_was_changed(paused: MediaSnapshot, current: MediaSnapshot) -> boo
 }
 
 fn log_nonfatal(action: &str, generation: u64, error: &MediaControlError) {
-    log::debug!(
-        "Media control {action} failed for recording generation {generation}; transcription continues: {error}"
-    );
+    let outcome = match error {
+        MediaControlError::Unavailable => "unavailable",
+        MediaControlError::Timeout => "timeout",
+        MediaControlError::Failed(_) => "failed",
+    };
+    // Intentionally categorical: backend error strings may contain player/app
+    // details. Diagnostics retain only action/outcome/generation metadata.
+    log_media_diagnostic(action, outcome, Some(generation));
+}
+
+fn log_media_diagnostic(action: &str, outcome: &str, generation: Option<u64>) {
+    if let Some(generation) = generation {
+        log::debug!("media_control action={action} outcome={outcome} generation={generation}");
+    } else {
+        log::debug!("media_control action={action} outcome={outcome}");
+    }
 }
 
 #[cfg(test)]

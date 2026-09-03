@@ -4,6 +4,7 @@ use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, S
 use crate::audio_toolkit::{is_microphone_access_denied, is_no_input_device_error, VadPolicy};
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::HistoryManager;
+use crate::managers::media::RecordingMediaController;
 use crate::managers::model::{EngineType, ModelManager};
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::TranscriptionManager;
@@ -725,6 +726,11 @@ impl ShortcutAction for TranscribeAction {
         let recording_start_time = Instant::now();
         match rm.try_start_recording(&binding_id, vad_policy) {
             Ok(readiness) => {
+                // Queue media control only after microphone capture has been accepted.
+                // The controller performs every platform call on its own worker, so
+                // this cannot add media-service latency to the hotkey/capture path.
+                app.state::<RecordingMediaController>()
+                    .begin_recording(settings.pause_media_while_recording);
                 debug!(
                     "Recording request accepted in {:?}; waiting for first microphone samples",
                     recording_start_time.elapsed()
@@ -817,6 +823,9 @@ impl ShortcutAction for TranscribeAction {
         // after the user has already requested stop.
         app.state::<Arc<AudioRecordingManager>>()
             .invalidate_recording_readiness();
+        // Resume controller-owned playback as soon as recording ends; do not wait
+        // for transcription, cleanup, or paste to complete.
+        app.state::<RecordingMediaController>().finish_recording();
 
         // Unregister the cancel shortcut when transcription stops
         shortcut::unregister_cancel_shortcut(app);

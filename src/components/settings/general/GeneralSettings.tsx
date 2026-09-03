@@ -12,10 +12,14 @@ import { useSettings } from "../../../hooks/useSettings";
 import { VolumeSlider } from "../VolumeSlider";
 import { MuteWhileRecording } from "../MuteWhileRecording";
 import { ModelSettingsCard } from "./ModelSettingsCard";
+import { ToggleSwitch } from "../../ui/ToggleSwitch";
 
 export const GeneralSettings: React.FC = () => {
   const { t } = useTranslation();
-  const { audioFeedbackEnabled } = useSettings();
+  const { audioFeedbackEnabled, getSetting, updateSetting, isUpdating } =
+    useSettings();
+  const pauseMediaWhileRecording =
+    getSetting("pause_media_while_recording") ?? false;
   const isLinux = type() === "linux";
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">
@@ -30,6 +34,25 @@ export const GeneralSettings: React.FC = () => {
         <MicrophoneSelector descriptionMode="tooltip" grouped={true} />
         <ChannelSelector descriptionMode="tooltip" grouped={true} />
         <MuteWhileRecording descriptionMode="tooltip" grouped={true} />
+        <ToggleSwitch
+          checked={pauseMediaWhileRecording}
+          onChange={(enabled) =>
+            updateSetting("pause_media_while_recording", enabled)
+          }
+          isUpdating={isUpdating("pause_media_while_recording")}
+          label={t("settings.sound.pauseMediaWhileRecording.label", {
+            defaultValue: "Pause media while recording",
+          })}
+          description={t(
+            "settings.sound.pauseMediaWhileRecording.description",
+            {
+              defaultValue:
+                "Pause currently playing system media during dictation and resume it only when Handy paused it.",
+            },
+          )}
+          descriptionMode="tooltip"
+          grouped={true}
+        />
         <AudioFeedback descriptionMode="tooltip" grouped={true} />
         <OutputDeviceSelector
           descriptionMode="tooltip"
