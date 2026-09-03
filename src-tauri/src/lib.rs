@@ -1074,8 +1074,10 @@ pub fn run(cli_args: CliArgs) {
             }
             show_main_window(app);
         }
-        // Teardown transcribe.cpp before exit
+        // Teardown pending native paste state and transcribe.cpp before exit.
         tauri::RunEvent::Exit => {
+            #[cfg(target_os = "windows")]
+            crate::paste_tx::shutdown_pending();
             if let Some(tm) = app.try_state::<Arc<TranscriptionManager>>() {
                 let _ = tm.unload_model();
             }
