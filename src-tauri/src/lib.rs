@@ -429,9 +429,158 @@ mod headless_guard_tests {
     }
 }
 
-/// Headless one-shot transcription for the `--transcribe-file` / `--list-devices`
-/// path. Drives the same `TranscriptionManager::transcribe` the app uses; no
-/// mic, no VAD, no download. Returns a process exit code (0 ok, 1 runtime
+fn run_headless_live_benchmark(app: &AppHandle, args: &CliArgs) -> i32 {
+    use crate::audio_toolkit::VadPolicy;
+    use std::time::{Duration, Instant};
+
+    if args.transcribe_file.is_some() {
+        eprintln!("error: --benchmark-live-seconds cannot be combined with --transcribe-file");
+        return 2;
+    }
+    let seconds = args.benchmark_live_seconds.unwrap_or(0);
+    if seconds == 0 || seconds > 300 {
+        eprintln!("error: --benchmark-live-seconds must be between 1 and 300");
+        return 2;
+    }
+    let reference = match &args.benchmark_reference_file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(reference) => Some(reference),
+            Err(error) => {
+                eprintln!(
+                    "error: cannot read benchmark reference {}: {}",
+                    path.display(),
+                    error
+                );
+                return 2;
+            }
+        },
+        None => None,
+    };
+
+    let tm = app.state::<Arc<TranscriptionManager>>();
+    let rm = app.state::<Arc<AudioRecordingManager>>();
+    let model_id = args
+        .model
+        .clone()
+        .unwrap_or_else(|| get_settings(app).selected_model);
+    if model_id.is_empty() {
+        eprintln!("error: no model selected (pass --model or pick one in the app)");
+        return 2;
+    }
+    let device_index = args.device_index;
+    let requested_device = match device_index {
+        Some(idx) => format!("index {}", idx),
+        None => "settings".to_string(),
+    };
+    let load_started = Instant::now();
+    if let Err(error) = tm.load_model_with_device(&model_id, device_index) {
+        eprintln!("error: load_model('{}') failed: {}", model_id, error);
+        return 1;
+    }
+    let load_ms = load_started.elapsed().as_millis() as u64;
+    let bound_backend = tm.current_backend();
+    let runs = args.repeat.unwrap_or(1).max(1);
+    let mut benchmark_samples = Vec::with_capacity(runs);
+
+    for run in 0..runs {
+        if !tm.is_model_loaded() {
+            if let Err(error) = tm.load_model_with_device(&model_id, device_index) {
+                eprintln!(
+                    "error: reload before live benchmark run {} failed: {}",
+                    run + 1,
+                    error
+                );
+                return 1;
+            }
+        }
+        let total_started = Instant::now();
+        tm.start_stream();
+        let cancel_generation = rm.cancel_generation();
+        let readiness = match rm.try_start_recording("cli-live-benchmark", VadPolicy::Disabled) {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                tm.cancel_stream();
+                eprintln!("error: live benchmark microphone start failed: {error}");
+                return 1;
+            }
+        };
+        if !readiness.wait_timeout(Duration::from_secs(5)) {
+            rm.cancel_recording();
+            tm.cancel_stream();
+            eprintln!("error: live benchmark microphone produced no samples within 5 seconds");
+            return 1;
+        }
+        std::thread::sleep(Duration::from_secs(seconds));
+        let Some(audio) = rm.stop_recording("cli-live-benchmark", cancel_generation) else {
+            tm.cancel_stream();
+            eprintln!("error: live benchmark microphone capture did not return audio");
+            return 1;
+        };
+        match tm.benchmark_live_capture(&audio, total_started, reference.as_deref()) {
+            Ok(sample) => benchmark_samples.push(sample),
+            Err(error) => {
+                eprintln!("error: live benchmark run {} failed: {}", run + 1, error);
+                return 1;
+            }
+        }
+    }
+
+    let audio_secs = benchmark_samples
+        .first()
+        .map(|sample| sample.audio_ms as f64 / 1000.0)
+        .unwrap_or(0.0);
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "input_mode": "live_microphone",
+                "model": model_id,
+                "requested_device": requested_device,
+                "bound_backend": bound_backend,
+                "audio_secs": audio_secs,
+                "load_ms": load_ms,
+                "samples": benchmark_samples,
+            })
+        );
+    } else {
+        println!(
+            "model={} device={} backend={} live_microphone={}s load={}ms",
+            model_id,
+            requested_device,
+            bound_backend.as_deref().unwrap_or("?"),
+            seconds,
+            load_ms,
+        );
+        for (index, sample) in benchmark_samples.iter().enumerate() {
+            println!(
+                "run={} mode={} first_partial_ms={} committed_cadence_ms={:?} finalization_tail_ms={} total_ms={} wer_milli={:?} worker_released={}",
+                index + 1,
+                sample.mode,
+                sample
+                    .first_partial_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                sample.committed_cadence_ms,
+                sample.finalization_tail_ms,
+                sample.total_ms,
+                sample.word_error_rate_milli,
+                sample.worker_released,
+            );
+        }
+    }
+    if benchmark_samples
+        .iter()
+        .all(|sample| sample.worker_released)
+    {
+        0
+    } else {
+        eprintln!("error: streaming worker did not release after live benchmark finalization");
+        1
+    }
+}
+
+/// Headless one-shot transcription for fixed WAV, live microphone benchmark,
+/// and model/device listing paths. Returns a process exit code (0 ok, 1 runtime
 /// failure, 2 bad input/usage).
 fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
     use std::time::Instant;
@@ -492,6 +641,10 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
         if args.transcribe_file.is_none() {
             return 0;
         }
+    }
+
+    if args.benchmark_live_seconds.is_some() {
+        return run_headless_live_benchmark(app, args);
     }
 
     let Some(wav) = args.transcribe_file.clone() else {
@@ -562,6 +715,20 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
 
     let runs = args.repeat.unwrap_or(1).max(1);
     if args.benchmark_stream {
+        let benchmark_reference = match &args.benchmark_reference_file {
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(reference) => Some(reference),
+                Err(error) => {
+                    eprintln!(
+                        "error: cannot read benchmark reference {}: {}",
+                        path.display(),
+                        error
+                    );
+                    return 2;
+                }
+            },
+            None => None,
+        };
         let mut benchmark_samples = Vec::with_capacity(runs);
         for i in 0..runs {
             if !tm.is_model_loaded() {
@@ -570,7 +737,11 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
                     return 1;
                 }
             }
-            match tm.benchmark_fixed_audio(&samples, args.benchmark_frame_ms) {
+            match tm.benchmark_fixed_audio_with_reference(
+                &samples,
+                args.benchmark_frame_ms,
+                benchmark_reference.as_deref(),
+            ) {
                 Ok(sample) => benchmark_samples.push(sample),
                 Err(e) => {
                     eprintln!("error: stream benchmark run {} failed: {}", i + 1, e);
@@ -855,8 +1026,10 @@ pub fn run(cli_args: CliArgs) {
 
     // The headless path must run as its own instance (see the single-instance
     // note below), not forward to an already-running app.
-    let headless_mode =
-        cli_args.transcribe_file.is_some() || cli_args.list_devices || cli_args.list_models;
+    let headless_mode = cli_args.transcribe_file.is_some()
+        || cli_args.benchmark_live_seconds.is_some()
+        || cli_args.list_devices
+        || cli_args.list_models;
 
     #[allow(unused_mut)]
     let mut builder = tauri::Builder::default()
@@ -978,7 +1151,17 @@ pub fn run(cli_args: CliArgs) {
                         .expect("Failed to initialize transcription manager"),
                 );
                 app_handle.manage(model_manager);
-                app_handle.manage(transcription_manager);
+                app_handle.manage(transcription_manager.clone());
+                if cli_args.benchmark_live_seconds.is_some() {
+                    let recording_manager = Arc::new(
+                        AudioRecordingManager::new(
+                            &app_handle,
+                            transcription_manager.stream_router(),
+                        )
+                        .expect("Failed to initialize audio manager for live benchmark"),
+                    );
+                    app_handle.manage(recording_manager);
+                }
                 managers::transcription::init_transcribe_backend();
                 managers::transcription::apply_accelerator_settings(&app_handle);
 

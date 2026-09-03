@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,8 +8,10 @@ import {
   fixtureIdentity,
   parseArgs,
   parseFixture,
+  parseReference,
   percentile,
   summarizeSamples,
+  WAVE2_MODEL_CONTRACT,
   WAVE2_MODELS,
 } from "./stream-benchmark.mjs";
 
@@ -26,15 +28,70 @@ test("fixed fixture identity records basename and content hash without full path
 
 test("wave2 model shortcut expands the documented comparison set", () => {
   const options = parseArgs(
-    ["--binary", "/tmp/handy", "--fixture", "short=/tmp/short.wav", "--wave2-models"],
+    [
+      "--binary",
+      "/tmp/handy",
+      "--fixture",
+      "short=/tmp/short.wav",
+      "--wave2-models",
+    ],
     {},
   );
   assert.deepEqual(options.models, [...WAVE2_MODELS]);
 });
 
-test("fixture parser requires stable labels", () => {
+test("fixture and reference parsers require stable labels", () => {
   assert.equal(parseFixture("normal=./normal.wav").label, "normal");
+  assert.equal(parseReference("normal=./normal.txt").label, "normal");
   assert.throws(() => parseFixture("./normal.wav"), /Expected LABEL=WAV_PATH/);
+  assert.throws(
+    () => parseReference("./normal.txt"),
+    /Expected LABEL=TEXT_PATH/,
+  );
+});
+
+test("live microphone mode parses without requiring a physical fixture", () => {
+  const options = parseArgs(
+    [
+      "--binary",
+      "/tmp/handy",
+      "--live-seconds",
+      "8",
+      "--live-reference",
+      "/tmp/phrase.txt",
+      "--model",
+      "model",
+    ],
+    {},
+  );
+  assert.equal(options.liveSeconds, 8);
+  assert.equal(options.fixtures.length, 0);
+  assert.match(options.liveReference, /phrase\.txt$/);
+});
+
+test("Wave 2 catalog contract keeps streaming candidates and Whisper Turbo final-only", () => {
+  const catalog = JSON.parse(
+    readFileSync("src-tauri/src/catalog/catalog.json", "utf8"),
+  );
+  const byId = new Map(catalog.models.map((model) => [model.id, model]));
+  for (const candidate of WAVE2_MODEL_CONTRACT) {
+    const catalogModel = byId.get(candidate.id);
+    assert.ok(catalogModel, `missing catalog model ${candidate.id}`);
+    assert.equal(
+      candidate.catalog_path,
+      catalogModel.capabilities.streaming ? "streaming_capable" : "final_only",
+    );
+  }
+  const whisper = WAVE2_MODEL_CONTRACT.find((candidate) =>
+    candidate.id.includes("whisper-large-v3-turbo"),
+  );
+  assert.equal(whisper.catalog_path, "final_only");
+  assert.equal(
+    WAVE2_MODEL_CONTRACT.filter(
+      (candidate) => candidate.catalog_path === "streaming_capable",
+    ).length,
+    3,
+  );
 });
 
 test("final-only samples do not invent partial or cadence timing", () => {
@@ -58,7 +115,11 @@ test("final-only samples do not invent partial or cadence timing", () => {
   ]);
   assert.equal(summary.mode, "final_only");
   assert.deepEqual(summary.first_partial_ms, { p50: null, p95: null });
-  assert.deepEqual(summary.committed_cadence_ms, { p50: null, p95: null, samples: 0 });
+  assert.deepEqual(summary.committed_cadence_ms, {
+    p50: null,
+    p95: null,
+    samples: 0,
+  });
   assert.equal(summary.finalization_tail_ms.p50, 280);
 });
 
@@ -71,6 +132,7 @@ test("streaming summary aggregates first partial, commit cadence, finalize and t
       finalization_tail_ms: 90,
       total_ms: 2100,
       worker_released: true,
+      word_error_rate_milli: 125,
     },
     {
       mode: "streaming",
@@ -79,12 +141,19 @@ test("streaming summary aggregates first partial, commit cadence, finalize and t
       finalization_tail_ms: 100,
       total_ms: 2200,
       worker_released: true,
+      word_error_rate_milli: 250,
     },
   ]);
   assert.equal(summary.first_partial_ms.p50, 140);
   assert.equal(summary.committed_cadence_ms.p50, 110);
   assert.equal(summary.finalization_tail_ms.p95, 100);
   assert.equal(summary.total_ms.p95, 2200);
+  assert.deepEqual(summary.quality, {
+    metric: "word_error_rate_milli",
+    p50: 125,
+    p95: 250,
+    samples: 2,
+  });
   assert.equal(summary.worker_released, true);
 });
 
@@ -125,6 +194,8 @@ test("fixed-WAV matrix exercises short medium long fixtures without inventing fi
           finalization_tail_ms: first + 30 + run,
           total_ms: first + 1000 + run,
           worker_released: true,
+          word_error_rate_milli:
+            { short: 0, medium: 125, long: 250 }[label] + run,
         })),
       }),
     };
@@ -133,19 +204,141 @@ test("fixed-WAV matrix exercises short medium long fixtures without inventing fi
   const results = await evaluateBenchmarkMatrix(options, fakeRunner);
   assert.equal(results.length, 6);
   for (const label of ["short", "medium", "long"]) {
-    const streaming = results.find((result) => result.fixture === label && result.model === "stream-model");
-    const finalOnly = results.find((result) => result.fixture === label && result.model === "final-model");
+    const streaming = results.find(
+      (result) => result.fixture === label && result.model === "stream-model",
+    );
+    const finalOnly = results.find(
+      (result) => result.fixture === label && result.model === "final-model",
+    );
     assert.equal(streaming.first_partial_ms.p50, measured[label]);
     assert.equal(streaming.committed_cadence_ms.p50, 91);
     assert.equal(streaming.committed_cadence_ms.samples, 4);
     assert.equal(streaming.finalization_tail_ms.p50, measured[label] + 30);
     assert.equal(streaming.total_ms.p50, measured[label] + 1000);
+    assert.equal(streaming.quality.samples, 2);
     assert.equal(streaming.worker_released, true);
     assert.deepEqual(finalOnly.first_partial_ms, { p50: null, p95: null });
-    assert.deepEqual(finalOnly.committed_cadence_ms, { p50: null, p95: null, samples: 0 });
+    assert.deepEqual(finalOnly.committed_cadence_ms, {
+      p50: null,
+      p95: null,
+      samples: 0,
+    });
     assert.equal(finalOnly.mode, "final_only");
     assert.equal(finalOnly.success, true);
   }
+});
+
+test("fixed-WAV reference is passed to the binary and reported by hash only", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "handy-stream-reference-"));
+  const wav = join(dir, "short.wav");
+  const reference = join(dir, "short.txt");
+  writeFileSync(wav, Buffer.from("wav bytes"));
+  writeFileSync(reference, "expected private transcript");
+  const options = {
+    binary: "/fake/handy",
+    fixtures: [{ label: "short", path: wav }],
+    references: [{ label: "short", path: reference }],
+    models: ["model"],
+    runs: 1,
+    frameMs: 100,
+    liveSeconds: null,
+    deviceIndex: null,
+  };
+  const fakeRunner = async (_binary, args) => {
+    assert.equal(
+      args[args.indexOf("--benchmark-reference-file") + 1],
+      reference,
+    );
+    return {
+      code: 0,
+      stdout: JSON.stringify({
+        audio_secs: 1.5,
+        load_ms: 20,
+        samples: [
+          {
+            mode: "streaming",
+            first_partial_ms: 120,
+            committed_cadence_ms: [80],
+            finalization_tail_ms: 50,
+            total_ms: 1600,
+            worker_released: true,
+            word_error_rate_milli: 125,
+          },
+        ],
+      }),
+    };
+  };
+  const [result] = await evaluateBenchmarkMatrix(options, fakeRunner);
+  assert.equal(result.quality.p50, 125);
+  assert.match(result.reference_sha256, /^[0-9a-f]{64}$/);
+  assert.equal(
+    JSON.stringify(result).includes("expected private transcript"),
+    false,
+  );
+  assert.equal(JSON.stringify(result).includes(dir), false);
+});
+
+test("live microphone benchmark uses the same timing and quality schema without hardware in CI", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "handy-stream-live-"));
+  const reference = join(dir, "phrase.txt");
+  writeFileSync(reference, "read this stable phrase");
+  const options = {
+    binary: "/fake/handy",
+    fixtures: [],
+    references: [],
+    models: [WAVE2_MODELS[0], WAVE2_MODELS.at(-1)],
+    runs: 2,
+    frameMs: 100,
+    liveSeconds: 6,
+    liveLabel: "live-phrase",
+    liveReference: reference,
+    deviceIndex: null,
+  };
+  const fakeRunner = async (_binary, args) => {
+    assert.equal(args.includes("--transcribe-file"), false);
+    assert.equal(args[args.indexOf("--benchmark-live-seconds") + 1], "6");
+    assert.equal(
+      args[args.indexOf("--benchmark-reference-file") + 1],
+      reference,
+    );
+    const model = args[args.indexOf("--model") + 1];
+    const finalOnly = model.includes("whisper-large-v3-turbo");
+    return {
+      code: 0,
+      stdout: JSON.stringify({
+        input_mode: "live_microphone",
+        audio_secs: 6,
+        load_ms: 40,
+        bound_backend: "cpu",
+        samples: Array.from({ length: 2 }, (_, run) => ({
+          mode: finalOnly ? "final_only" : "streaming",
+          first_partial_ms: finalOnly ? null : 180 + run,
+          committed_cadence_ms: finalOnly ? [] : [100 + run],
+          finalization_tail_ms: 70 + run,
+          total_ms: 6100 + run,
+          worker_released: true,
+          word_error_rate_milli: 100 + run,
+        })),
+      }),
+    };
+  };
+  const results = await evaluateBenchmarkMatrix(options, fakeRunner);
+  assert.equal(results.length, 2);
+  const streaming = results.find(
+    (result) => result.catalog_path === "streaming_capable",
+  );
+  const finalOnly = results.find(
+    (result) => result.catalog_path === "final_only",
+  );
+  assert.equal(streaming.input_mode, "live_microphone");
+  assert.equal(streaming.first_partial_ms.p50, 180);
+  assert.equal(streaming.quality.p50, 100);
+  assert.equal(finalOnly.mode, "final_only");
+  assert.deepEqual(finalOnly.first_partial_ms, { p50: null, p95: null });
+  assert.equal(
+    JSON.stringify(results).includes("read this stable phrase"),
+    false,
+  );
 });
 
 test("nearest-rank percentile is deterministic", () => {

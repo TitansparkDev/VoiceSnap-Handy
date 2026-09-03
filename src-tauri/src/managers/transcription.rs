@@ -193,6 +193,44 @@ pub struct TranscriptionBenchmarkSample {
     pub finalization_tail_ms: u64,
     pub total_ms: u64,
     pub worker_released: bool,
+    /// Deterministic word-error rate in thousandths (0 = exact, 1000 = 100%).
+    /// None when the benchmark did not receive a reference transcript.
+    pub word_error_rate_milli: Option<u32>,
+}
+
+fn benchmark_word_error_rate_milli(reference: &str, actual: &str) -> u32 {
+    fn words(text: &str) -> Vec<String> {
+        text.split_whitespace()
+            .map(|word| {
+                word.chars()
+                    .filter(|ch| ch.is_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>()
+            })
+            .filter(|word| !word.is_empty())
+            .collect()
+    }
+
+    let reference = words(reference);
+    let actual = words(actual);
+    if reference.is_empty() {
+        return if actual.is_empty() { 0 } else { 1000 };
+    }
+
+    let mut previous: Vec<usize> = (0..=actual.len()).collect();
+    for (row, expected) in reference.iter().enumerate() {
+        let mut current = Vec::with_capacity(actual.len() + 1);
+        current.push(row + 1);
+        for (column, observed) in actual.iter().enumerate() {
+            let substitution = previous[column] + usize::from(expected != observed);
+            let insertion = current[column] + 1;
+            let deletion = previous[column + 1] + 1;
+            current.push(substitution.min(insertion).min(deletion));
+        }
+        previous = current;
+    }
+    let edits = previous[actual.len()] as u64;
+    ((edits * 1000) / reference.len() as u64).min(u32::MAX as u64) as u32
 }
 
 /// Routes real-time audio frames to the active streaming worker. Shared between
@@ -1648,17 +1686,17 @@ impl TranscriptionManager {
     /// live capture, paced at real time. Streaming-capable engines report live
     /// milestones; engines that cannot stream cleanly fall back to one final
     /// batch decode and intentionally report no partial/cadence samples.
-    pub fn benchmark_fixed_audio(
+    pub fn benchmark_fixed_audio_with_reference(
         &self,
         audio: &[f32],
         frame_ms: u64,
+        reference: Option<&str>,
     ) -> Result<TranscriptionBenchmarkSample> {
         if audio.is_empty() {
             return Err(anyhow::anyhow!("benchmark fixture contains no audio"));
         }
         let frame_ms = frame_ms.max(1);
         let frame_samples = ((16_000_u64 * frame_ms) / 1_000).max(1) as usize;
-        let audio_ms = ((audio.len() as u64) * 1_000) / 16_000;
         let total_started = Instant::now();
 
         self.start_stream();
@@ -1667,8 +1705,33 @@ impl TranscriptionManager {
             thread::sleep(Duration::from_secs_f64(chunk.len() as f64 / 16_000.0));
         }
 
+        self.finish_benchmark_audio(audio, total_started, reference)
+    }
+
+    /// Finish a live microphone benchmark after `start_stream` and the recorder's
+    /// real-time callback have fed the active `StreamRouter` during capture.
+    pub fn benchmark_live_capture(
+        &self,
+        audio: &[f32],
+        total_started: Instant,
+        reference: Option<&str>,
+    ) -> Result<TranscriptionBenchmarkSample> {
+        if audio.is_empty() {
+            self.cancel_stream();
+            return Err(anyhow::anyhow!("live benchmark captured no audio"));
+        }
+        self.finish_benchmark_audio(audio, total_started, reference)
+    }
+
+    fn finish_benchmark_audio(
+        &self,
+        audio: &[f32],
+        total_started: Instant,
+        reference: Option<&str>,
+    ) -> Result<TranscriptionBenchmarkSample> {
+        let audio_ms = ((audio.len() as u64) * 1_000) / 16_000;
         let finalize_started = Instant::now();
-        if let Some((_text, mut timing)) = self.finalize_stream_with_benchmark_timing()? {
+        if let Some((text, mut timing)) = self.finalize_stream_with_benchmark_timing()? {
             timing.finalization_tail_ms = finalize_started.elapsed().as_millis() as u64;
             timing.total_ms = total_started.elapsed().as_millis() as u64;
             let worker_released = self.wait_for_stream_worker_release(Duration::from_secs(1));
@@ -1680,11 +1743,13 @@ impl TranscriptionManager {
                 finalization_tail_ms: timing.finalization_tail_ms,
                 total_ms: timing.total_ms,
                 worker_released,
+                word_error_rate_milli: reference
+                    .map(|expected| benchmark_word_error_rate_milli(expected, &text)),
             });
         }
 
         let batch_started = Instant::now();
-        let _text = self.transcribe(audio.to_vec())?;
+        let text = self.transcribe(audio.to_vec())?;
         let batch_ms = batch_started.elapsed().as_millis() as u64;
         let worker_released = self.wait_for_stream_worker_release(Duration::from_secs(1));
         Ok(TranscriptionBenchmarkSample {
@@ -1695,6 +1760,8 @@ impl TranscriptionManager {
             finalization_tail_ms: batch_ms,
             total_ms: total_started.elapsed().as_millis() as u64,
             worker_released,
+            word_error_rate_milli: reference
+                .map(|expected| benchmark_word_error_rate_milli(expected, &text)),
         })
     }
 
@@ -2929,6 +2996,24 @@ mod tests {
 
     fn languages(codes: &[&str]) -> Vec<String> {
         codes.iter().map(|code| (*code).to_string()).collect()
+    }
+
+    #[test]
+    fn benchmark_word_error_rate_is_deterministic_and_text_free() {
+        assert_eq!(
+            benchmark_word_error_rate_milli("Hello, world!", "hello world"),
+            0
+        );
+        assert_eq!(
+            benchmark_word_error_rate_milli("one two three", "one four three"),
+            333
+        );
+        assert_eq!(
+            benchmark_word_error_rate_milli("one two", "one two extra"),
+            500
+        );
+        assert_eq!(benchmark_word_error_rate_milli("", ""), 0);
+        assert_eq!(benchmark_word_error_rate_milli("", "unexpected"), 1000);
     }
 
     #[test]
