@@ -811,10 +811,9 @@ impl ShortcutAction for TranscribeAction {
                         let selected_model = get_settings(&ah).selected_model;
                         (!selected_model.is_empty()).then_some(selected_model)
                     };
-                    let history_duration_ms = i64::try_from(
-                        sample_count.saturating_mul(1000) / 16_000,
-                    )
-                    .unwrap_or(i64::MAX);
+                    let history_duration_ms =
+                        i64::try_from(sample_count.saturating_mul(1000) / 16_000)
+                            .unwrap_or(i64::MAX);
 
                     if rm.was_cancelled_since(cancel_generation) {
                         debug!("Transcription operation cancelled before output handling");

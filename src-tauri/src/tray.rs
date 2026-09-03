@@ -676,6 +676,7 @@ mod tests {
             id: 1,
             file_name: "handy-1.wav".to_string(),
             timestamp: 0,
+            duration_ms: None,
             saved: false,
             title: "Recording".to_string(),
             transcription_text: transcription.to_string(),
