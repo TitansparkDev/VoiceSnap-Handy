@@ -684,6 +684,7 @@ mod tests {
             post_process_prompt: None,
             post_process_requested: false,
             model_id: None,
+            engine_type: None,
             language: None,
         }
     }

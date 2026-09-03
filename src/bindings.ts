@@ -1029,6 +1029,10 @@ export type EngineType =
 export type GpuDeviceOption = { id: string; name: string; total_vram_mb: number }
 export type HistoryEntry = { id: number; file_name: string; timestamp: number; duration_ms: number | null; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean; model_id: string | null;
 /**
+ * Stable engine family identifier for the model used by this run.
+ */
+engine_type: string | null;
+/**
  * Effective language mode used for the transcription. `auto` means the
  * model was allowed to detect the language rather than a forced code.
  */

@@ -113,6 +113,7 @@ pub async fn retry_history_entry_transcription(
         (!history_settings.selected_model.is_empty())
             .then_some(history_settings.selected_model.clone())
     });
+    let engine_type = crate::actions::resolve_history_engine_type(&app, model_id.as_deref());
     let language = crate::actions::resolve_effective_language(&app, &history_settings);
     let language = (!language.is_empty()).then_some(language);
     let processed =
@@ -124,6 +125,7 @@ pub async fn retry_history_entry_transcription(
             processed.post_processed_text,
             processed.post_process_prompt,
             model_id,
+            engine_type,
             language,
         )
         .map(|_| ())

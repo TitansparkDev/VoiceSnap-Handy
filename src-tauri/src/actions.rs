@@ -4,7 +4,7 @@ use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, S
 use crate::audio_toolkit::{is_microphone_access_denied, is_no_input_device_error, VadPolicy};
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::HistoryManager;
-use crate::managers::model::ModelManager;
+use crate::managers::model::{EngineType, ModelManager};
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::TranscriptionManager;
 use crate::settings::{get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID};
@@ -457,6 +457,27 @@ pub(crate) struct ProcessedTranscription {
     pub post_process_prompt: Option<String>,
 }
 
+/// Resolve the model used by a history row to a stable engine-family identifier.
+/// Unknown or already-removed models leave the field empty rather than guessing.
+pub(crate) fn resolve_history_engine_type(
+    app: &AppHandle,
+    model_id: Option<&str>,
+) -> Option<String> {
+    let model_id = model_id?;
+    let model = app.state::<Arc<ModelManager>>().get_model_info(model_id)?;
+    let engine = match model.engine_type {
+        EngineType::TranscribeCpp => "transcribe_cpp",
+        EngineType::Parakeet => "parakeet",
+        EngineType::Moonshine => "moonshine",
+        EngineType::MoonshineStreaming => "moonshine_streaming",
+        EngineType::SenseVoice => "sense_voice",
+        EngineType::GigaAM => "gigaam",
+        EngineType::Canary => "canary",
+        EngineType::Cohere => "cohere",
+    };
+    Some(engine.to_string())
+}
+
 /// Resolve the persisted language *intent* into the language the currently-loaded
 /// model will actually use — the same capability-aware coercion the transcription
 /// paths apply (see [`crate::managers::model::effective_language`]). Post-processing
@@ -860,14 +881,19 @@ impl ShortcutAction for TranscribeAction {
 
                             // Save to history if WAV was saved
                             if wav_saved {
+                                let history_model_id = tm
+                                    .get_current_model()
+                                    .or_else(|| selected_history_model_id.clone());
+                                let history_engine_type =
+                                    resolve_history_engine_type(&ah, history_model_id.as_deref());
                                 if let Err(err) = hm.save_entry(
                                     file_name,
                                     transcription,
                                     post_process,
                                     processed.post_processed_text.clone(),
                                     processed.post_process_prompt.clone(),
-                                    tm.get_current_model()
-                                        .or_else(|| selected_history_model_id.clone()),
+                                    history_model_id,
+                                    history_engine_type,
                                     history_language.clone(),
                                     history_duration_ms,
                                 ) {
@@ -927,6 +953,10 @@ impl ShortcutAction for TranscribeAction {
                             let _ = ah.emit("transcription-error", err.to_string());
                             // Save entry with empty text so user can retry
                             if wav_saved {
+                                let history_engine_type = resolve_history_engine_type(
+                                    &ah,
+                                    selected_history_model_id.as_deref(),
+                                );
                                 if let Err(save_err) = hm.save_entry(
                                     file_name,
                                     String::new(),
@@ -934,6 +964,7 @@ impl ShortcutAction for TranscribeAction {
                                     None,
                                     None,
                                     selected_history_model_id,
+                                    history_engine_type,
                                     history_language,
                                     history_duration_ms,
                                 ) {

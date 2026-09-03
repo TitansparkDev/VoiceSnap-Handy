@@ -73,6 +73,22 @@ const formatRecordingDuration = (durationMs: number | null): string | null => {
   return `${minutes}m ${seconds}s`;
 };
 
+const formatHistoryEngine = (engineType: string | null): string | null => {
+  if (!engineType) return null;
+
+  const labels: Record<string, string> = {
+    transcribe_cpp: "transcribe.cpp",
+    parakeet: "Parakeet",
+    moonshine: "Moonshine",
+    moonshine_streaming: "Moonshine Streaming",
+    sense_voice: "SenseVoice",
+    gigaam: "GigaAM",
+    canary: "Canary",
+    cohere: "Cohere",
+  };
+  return labels[engineType] ?? engineType;
+};
+
 interface OpenRecordingsButtonProps {
   onClick: () => void;
   label: string;
@@ -607,6 +623,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
 
   const formattedDate = formatDateTime(String(entry.timestamp), i18n.language);
   const formattedDuration = formatRecordingDuration(entry.duration_ms);
+  const engineLabel = formatHistoryEngine(entry.engine_type);
   const languageLabel = entry.language
     ? entry.language === "auto"
       ? t("settings.general.language.auto")
@@ -626,6 +643,14 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
               })}
             >
               {formattedDuration}
+            </span>
+          )}
+          {engineLabel && (
+            <span
+              className="rounded bg-mid-gray/10 px-1.5 py-0.5 text-[10px] text-text/50"
+              title={t("settings.history.engine", { defaultValue: "Engine" })}
+            >
+              {engineLabel}
             </span>
           )}
           {languageLabel && (
