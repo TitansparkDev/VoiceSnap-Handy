@@ -23,8 +23,8 @@ use crate::settings::APPLE_INTELLIGENCE_DEFAULT_MODEL_ID;
 use crate::settings::{
     self, get_settings, AutoSubmitKey, ClipboardHandling, InsertionMode, KeyboardImplementation,
     LLMPrompt, OverlayPosition, OverlayStyle, PasteMethod, ShortcutActivation, ShortcutBinding,
-    SoundTheme, Theme, TypingTool, VadBackend, APPLE_INTELLIGENCE_PROVIDER_ID,
-    LOCAL_CLEANUP_PROVIDER_ID,
+    SoundTheme, Theme, TypingTool, VadBackend, VocabularySettingsV1,
+    APPLE_INTELLIGENCE_PROVIDER_ID, LOCAL_CLEANUP_PROVIDER_ID,
 };
 use crate::tray;
 
@@ -833,6 +833,24 @@ pub fn change_whats_new_last_seen_version_setting(
 pub fn update_custom_words(app: AppHandle, words: Vec<String>) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
     settings.custom_words = words;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn update_vocabulary_v1(
+    app: AppHandle,
+    vocabulary: VocabularySettingsV1,
+) -> Result<(), String> {
+    if vocabulary.version != 1 {
+        return Err(format!(
+            "Unsupported vocabulary settings version {}",
+            vocabulary.version
+        ));
+    }
+    let mut settings = settings::get_settings(&app);
+    settings.vocabulary_v1 = vocabulary;
     settings::write_settings(&app, settings);
     Ok(())
 }
