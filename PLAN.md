@@ -314,7 +314,7 @@ Deliverables:
   and quality on short/medium/long utterances.
 - Make the overlay's committed/tentative distinction visually obvious.
 - Keep the overlay from stealing focus from the target application.
-- Ensure a non-streaming model cleanly falls back to final batch transcription.
+- Ensure a non-streaming model cleanly falls back to final batch transcription. — done 2026-09-03
 
 Acceptance:
 
