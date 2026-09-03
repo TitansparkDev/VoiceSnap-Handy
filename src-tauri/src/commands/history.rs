@@ -139,6 +139,7 @@ pub async fn retry_history_entry_transcription(
             language,
             backend,
             device,
+            Some(processed.cleanup_mode.clone()),
             Some(transcription_total_ms),
             cleanup_total_ms,
         )
@@ -166,6 +167,7 @@ pub async fn retry_history_entry_cleanup(
     let cleanup_started = Instant::now();
     let processed = process_transcription_output(&app, &entry.transcription_text, true).await;
     let cleanup_total_ms = i64::try_from(cleanup_started.elapsed().as_millis()).unwrap_or(i64::MAX);
+    let cleanup_mode = Some(processed.cleanup_mode.clone());
     let cleaned_text = processed
         .post_processed_text
         .filter(|text| !text.trim().is_empty())
@@ -176,6 +178,7 @@ pub async fn retry_history_entry_cleanup(
             id,
             cleaned_text,
             processed.post_process_prompt,
+            cleanup_mode,
             Some(cleanup_total_ms),
         )
         .map(|_| ())

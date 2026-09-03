@@ -459,6 +459,18 @@ pub(crate) struct ProcessedTranscription {
     pub final_text: String,
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
+    pub cleanup_mode: String,
+}
+
+/// Describe the cleanup path requested for a history row without persisting
+/// transcript content or provider secrets. Provider-backed cleanup remains
+/// distinguishable until the dedicated fast/local cleanup modes are added.
+pub(crate) fn resolve_history_cleanup_mode(settings: &AppSettings, post_process: bool) -> String {
+    if post_process {
+        format!("provider:{}", settings.post_process_provider_id)
+    } else {
+        "off".to_string()
+    }
 }
 
 /// Resolve the model used by a history row to a stable engine-family identifier.
@@ -509,6 +521,7 @@ pub(crate) async fn process_transcription_output(
     post_process: bool,
 ) -> ProcessedTranscription {
     let settings = get_settings(app);
+    let cleanup_mode = resolve_history_cleanup_mode(&settings, post_process);
     let mut final_text = transcription.to_string();
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
@@ -546,6 +559,7 @@ pub(crate) async fn process_transcription_output(
         final_text,
         post_processed_text,
         post_process_prompt,
+        cleanup_mode,
     }
 }
 
@@ -911,6 +925,7 @@ impl ShortcutAction for TranscribeAction {
                                     Some(HISTORY_INSERTION_MODE_AT_STOP.to_string()),
                                     history_backend.clone(),
                                     history_device.clone(),
+                                    Some(processed.cleanup_mode.clone()),
                                     Some("success".to_string()),
                                     Some(history_transcription_total_ms),
                                     history_cleanup_total_ms,
@@ -988,6 +1003,10 @@ impl ShortcutAction for TranscribeAction {
                                     Some(HISTORY_INSERTION_MODE_AT_STOP.to_string()),
                                     history_backend,
                                     history_device,
+                                    Some(resolve_history_cleanup_mode(
+                                        &history_settings,
+                                        post_process,
+                                    )),
                                     Some("failure".to_string()),
                                     Some(history_transcription_total_ms),
                                     None,
@@ -1082,10 +1101,10 @@ mod tests {
     use super::{
         build_legacy_prompt, build_system_prompt, complete_unless_cancelled,
         is_blank_transcription, normalize_cleanup_output, parse_structured_cleanup_output,
-        resolve_stream_or_batch, should_use_streaming_overlay, strip_think_block,
-        CLEANUP_OUTPUT_CONTRACT,
+        resolve_history_cleanup_mode, resolve_stream_or_batch, should_use_streaming_overlay,
+        strip_think_block, CLEANUP_OUTPUT_CONTRACT,
     };
-    use crate::settings::OverlayStyle;
+    use crate::settings::{AppSettings, OverlayStyle};
     use std::cell::Cell;
     use std::future;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1104,6 +1123,18 @@ mod tests {
     fn non_blank_transcription_is_kept() {
         assert!(!is_blank_transcription("hello"));
         assert!(!is_blank_transcription("  hello  "));
+    }
+
+    #[test]
+    fn history_cleanup_mode_records_off_or_selected_provider() {
+        let mut settings = AppSettings::default();
+        settings.post_process_provider_id = "openrouter".to_string();
+
+        assert_eq!(resolve_history_cleanup_mode(&settings, false), "off");
+        assert_eq!(
+            resolve_history_cleanup_mode(&settings, true),
+            "provider:openrouter"
+        );
     }
 
     #[test]

@@ -41,6 +41,7 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN outcome TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN transcription_total_ms INTEGER;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN cleanup_total_ms INTEGER;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN cleanup_mode TEXT;"),
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -86,6 +87,8 @@ pub struct HistoryEntry {
     pub backend: Option<String>,
     /// Actual runtime compute device used by the transcription engine.
     pub device: Option<String>,
+    /// Cleanup behavior used for this row: `off` or the selected provider path.
+    pub cleanup_mode: Option<String>,
     /// Persisted session result. Current recording sessions use `success` or `failure`.
     pub outcome: Option<String>,
     /// Safe transcription-stage timing summary for this history row.
@@ -243,6 +246,7 @@ impl HistoryManager {
             insertion_mode: row.get("insertion_mode")?,
             backend: row.get("backend")?,
             device: row.get("device")?,
+            cleanup_mode: row.get("cleanup_mode")?,
             outcome: row.get("outcome")?,
             transcription_total_ms: row.get("transcription_total_ms")?,
             cleanup_total_ms: row.get("cleanup_total_ms")?,
@@ -268,6 +272,7 @@ impl HistoryManager {
         insertion_mode: Option<String>,
         backend: Option<String>,
         device: Option<String>,
+        cleanup_mode: Option<String>,
         outcome: Option<String>,
         transcription_total_ms: Option<i64>,
         cleanup_total_ms: Option<i64>,
@@ -293,11 +298,12 @@ impl HistoryManager {
                 insertion_mode,
                 backend,
                 device,
+                cleanup_mode,
                 outcome,
                 transcription_total_ms,
                 cleanup_total_ms,
                 duration_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 &file_name,
                 timestamp,
@@ -313,6 +319,7 @@ impl HistoryManager {
                 &insertion_mode,
                 &backend,
                 &device,
+                &cleanup_mode,
                 &outcome,
                 transcription_total_ms,
                 cleanup_total_ms,
@@ -337,6 +344,7 @@ impl HistoryManager {
             insertion_mode,
             backend,
             device,
+            cleanup_mode,
             outcome,
             transcription_total_ms,
             cleanup_total_ms,
@@ -370,6 +378,7 @@ impl HistoryManager {
         language: Option<String>,
         backend: Option<String>,
         device: Option<String>,
+        cleanup_mode: Option<String>,
         transcription_total_ms: Option<i64>,
         cleanup_total_ms: Option<i64>,
     ) -> Result<HistoryEntry> {
@@ -384,10 +393,11 @@ impl HistoryManager {
                  language = ?6,
                  backend = ?7,
                  device = ?8,
-                 transcription_total_ms = ?9,
-                 cleanup_total_ms = ?10,
+                 cleanup_mode = ?9,
+                 transcription_total_ms = ?10,
+                 cleanup_total_ms = ?11,
                  outcome = 'success'
-             WHERE id = ?11",
+             WHERE id = ?12",
             params![
                 transcription_text,
                 post_processed_text,
@@ -397,6 +407,7 @@ impl HistoryManager {
                 language,
                 backend,
                 device,
+                cleanup_mode,
                 transcription_total_ms,
                 cleanup_total_ms,
                 id
@@ -409,7 +420,7 @@ impl HistoryManager {
 
         let entry = conn
             .query_row(
-                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, outcome, transcription_total_ms, cleanup_total_ms
+                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms
                  FROM transcription_history WHERE id = ?1",
                 params![id],
                 Self::map_history_entry,
@@ -433,6 +444,7 @@ impl HistoryManager {
         id: i64,
         post_processed_text: String,
         post_process_prompt: Option<String>,
+        cleanup_mode: Option<String>,
         cleanup_total_ms: Option<i64>,
     ) -> Result<HistoryEntry> {
         let conn = self.get_connection()?;
@@ -441,6 +453,7 @@ impl HistoryManager {
             id,
             post_processed_text,
             post_process_prompt,
+            cleanup_mode,
             cleanup_total_ms,
         )?;
 
@@ -462,6 +475,7 @@ impl HistoryManager {
         id: i64,
         post_processed_text: String,
         post_process_prompt: Option<String>,
+        cleanup_mode: Option<String>,
         cleanup_total_ms: Option<i64>,
     ) -> Result<HistoryEntry> {
         let updated = conn.execute(
@@ -469,11 +483,13 @@ impl HistoryManager {
              SET post_processed_text = ?1,
                  post_process_prompt = ?2,
                  post_process_requested = 1,
-                 cleanup_total_ms = ?3
-             WHERE id = ?4",
+                 cleanup_mode = ?3,
+                 cleanup_total_ms = ?4
+             WHERE id = ?5",
             params![
                 post_processed_text,
                 post_process_prompt,
+                cleanup_mode,
                 cleanup_total_ms,
                 id
             ],
@@ -484,7 +500,7 @@ impl HistoryManager {
         }
 
         conn.query_row(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, outcome, transcription_total_ms, cleanup_total_ms
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms
              FROM transcription_history WHERE id = ?1",
             params![id],
             Self::map_history_entry,
@@ -690,7 +706,7 @@ impl HistoryManager {
         };
 
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, outcome, transcription_total_ms, cleanup_total_ms
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms
              FROM transcription_history
              WHERE (?1 IS NULL OR id < ?1)
                AND (
@@ -772,6 +788,7 @@ impl HistoryManager {
                 insertion_mode,
                 backend,
                 device,
+                cleanup_mode,
                 outcome,
                 transcription_total_ms,
                 cleanup_total_ms
@@ -809,6 +826,7 @@ impl HistoryManager {
                 insertion_mode,
                 backend,
                 device,
+                cleanup_mode,
                 outcome,
                 transcription_total_ms,
                 cleanup_total_ms
@@ -873,6 +891,7 @@ impl HistoryManager {
                 insertion_mode,
                 backend,
                 device,
+                cleanup_mode,
                 outcome,
                 transcription_total_ms,
                 cleanup_total_ms
@@ -952,6 +971,7 @@ mod tests {
                 insertion_mode TEXT,
                 backend TEXT,
                 device TEXT,
+                cleanup_mode TEXT,
                 outcome TEXT,
                 transcription_total_ms INTEGER,
                 cleanup_total_ms INTEGER
@@ -1048,6 +1068,7 @@ mod tests {
         assert!(entry.insertion_mode.is_none());
         assert!(entry.backend.is_none());
         assert!(entry.device.is_none());
+        assert!(entry.cleanup_mode.is_none());
         assert!(entry.outcome.is_none());
         assert!(entry.transcription_total_ms.is_none());
         assert!(entry.cleanup_total_ms.is_none());
@@ -1116,6 +1137,22 @@ mod tests {
             .expect("runtime-tagged entry exists");
         assert_eq!(entry.backend.as_deref(), Some("vulkan"));
         assert_eq!(entry.device.as_deref(), Some("gpu-0"));
+    }
+
+    #[test]
+    fn history_entry_preserves_cleanup_mode_metadata() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "cleanup-tagged recording", None);
+        conn.execute(
+            "UPDATE transcription_history SET cleanup_mode = ?1 WHERE timestamp = ?2",
+            params!["provider:openai", 100_i64],
+        )
+        .expect("store cleanup mode metadata");
+
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch cleanup-tagged entry")
+            .expect("cleanup-tagged entry exists");
+        assert_eq!(entry.cleanup_mode.as_deref(), Some("provider:openai"));
     }
 
     #[test]
@@ -1219,6 +1256,7 @@ mod tests {
             1,
             "new cleanup".to_string(),
             Some("new prompt".to_string()),
+            Some("provider:openai".to_string()),
             Some(42),
         )
         .expect("update cleanup without retranscribing");
@@ -1227,6 +1265,7 @@ mod tests {
         assert_eq!(entry.post_processed_text.as_deref(), Some("new cleanup"));
         assert_eq!(entry.post_process_prompt.as_deref(), Some("new prompt"));
         assert!(entry.post_process_requested);
+        assert_eq!(entry.cleanup_mode.as_deref(), Some("provider:openai"));
         assert_eq!(entry.cleanup_total_ms, Some(42));
         assert_eq!(entry.model_id.as_deref(), Some("whisper-large-v3-turbo"));
     }
@@ -1239,6 +1278,7 @@ mod tests {
             99,
             "new cleanup".to_string(),
             None,
+            Some("provider:openai".to_string()),
             Some(10),
         )
         .expect_err("missing history entry should fail");

@@ -635,6 +635,15 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
       : entry.insertion_mode
     : null;
   const runtimeLabel = [entry.backend, entry.device].filter(Boolean).join(" · ") || null;
+  const cleanupModeLabel = entry.cleanup_mode
+    ? entry.cleanup_mode === "off"
+      ? t("settings.history.cleanupNotRequested", {
+          defaultValue: "No cleanup requested",
+        })
+      : entry.cleanup_mode.startsWith("provider:")
+        ? entry.cleanup_mode.slice("provider:".length).replace(/_/g, " ")
+        : entry.cleanup_mode
+    : null;
   const outcomeLabel = entry.outcome
     ? entry.outcome === "success"
       ? t("settings.history.successful", { defaultValue: "Successful" })
@@ -702,6 +711,16 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
               })}
             >
               {runtimeLabel}
+            </span>
+          )}
+          {cleanupModeLabel && (
+            <span
+              className="rounded bg-mid-gray/10 px-1.5 py-0.5 text-[10px] text-text/50"
+              title={t("settings.history.cleanupMode", {
+                defaultValue: "Cleanup mode",
+              })}
+            >
+              {cleanupModeLabel}
             </span>
           )}
           {outcomeLabel && (

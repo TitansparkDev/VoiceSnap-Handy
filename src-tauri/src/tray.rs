@@ -689,6 +689,7 @@ mod tests {
             insertion_mode: None,
             backend: None,
             device: None,
+            cleanup_mode: None,
             outcome: None,
             transcription_total_ms: None,
             cleanup_total_ms: None,

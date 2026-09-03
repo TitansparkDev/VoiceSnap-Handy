@@ -1050,6 +1050,10 @@ backend: string | null;
  */
 device: string | null;
 /**
+ * Cleanup behavior used for this row: `off` or the selected provider path.
+ */
+cleanup_mode: string | null;
+/**
  * Persisted session result. Current recording sessions use `success` or `failure`.
  */
 outcome: string | null;
