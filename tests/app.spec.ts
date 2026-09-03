@@ -71,3 +71,65 @@ test.describe("Handy App", () => {
     expect(html).toContain("<body");
   });
 });
+
+test.describe("Recording overlay", () => {
+  test("renders committed text distinctly from tentative text", async ({ page }) => {
+    await installTauriEventMock(page);
+    await page.goto("/src/overlay/index.html");
+
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (window as unknown as TauriTestWindow).__tauriListenerCount(
+              "show-overlay",
+            ),
+        ),
+      )
+      .toBeGreaterThan(0);
+
+    await page.evaluate(() => {
+      const testWindow = window as unknown as TauriTestWindow;
+      testWindow.__emitTauriEvent("show-overlay", "streaming");
+      testWindow.__emitTauriEvent("stream-text-event", {
+        committed: "Stable committed words",
+        tentative: "provisional suffix",
+      });
+    });
+
+    const committed = page.locator(".stext-cap .committed");
+    const tentative = page.locator(".stext-cap .tentative");
+
+    await expect(committed).toHaveText("Stable committed words ");
+    await expect(tentative).toHaveText("provisional suffix");
+
+    const committedStyle = await committed.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return {
+        color: style.color,
+        fontStyle: style.fontStyle,
+        fontWeight: style.fontWeight,
+        opacity: style.opacity,
+      };
+    });
+    const tentativeStyle = await tentative.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return {
+        color: style.color,
+        fontStyle: style.fontStyle,
+        fontWeight: style.fontWeight,
+        opacity: style.opacity,
+      };
+    });
+
+    expect(committedStyle.color).not.toBe(tentativeStyle.color);
+    expect(committedStyle.fontStyle).toBe("normal");
+    expect(tentativeStyle.fontStyle).toBe("italic");
+    expect(Number(tentativeStyle.opacity)).toBeLessThan(
+      Number(committedStyle.opacity),
+    );
+    expect(Number(committedStyle.fontWeight)).toBeGreaterThan(
+      Number(tentativeStyle.fontWeight),
+    );
+  });
+});
