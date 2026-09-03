@@ -337,6 +337,61 @@ impl HistoryManager {
         Ok(entry)
     }
 
+    fn update_post_processing_with_conn(
+        conn: &Connection,
+        id: i64,
+        post_processed_text: Option<String>,
+        post_process_prompt: Option<String>,
+    ) -> Result<HistoryEntry> {
+        let updated = conn.execute(
+            "UPDATE transcription_history
+             SET post_processed_text = ?1,
+                 post_process_prompt = ?2,
+                 post_process_requested = 1
+             WHERE id = ?3",
+            params![post_processed_text, post_process_prompt, id],
+        )?;
+
+        if updated == 0 {
+            return Err(anyhow!("History entry {} not found", id));
+        }
+
+        conn.query_row(
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, model_id
+             FROM transcription_history WHERE id = ?1",
+            params![id],
+            Self::map_history_entry,
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn update_post_processing(
+        &self,
+        id: i64,
+        post_processed_text: Option<String>,
+        post_process_prompt: Option<String>,
+    ) -> Result<HistoryEntry> {
+        let conn = self.get_connection()?;
+        let entry = Self::update_post_processing_with_conn(
+            &conn,
+            id,
+            post_processed_text,
+            post_process_prompt,
+        )?;
+
+        debug!("Updated post-processing for history entry {}", id);
+
+        if let Err(e) = (HistoryUpdatePayload::Updated {
+            entry: entry.clone(),
+        })
+        .emit(&self.app_handle)
+        {
+            error!("Failed to emit history-updated event: {}", e);
+        }
+
+        Ok(entry)
+    }
+
     pub fn cleanup_old_entries(&self) -> Result<()> {
         let retention_period = crate::settings::get_recording_retention_period(&self.app_handle);
 
@@ -466,9 +521,10 @@ impl HistoryManager {
         end_timestamp_exclusive: Option<i64>,
         model_filter: Option<&str>,
         outcome_filter: Option<&str>,
+        cleanup_filter: Option<&str>,
     ) -> Result<PaginatedHistory> {
         let conn = self.get_connection()?;
-        Self::get_history_entries_with_conn(
+        Self::get_history_entries_filtered_with_conn(
             &conn,
             cursor,
             limit,
@@ -477,6 +533,7 @@ impl HistoryManager {
             end_timestamp_exclusive,
             model_filter,
             outcome_filter,
+            cleanup_filter,
         )
     }
 
@@ -490,6 +547,30 @@ impl HistoryManager {
         model_filter: Option<&str>,
         outcome_filter: Option<&str>,
     ) -> Result<PaginatedHistory> {
+        Self::get_history_entries_filtered_with_conn(
+            conn,
+            cursor,
+            limit,
+            search,
+            start_timestamp,
+            end_timestamp_exclusive,
+            model_filter,
+            outcome_filter,
+            None,
+        )
+    }
+
+    fn get_history_entries_filtered_with_conn(
+        conn: &Connection,
+        cursor: Option<i64>,
+        limit: Option<usize>,
+        search: Option<&str>,
+        start_timestamp: Option<i64>,
+        end_timestamp_exclusive: Option<i64>,
+        model_filter: Option<&str>,
+        outcome_filter: Option<&str>,
+        cleanup_filter: Option<&str>,
+    ) -> Result<PaginatedHistory> {
         let limit = limit.map(|l| l.min(100));
         let fetch_count = limit
             .map(|lim| lim.saturating_add(1) as i64)
@@ -500,6 +581,12 @@ impl HistoryManager {
             Some("success") => Some(true),
             Some("failure") => Some(false),
             Some(value) => return Err(anyhow!("Invalid history outcome filter: {value}")),
+        };
+        let cleanup_filter = match cleanup_filter {
+            None => None,
+            Some("requested") => Some(true),
+            Some("not_requested") => Some(false),
+            Some(value) => return Err(anyhow!("Invalid history cleanup filter: {value}")),
         };
 
         let mut stmt = conn.prepare(
@@ -519,8 +606,9 @@ impl HistoryManager {
                     OR (?6 = 1 AND transcription_text != '')
                     OR (?6 = 0 AND transcription_text = '')
                )
+               AND (?7 IS NULL OR post_process_requested = ?7)
              ORDER BY id DESC
-             LIMIT ?7",
+             LIMIT ?8",
         )?;
         let mut entries = stmt
             .query_map(
@@ -531,6 +619,7 @@ impl HistoryManager {
                     end_timestamp_exclusive,
                     model_filter,
                     outcome_filter,
+                    cleanup_filter,
                     fetch_count
                 ],
                 Self::map_history_entry,
@@ -850,6 +939,36 @@ mod tests {
     }
 
     #[test]
+    fn retry_cleanup_updates_only_post_processing_fields() {
+        let conn = setup_conn();
+        insert_entry_with_model(
+            &conn,
+            100,
+            "raw transcript",
+            Some("old cleanup"),
+            Some("whisper-large-v3-turbo"),
+        );
+        let id = conn.last_insert_rowid();
+
+        let updated = HistoryManager::update_post_processing_with_conn(
+            &conn,
+            id,
+            Some("new cleanup".to_string()),
+            Some("new prompt".to_string()),
+        )
+        .expect("update cleanup without retranscribing");
+
+        assert_eq!(updated.transcription_text, "raw transcript");
+        assert_eq!(updated.post_processed_text.as_deref(), Some("new cleanup"));
+        assert_eq!(updated.post_process_prompt.as_deref(), Some("new prompt"));
+        assert!(updated.post_process_requested);
+        assert_eq!(
+            updated.model_id.as_deref(),
+            Some("whisper-large-v3-turbo")
+        );
+    }
+
+    #[test]
     fn history_search_matches_raw_and_final_text_case_insensitively() {
         let conn = setup_conn();
         insert_entry(&conn, 100, "Alpha raw phrase", None);
@@ -1061,6 +1180,68 @@ mod tests {
         .expect("filter failed history");
         assert_eq!(failed.entries.len(), 1);
         assert_eq!(failed.entries[0].timestamp, 200);
+    }
+
+    #[test]
+    fn history_cleanup_filter_uses_requested_state_and_combines_with_outcome() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "successful cleaned", Some("cleaned text"));
+        insert_entry(&conn, 200, "successful raw", None);
+        insert_entry(&conn, 300, "", None);
+        conn.execute(
+            "UPDATE transcription_history SET post_process_requested = 1 WHERE timestamp IN (?1, ?2)",
+            params![100_i64, 300_i64],
+        )
+        .expect("mark cleanup requested entries");
+
+        let requested_success = HistoryManager::get_history_entries_filtered_with_conn(
+            &conn,
+            None,
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+            Some("success"),
+            Some("requested"),
+        )
+        .expect("filter cleanup-requested successful history");
+        assert_eq!(requested_success.entries.len(), 1);
+        assert_eq!(requested_success.entries[0].timestamp, 100);
+
+        let not_requested = HistoryManager::get_history_entries_filtered_with_conn(
+            &conn,
+            None,
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+            Some("success"),
+            Some("not_requested"),
+        )
+        .expect("filter history without cleanup requested");
+        assert_eq!(not_requested.entries.len(), 1);
+        assert_eq!(not_requested.entries[0].timestamp, 200);
+    }
+
+    #[test]
+    fn history_cleanup_filter_rejects_unknown_values() {
+        let conn = setup_conn();
+        let error = HistoryManager::get_history_entries_filtered_with_conn(
+            &conn,
+            None,
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("unknown"),
+        )
+        .expect_err("reject unknown history cleanup filter");
+
+        assert!(error.to_string().contains("Invalid history cleanup filter"));
     }
 
     #[test]

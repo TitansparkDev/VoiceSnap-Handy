@@ -18,6 +18,7 @@ pub async fn get_history_entries(
     end_timestamp_exclusive: Option<i64>,
     model_filter: Option<String>,
     outcome_filter: Option<String>,
+    cleanup_filter: Option<String>,
 ) -> Result<PaginatedHistory, String> {
     history_manager
         .get_history_entries(
@@ -28,6 +29,7 @@ pub async fn get_history_entries(
             end_timestamp_exclusive,
             model_filter.as_deref(),
             outcome_filter.as_deref(),
+            cleanup_filter.as_deref(),
         )
         .await
         .map_err(|e| e.to_string())
@@ -119,6 +121,38 @@ pub async fn retry_history_entry_transcription(
             processed.post_processed_text,
             processed.post_process_prompt,
             model_id,
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn retry_history_entry_cleanup(
+    app: AppHandle,
+    history_manager: State<'_, Arc<HistoryManager>>,
+    id: i64,
+) -> Result<(), String> {
+    let entry = history_manager
+        .get_entry_by_id(id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("History entry {} not found", id))?;
+
+    if entry.transcription_text.trim().is_empty() {
+        return Err("Cannot retry cleanup without a transcription".to_string());
+    }
+
+    let processed = process_transcription_output(&app, &entry.transcription_text, true).await;
+    let Some(cleaned_text) = processed.post_processed_text else {
+        return Err("Post-processing did not produce a cleaned transcript".to_string());
+    };
+
+    history_manager
+        .update_post_processing(
+            id,
+            Some(cleaned_text),
+            processed.post_process_prompt,
         )
         .map(|_| ())
         .map_err(|e| e.to_string())

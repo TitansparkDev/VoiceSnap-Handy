@@ -1,7 +1,15 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { readFile } from "@tauri-apps/plugin-fs";
-import { Check, Copy, FolderOpen, RotateCcw, Star, Trash2 } from "lucide-react";
+import {
+  Check,
+  Copy,
+  FolderOpen,
+  RotateCcw,
+  Sparkles,
+  Star,
+  Trash2,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import {
@@ -81,6 +89,7 @@ export const HistorySettings: React.FC = () => {
   const [endDate, setEndDate] = useState("");
   const [modelFilter, setModelFilter] = useState("");
   const [outcomeFilter, setOutcomeFilter] = useState("");
+  const [cleanupFilter, setCleanupFilter] = useState("");
   const [modelOptions, setModelOptions] = useState<
     Array<{ id: string; name: string }>
   >([]);
@@ -115,6 +124,7 @@ export const HistorySettings: React.FC = () => {
           localMidnightTimestamp(endDate, 1),
           modelFilter || null,
           outcomeFilter || null,
+          cleanupFilter || null,
         );
         if (generation !== requestGenerationRef.current) {
           return;
@@ -139,7 +149,7 @@ export const HistorySettings: React.FC = () => {
         }
       }
     },
-    [searchTerm, startDate, endDate, modelFilter, outcomeFilter],
+    [searchTerm, startDate, endDate, modelFilter, outcomeFilter, cleanupFilter],
   );
 
   useEffect(() => {
@@ -195,7 +205,14 @@ export const HistorySettings: React.FC = () => {
     const unlisten = events.historyUpdatePayload.listen((event) => {
       const payload: HistoryUpdatePayload = event.payload;
       if (payload.action === "added" || payload.action === "updated") {
-        if (searchTerm || startDate || endDate || modelFilter || outcomeFilter) {
+        if (
+          searchTerm ||
+          startDate ||
+          endDate ||
+          modelFilter ||
+          outcomeFilter ||
+          cleanupFilter
+        ) {
           // Re-run server-side filters so unrelated live updates never leak
           // into an active filtered result set.
           void loadPage();
@@ -214,7 +231,15 @@ export const HistorySettings: React.FC = () => {
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [loadPage, searchTerm, startDate, endDate, modelFilter, outcomeFilter]);
+  }, [
+    loadPage,
+    searchTerm,
+    startDate,
+    endDate,
+    modelFilter,
+    outcomeFilter,
+    cleanupFilter,
+  ]);
 
   const toggleSaved = async (id: number) => {
     // Optimistic update
@@ -289,6 +314,10 @@ export const HistorySettings: React.FC = () => {
     }
   };
 
+  const retryHistoryEntryCleanup = async (id: number) => {
+    await invoke<void>("retry_history_entry_cleanup", { id });
+  };
+
   const openRecordingsFolder = async () => {
     try {
       const result = await commands.openRecordingsFolder();
@@ -301,7 +330,12 @@ export const HistorySettings: React.FC = () => {
   };
 
   const hasActiveFilters = Boolean(
-    searchTerm || startDate || endDate || modelFilter || outcomeFilter,
+    searchTerm ||
+      startDate ||
+      endDate ||
+      modelFilter ||
+      outcomeFilter ||
+      cleanupFilter,
   );
 
   let content: React.ReactNode;
@@ -336,6 +370,7 @@ export const HistorySettings: React.FC = () => {
                 getAudioUrl={getAudioUrl}
                 deleteAudio={deleteAudioEntry}
                 retryTranscription={retryHistoryEntry}
+                retryCleanup={retryHistoryEntryCleanup}
               />
             ))}
           </div>
@@ -406,6 +441,30 @@ export const HistorySettings: React.FC = () => {
               </select>
             </label>
             <label className="mt-2 block text-[10px] font-medium uppercase tracking-wide text-text/45">
+              {t("settings.history.cleanupFilter", { defaultValue: "Cleanup" })}
+              <select
+                value={cleanupFilter}
+                onChange={(event) => setCleanupFilter(event.target.value)}
+                className="mt-1 block w-full rounded-md border border-mid-gray/20 bg-background px-2 py-1.5 text-sm font-normal normal-case tracking-normal text-text outline-none transition-colors focus:border-logo-primary/60"
+              >
+                <option value="">
+                  {t("settings.history.allCleanupStates", {
+                    defaultValue: "All cleanup states",
+                  })}
+                </option>
+                <option value="requested">
+                  {t("settings.history.cleanupRequested", {
+                    defaultValue: "Cleanup requested",
+                  })}
+                </option>
+                <option value="not_requested">
+                  {t("settings.history.cleanupNotRequested", {
+                    defaultValue: "No cleanup requested",
+                  })}
+                </option>
+              </select>
+            </label>
+            <label className="mt-2 block text-[10px] font-medium uppercase tracking-wide text-text/45">
               {t("settings.history.outcomeFilter", { defaultValue: "Outcome" })}
               <select
                 value={outcomeFilter}
@@ -444,6 +503,7 @@ interface HistoryEntryProps {
   getAudioUrl: (fileName: string) => Promise<string | null>;
   deleteAudio: (id: number) => Promise<void>;
   retryTranscription: (id: number) => Promise<void>;
+  retryCleanup: (id: number) => Promise<void>;
 }
 
 const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
@@ -453,10 +513,12 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   getAudioUrl,
   deleteAudio,
   retryTranscription,
+  retryCleanup,
 }) => {
   const { t, i18n } = useTranslation();
   const [showCopied, setShowCopied] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  const [cleaning, setCleaning] = useState(false);
 
   const rawText = entry.transcription_text.trim();
   const finalText = entry.post_processed_text?.trim() ?? "";
@@ -500,6 +562,23 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
     }
   };
 
+  const handleRetryCleanup = async () => {
+    try {
+      setCleaning(true);
+      await retryCleanup(entry.id);
+    } catch (error) {
+      console.error("Failed to retry cleanup:", error);
+      toast.error(
+        t("settings.history.recleanError", {
+          defaultValue: "Failed to retry cleanup.",
+        }),
+      );
+    } finally {
+      setCleaning(false);
+    }
+  };
+
+  const busy = retrying || cleaning;
   const formattedDate = formatDateTime(String(entry.timestamp), i18n.language);
 
   return (
@@ -509,7 +588,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
         <div className="flex items-center">
           <IconButton
             onClick={handleCopyText}
-            disabled={!hasTranscription || retrying}
+            disabled={!hasTranscription || busy}
             title={t("settings.history.copyToClipboard")}
           >
             {showCopied ? (
@@ -520,7 +599,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
           </IconButton>
           <IconButton
             onClick={onToggleSaved}
-            disabled={retrying}
+            disabled={busy}
             active={entry.saved}
             title={
               entry.saved
@@ -536,7 +615,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
           </IconButton>
           <IconButton
             onClick={handleRetranscribe}
-            disabled={retrying}
+            disabled={busy}
             title={t("settings.history.retranscribe")}
           >
             <RotateCcw
@@ -550,8 +629,25 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
             />
           </IconButton>
           <IconButton
+            onClick={handleRetryCleanup}
+            disabled={!hasTranscription || busy}
+            title={t("settings.history.reclean", {
+              defaultValue: "Retry cleanup",
+            })}
+          >
+            <Sparkles
+              width={16}
+              height={16}
+              style={
+                cleaning
+                  ? { animation: "spin 1s linear infinite reverse" }
+                  : undefined
+              }
+            />
+          </IconButton>
+          <IconButton
             onClick={handleDeleteEntry}
-            disabled={retrying}
+            disabled={busy}
             title={t("settings.history.delete")}
           >
             <Trash2 width={16} height={16} />
