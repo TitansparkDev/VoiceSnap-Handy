@@ -259,7 +259,24 @@ async fn wait_until_healthy(
     provider: &PostProcessProvider,
     generation: u64,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + LOCAL_RUNTIME_STARTUP_TIMEOUT;
+    wait_until_healthy_with_timing(
+        supervisor,
+        provider,
+        generation,
+        LOCAL_RUNTIME_STARTUP_TIMEOUT,
+        LOCAL_RUNTIME_HEALTH_POLL,
+    )
+    .await
+}
+
+async fn wait_until_healthy_with_timing(
+    supervisor: &RuntimeSupervisor,
+    provider: &PostProcessProvider,
+    generation: u64,
+    startup_timeout: Duration,
+    health_poll: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + startup_timeout;
     loop {
         {
             let mut state = supervisor.lock_state();
@@ -281,10 +298,10 @@ async fn wait_until_healthy(
         if Instant::now() >= deadline {
             return Err(format!(
                 "timed out after {:?} waiting for the local cleanup runtime health endpoint",
-                LOCAL_RUNTIME_STARTUP_TIMEOUT
+                startup_timeout
             ));
         }
-        tokio::time::sleep(LOCAL_RUNTIME_HEALTH_POLL).await;
+        tokio::time::sleep(health_poll).await;
     }
 }
 
@@ -400,6 +417,101 @@ fn derive_llama_cpu_args(primary: &[String]) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
+
+    const TEST_CHILD_MODE_ENV: &str = "HANDY_LOCAL_CLEANUP_TEST_CHILD_MODE";
+
+    fn test_provider(base_url: &str) -> PostProcessProvider {
+        PostProcessProvider {
+            id: LOCAL_CLEANUP_PROVIDER_ID.to_string(),
+            label: "Local cleanup test".to_string(),
+            base_url: base_url.to_string(),
+            allow_base_url_edit: false,
+            models_endpoint: None,
+            supports_structured_output: false,
+        }
+    }
+
+    fn spawn_fixture_child(mode: &str) -> Child {
+        Command::new(std::env::current_exe().expect("test executable path"))
+            .arg("local_cleanup_child_fixture")
+            .arg("--nocapture")
+            .env(TEST_CHILD_MODE_ENV, mode)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn local cleanup fixture child")
+    }
+
+    #[test]
+    fn local_cleanup_child_fixture() {
+        match std::env::var(TEST_CHILD_MODE_ENV).as_deref() {
+            Ok("wait") => thread::sleep(Duration::from_secs(30)),
+            Ok("exit") => {}
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn bounded_startup_health_wait_times_out() {
+        let supervisor = RuntimeSupervisor::new();
+        let provider = test_provider("http://127.0.0.1:1");
+        let started = Instant::now();
+        let result = tauri::async_runtime::block_on(wait_until_healthy_with_timing(
+            &supervisor,
+            &provider,
+            1,
+            Duration::from_millis(30),
+            Duration::from_millis(1),
+        ));
+
+        let error = result.expect_err("unhealthy runtime must time out");
+        assert!(error.contains("timed out after"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn startup_cancellation_guard_kills_and_reaps_managed_child() {
+        let supervisor = RuntimeSupervisor::new();
+        let child = spawn_fixture_child("wait");
+        supervisor.lock_state().child = Some(ManagedChild {
+            child,
+            label: "test",
+            generation: 7,
+        });
+
+        let started = Instant::now();
+        {
+            let _guard = StartupChildGuard {
+                supervisor: &supervisor,
+                armed: true,
+            };
+        }
+
+        assert!(supervisor.lock_state().child.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn exited_runtime_is_reaped_before_reuse() {
+        let mut child = spawn_fixture_child("exit");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while child.try_wait().expect("inspect fixture child").is_none() {
+            assert!(Instant::now() < deadline, "fixture child did not exit");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut state = RuntimeState {
+            child: Some(ManagedChild {
+                child,
+                label: "test",
+                generation: 9,
+            }),
+        };
+        assert!(state.reap_exited().expect("reap exited runtime"));
+        assert!(state.child.is_none());
+    }
 
     #[test]
     fn derives_cpu_fallback_for_common_llama_gpu_flags() {
