@@ -35,17 +35,13 @@
 // tests), but only the macOS/Windows platform modules consume all of it.
 #![cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 
+use std::fmt;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
-
-#[cfg(target_os = "macos")]
-use macos as platform;
-#[cfg(target_os = "windows")]
-use windows as platform;
 
 /// How long after the *last* observed read the transcript stays on the
 /// clipboard before restoring. Covers applications that read the clipboard
@@ -61,6 +57,34 @@ pub(crate) const RESTORE_TIMEOUT: Duration = Duration::from_secs(8);
 /// When the chord could not be injected at all, no legitimate receipt can
 /// arrive, so restore quickly instead of waiting out the full timeout.
 pub(crate) const FAILED_INJECTION_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Why the receipt-sequenced path could not complete. Most setup failures may
+/// safely fall back to the legacy clipboard path. Windows input-injection
+/// failures are different: the legacy path uses the same synthetic input APIs,
+/// so retrying would obscure the actionable UIPI / integrity-level diagnosis.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ReliablePasteError {
+    Unavailable(String),
+    WindowsInputBlocked(String),
+}
+
+impl ReliablePasteError {
+    pub(crate) fn allows_legacy_fallback(&self) -> bool {
+        matches!(self, Self::Unavailable(_))
+    }
+}
+
+impl fmt::Display for ReliablePasteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(error) => write!(f, "{error}"),
+            Self::WindowsInputBlocked(error) => write!(
+                f,
+                "Windows did not accept the synthetic paste input ({error}). This can happen when the target runs at a higher integrity level (UIPI). Clipboard ownership was preserved; run Handy at the same integrity level as the target or paste manually."
+            ),
+        }
+    }
+}
 
 /// Shared, cross-thread record of one paste transaction.
 #[derive(Debug)]
@@ -80,6 +104,9 @@ pub(crate) struct TxState {
     /// A newer paste transaction settled this one early (see flush logic in
     /// the platform modules).
     pub cancelled: bool,
+    /// Exactly one thread may claim settlement. This prevents a timer tick and
+    /// a synchronous failure/flush path from both restoring the clipboard.
+    pub settled: bool,
     /// The post-paste Enter (auto-submit) has been sent for this transaction.
     /// (Read on Windows; the macOS path settles via `MacPending::settled`.)
     #[allow(dead_code)]
@@ -97,6 +124,7 @@ impl TxState {
             receipts: Vec::new(),
             ownership_lost: false,
             cancelled: false,
+            settled: false,
             auto_submit_sent: false,
             logged_receipt: false,
         }
@@ -126,6 +154,17 @@ impl TxState {
     pub fn any_receipt_after_injection(&self) -> bool {
         self.last_receipt_after_injection().is_some()
     }
+
+    /// Claims responsibility for settling this transaction. A second caller
+    /// loses the claim and must not touch the clipboard.
+    pub fn claim_settlement(&mut self) -> bool {
+        if self.settled {
+            false
+        } else {
+            self.settled = true;
+            true
+        }
+    }
 }
 
 pub(crate) enum WaitDecision {
@@ -145,7 +184,7 @@ pub(crate) fn may_restore(state: &TxState, published_sequence: u32, current_sequ
 /// Pure decision: given the current transaction state, keep waiting for the
 /// target to read, or finish now. Both platform event loops call this.
 pub(crate) fn evaluate(state: &TxState, now: Instant) -> WaitDecision {
-    if state.ownership_lost || state.cancelled {
+    if state.ownership_lost || state.cancelled || state.settled {
         return WaitDecision::Finish;
     }
     if let Some(last) = state.last_receipt_after_injection() {
@@ -212,16 +251,33 @@ pub(crate) fn try_reliable_paste(
     auto_submit: bool,
     auto_submit_key: crate::settings::AutoSubmitKey,
     clipboard_handling: crate::settings::ClipboardHandling,
-) -> Result<(), String> {
-    platform::run(
-        text,
-        app_handle,
-        paste_method,
-        enigo,
-        auto_submit,
-        auto_submit_key,
-        clipboard_handling,
-    )
+) -> Result<(), ReliablePasteError> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::run(
+            text,
+            app_handle,
+            paste_method,
+            enigo,
+            auto_submit,
+            auto_submit_key,
+            clipboard_handling,
+        )
+        .map_err(ReliablePasteError::Unavailable)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        windows::run(
+            text,
+            app_handle,
+            paste_method,
+            enigo,
+            auto_submit,
+            auto_submit_key,
+            clipboard_handling,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -298,6 +354,14 @@ mod tests {
     fn app_exit_or_explicit_cancellation_finishes_immediately() {
         let mut s = state_after_publish(Duration::from_millis(10));
         s.cancelled = true;
+        assert!(matches!(evaluate(&s, Instant::now()), WaitDecision::Finish));
+    }
+
+    #[test]
+    fn settlement_can_only_be_claimed_once() {
+        let mut s = state_after_publish(Duration::from_millis(10));
+        assert!(s.claim_settlement());
+        assert!(!s.claim_settlement());
         assert!(matches!(evaluate(&s, Instant::now()), WaitDecision::Finish));
     }
 

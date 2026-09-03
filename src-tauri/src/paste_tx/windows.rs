@@ -26,7 +26,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
 
-use super::{evaluate, may_restore, send_chord, TxState, WaitDecision};
+use super::{evaluate, may_restore, send_chord, ReliablePasteError, TxState, WaitDecision};
 use crate::clipboard::send_return_key;
 use crate::input::EnigoState;
 use crate::settings::{AutoSubmitKey, ClipboardHandling, PasteMethod};
@@ -251,27 +251,23 @@ fn flush_pending() {
     let Some(previous) = previous else {
         return;
     };
-    let receipt = {
+    let (receipt, claimed_settlement) = {
         let mut st = match previous.state.lock() {
             Ok(st) => st,
             Err(_) => return,
         };
         st.cancelled = true;
-        st.any_receipt_after_injection()
+        let receipt = st.any_receipt_after_injection();
+        (receipt, st.claim_settlement())
     };
+    if !claimed_settlement {
+        return;
+    }
     if previous.auto_submit && receipt {
         send_auto_submit(&previous);
     }
     let sequence = *previous.sequence.lock().unwrap();
-    let current_sequence = unsafe { GetClipboardSequenceNumber() };
-    let still_ours = previous
-        .state
-        .lock()
-        .map(|st| may_restore(&st, sequence, current_sequence))
-        .unwrap_or(false);
-    if still_ours {
-        unsafe { settle_clipboard(&previous) };
-    } else {
+    if !unsafe { settle_clipboard(&previous, sequence) } {
         discard_saved_bitmap(&previous);
     }
 }
@@ -283,25 +279,75 @@ pub(super) fn shutdown_pending() {
     flush_pending();
 }
 
-/// Settle-time clipboard handling once we know we still own the clipboard:
-/// restore the snapshot, or — for ClipboardHandling::CopyToClipboard — replace
-/// the concealed promise with plain transcript text, so clipboard history and
-/// managers record it and it survives this transaction's window going away.
-unsafe fn settle_clipboard(shared: &WinTxShared) {
-    if !shared.preserve_transcript {
-        restore_snapshot(shared);
-        discard_saved_bitmap(shared);
+fn clear_pending_if_same(shared: &WinTxShared) {
+    if let Ok(mut slot) = PENDING.lock() {
+        let is_us = slot
+            .as_ref()
+            .map(|pending| Arc::as_ptr(pending) as *const WinTxShared == shared as *const _)
+            .unwrap_or(false);
+        if is_us {
+            *slot = None;
+        }
+    }
+}
+
+/// A failed SendInput/enigo chord on Windows is commonly UIPI: a normal-integrity
+/// Handy cannot inject into an elevated target. Settle synchronously so the
+/// caller gets an actionable error only after the original clipboard has been
+/// restored when still owned by this transaction. If a newer owner already won,
+/// the sequence fence leaves that clipboard content untouched.
+fn abort_after_input_failure(shared: &WinTxShared) {
+    let claimed_settlement = {
+        let mut st = match shared.state.lock() {
+            Ok(st) => st,
+            Err(_) => return,
+        };
+        st.injection_failed = true;
+        st.cancelled = true;
+        st.claim_settlement()
+    };
+
+    clear_pending_if_same(shared);
+    if !claimed_settlement {
         return;
+    }
+
+    let sequence = *shared.sequence.lock().unwrap();
+    if !unsafe { restore_snapshot_if_current(shared, sequence) } {
+        info!("[reliable-paste] input failed after clipboard changed externally; leaving newer content untouched");
+    }
+    discard_saved_bitmap(shared);
+}
+
+/// Settle-time clipboard handling. The sequence/ownership fence is checked
+/// *after* opening the clipboard; once it is open no newer owner can slip in
+/// between the check and EmptyClipboard/restore.
+unsafe fn settle_clipboard(shared: &WinTxShared, expected_sequence: u32) -> bool {
+    if !shared.preserve_transcript {
+        let restored = restore_snapshot_if_current(shared, expected_sequence);
+        discard_saved_bitmap(shared);
+        return restored;
     }
     if OpenClipboard(None).is_err() {
         warn!("[reliable-paste] could not open clipboard to leave transcript");
-        return;
+        return false;
+    }
+    let current_sequence = GetClipboardSequenceNumber();
+    let still_ours = shared
+        .state
+        .lock()
+        .map(|st| may_restore(&st, expected_sequence, current_sequence))
+        .unwrap_or(false);
+    if !still_ours {
+        let _ = CloseClipboard();
+        return false;
     }
     let _ = EmptyClipboard();
     render_text(shared);
     let _ = CloseClipboard();
     discard_saved_bitmap(shared);
     info!("[reliable-paste] left transcript on clipboard as plain text");
+    true
 }
 
 /// Restores the snapshotted clipboard contents while the clipboard is already
@@ -338,15 +384,28 @@ unsafe fn restore_snapshot_open(shared: &WinTxShared) {
     }
 }
 
-/// Restores the snapshotted clipboard contents. Safe to call from any thread.
-unsafe fn restore_snapshot(shared: &WinTxShared) {
+/// Restores the snapshotted clipboard only while this transaction is still the
+/// current clipboard owner. The sequence check happens while the clipboard is
+/// open, closing the check-then-open race against a newer user copy.
+unsafe fn restore_snapshot_if_current(shared: &WinTxShared, expected_sequence: u32) -> bool {
     if OpenClipboard(None).is_err() {
         warn!("[reliable-paste] could not open clipboard to restore");
-        return;
+        return false;
+    }
+    let current_sequence = GetClipboardSequenceNumber();
+    let still_ours = shared
+        .state
+        .lock()
+        .map(|st| may_restore(&st, expected_sequence, current_sequence))
+        .unwrap_or(false);
+    if !still_ours {
+        let _ = CloseClipboard();
+        return false;
     }
     restore_snapshot_open(shared);
     let _ = CloseClipboard();
     info!("[reliable-paste] restored previous clipboard");
+    true
 }
 
 unsafe fn copy_hglobal_medium(data_object: &IDataObject, format: u32) -> Option<Vec<u8>> {
@@ -563,17 +622,27 @@ fn on_timer(_hwnd: HWND, shared: &WinTxShared) {
         return;
     }
 
-    let (receipt, ownership_lost, injection_failed) = {
-        let st = match shared.state.lock() {
+    let (receipt, ownership_lost, injection_failed, claimed_settlement) = {
+        let mut st = match shared.state.lock() {
             Ok(st) => st,
             Err(_) => return,
         };
+        let receipt = st.any_receipt_after_injection();
+        let ownership_lost = st.ownership_lost;
+        let injection_failed = st.injection_failed;
+        let claimed_settlement = st.claim_settlement();
         (
-            st.any_receipt_after_injection(),
-            st.ownership_lost,
-            st.injection_failed,
+            receipt,
+            ownership_lost,
+            injection_failed,
+            claimed_settlement,
         )
     };
+    if !claimed_settlement {
+        clear_pending_if_same(shared);
+        unsafe { PostQuitMessage(0) };
+        return;
+    }
     if ownership_lost {
         info!("[reliable-paste] settling: clipboard ownership lost");
     } else if receipt {
@@ -591,28 +660,12 @@ fn on_timer(_hwnd: HWND, shared: &WinTxShared) {
     }
 
     let sequence = *shared.sequence.lock().unwrap();
-    let current_sequence = unsafe { GetClipboardSequenceNumber() };
-    let still_ours = shared
-        .state
-        .lock()
-        .map(|st| may_restore(&st, sequence, current_sequence))
-        .unwrap_or(false);
-    if still_ours {
-        unsafe { settle_clipboard(shared) };
-    } else {
+    if !unsafe { settle_clipboard(shared, sequence) } {
         discard_saved_bitmap(shared);
         info!("[reliable-paste] clipboard changed externally; leaving it untouched");
     }
 
-    if let Ok(mut slot) = PENDING.lock() {
-        let is_us = slot
-            .as_ref()
-            .map(|pending| Arc::as_ptr(pending) as *const WinTxShared == shared as *const _)
-            .unwrap_or(false);
-        if is_us {
-            *slot = None;
-        }
-    }
+    clear_pending_if_same(shared);
 
     unsafe {
         PostQuitMessage(0);
@@ -717,7 +770,7 @@ pub(super) fn run(
     auto_submit: bool,
     auto_submit_key: AutoSubmitKey,
     clipboard_handling: ClipboardHandling,
-) -> Result<(), String> {
+) -> Result<(), ReliablePasteError> {
     let shared = Arc::new(WinTxShared {
         state: Mutex::new(TxState::new()),
         text: text.to_string(),
@@ -738,8 +791,12 @@ pub(super) fn run(
     // why it could not) before injecting the chord.
     match ready_rx.recv() {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err("reliable paste worker died before publishing".to_string()),
+        Ok(Err(e)) => return Err(ReliablePasteError::Unavailable(e)),
+        Err(_) => {
+            return Err(ReliablePasteError::Unavailable(
+                "reliable paste worker died before publishing".to_string(),
+            ))
+        }
     }
     info!("[reliable-paste] published transcript (delayed render)");
 
@@ -751,12 +808,155 @@ pub(super) fn run(
             info!("[reliable-paste] paste chord sent ({paste_method:?})");
         }
         Err(e) => {
-            // Keep the transaction alive: the worker restores the clipboard
-            // after the short failed-injection timeout.
-            shared.state.lock().unwrap().injection_failed = true;
             error!("[reliable-paste] failed to send paste chord: {e}");
+            abort_after_input_failure(&shared);
+            return Err(ReliablePasteError::WindowsInputBlocked(e));
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STRESS_CYCLES: usize = 1_000;
+
+    #[derive(Debug)]
+    struct HarnessClipboard {
+        contents: String,
+        sequence: u32,
+    }
+
+    impl HarnessClipboard {
+        fn new(contents: impl Into<String>) -> Self {
+            Self {
+                contents: contents.into(),
+                sequence: 1,
+            }
+        }
+
+        fn replace(&mut self, contents: impl Into<String>) {
+            self.contents = contents.into();
+            self.sequence = self.sequence.wrapping_add(1);
+        }
+    }
+
+    struct HarnessTx {
+        snapshot: String,
+        published_sequence: u32,
+        state: TxState,
+    }
+
+    impl HarnessTx {
+        fn publish(clipboard: &mut HarnessClipboard, transcript: String) -> Self {
+            let snapshot = clipboard.contents.clone();
+            clipboard.replace(transcript);
+            let mut state = TxState::new();
+            state.injected_at = Some(Instant::now());
+            Self {
+                snapshot,
+                published_sequence: clipboard.sequence,
+                state,
+            }
+        }
+
+        fn settle(&mut self, clipboard: &mut HarnessClipboard) -> bool {
+            self.state.cancelled = true;
+            assert!(
+                self.state.claim_settlement(),
+                "transaction settlement leaked or was claimed twice"
+            );
+            let can_restore = may_restore(&self.state, self.published_sequence, clipboard.sequence);
+            if can_restore {
+                clipboard.replace(self.snapshot.clone());
+            }
+            can_restore
+        }
+    }
+
+    #[test]
+    fn windows_stress_harness_runs_thousand_paste_restore_cycles() {
+        let mut clipboard = HarnessClipboard::new("initial");
+
+        for cycle in 0..STRESS_CYCLES {
+            let original = format!("original-{cycle}");
+            let transcript = format!("transcript-{cycle}");
+            clipboard.replace(original.clone());
+
+            let mut tx = HarnessTx::publish(&mut clipboard, transcript.clone());
+            assert_eq!(
+                clipboard.contents, transcript,
+                "paste publication was lost on cycle {cycle}"
+            );
+            assert!(
+                tx.settle(&mut clipboard),
+                "restore ownership lost on cycle {cycle}"
+            );
+            assert_eq!(
+                clipboard.contents, original,
+                "clipboard restoration loss on cycle {cycle}"
+            );
+            assert!(
+                tx.state.settled,
+                "transaction state leaked on cycle {cycle}"
+            );
+            assert!(
+                !tx.state.claim_settlement(),
+                "transaction could be settled twice on cycle {cycle}"
+            );
+
+            // Every stress iteration also forces an ownership handoff after a
+            // publication. Settlement must detect the newer sequence and leave
+            // the newer owner's clipboard untouched.
+            clipboard.replace(format!("race-original-{cycle}"));
+            let mut raced = HarnessTx::publish(&mut clipboard, format!("race-transcript-{cycle}"));
+            let newer = format!("newer-owner-{cycle}");
+            clipboard.replace(newer.clone());
+            assert!(
+                !raced.settle(&mut clipboard),
+                "ownership clobber was not detected on cycle {cycle}"
+            );
+            assert_eq!(
+                clipboard.contents, newer,
+                "newer clipboard owner was clobbered on cycle {cycle}"
+            );
+            assert!(
+                raced.state.settled,
+                "raced transaction state leaked on cycle {cycle}"
+            );
+        }
+    }
+
+    #[test]
+    fn uipi_failure_preserves_newer_clipboard_owner_and_is_actionable() {
+        let mut clipboard = HarnessClipboard::new("original");
+        let mut tx = HarnessTx::publish(&mut clipboard, "transcript".to_string());
+        tx.state.injection_failed = true;
+        assert!(tx.settle(&mut clipboard));
+        assert_eq!(
+            clipboard.contents, "original",
+            "UIPI fallback lost the original clipboard"
+        );
+        assert!(tx.state.settled, "failed transaction state leaked");
+
+        let mut raced = HarnessTx::publish(&mut clipboard, "second-transcript".to_string());
+        raced.state.injection_failed = true;
+        // Simulate the user/app copying something after Handy published but
+        // before the UIPI failure is handled. The newer owner must win.
+        clipboard.replace("newer-owner");
+        assert!(!raced.settle(&mut clipboard));
+        assert_eq!(
+            clipboard.contents, "newer-owner",
+            "newer clipboard owner was clobbered"
+        );
+        assert!(raced.state.settled, "failed raced transaction state leaked");
+
+        let error = ReliablePasteError::WindowsInputBlocked("SendInput returned no events".into());
+        assert!(!error.allows_legacy_fallback());
+        let message = error.to_string();
+        assert!(message.contains("higher integrity level"));
+        assert!(message.contains("same integrity level"));
+    }
 }

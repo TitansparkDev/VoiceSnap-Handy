@@ -823,9 +823,10 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
                 });
                 match reliable_result {
                     Ok(()) => return Ok(()),
-                    Err(e) => {
+                    Err(e) if e.allows_legacy_fallback() => {
                         log::warn!("Reliable paste unavailable ({e}); falling back to legacy paste")
                     }
+                    Err(e) => return Err(e.to_string()),
                 }
             }
             paste_via_clipboard(
