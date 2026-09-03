@@ -1036,6 +1036,50 @@ mod tests {
     }
 
     #[test]
+    fn normal_receipt_sequenced_transaction_timing_stays_below_regression_budget() {
+        const CYCLES: u32 = 20_000;
+        const MAX_MEAN_TRANSACTION_TIME: std::time::Duration =
+            std::time::Duration::from_micros(1_000);
+
+        // Time the deterministic normal transaction state path end-to-end:
+        // snapshot/publish, a legitimate post-injection delayed-render receipt,
+        // quiet-period decision, sequence-fenced settlement, and restore. The
+        // quiet period is advanced with a synthetic timestamp instead of a sleep,
+        // because this guard is for Handy-side regressions rather than target
+        // application scheduling latency. Payload values are synthetic fixtures
+        // and the report intentionally prints timing metadata only.
+        let original = "original clipboard fixture ".repeat(16);
+        let transcript = "normal transcript fixture ".repeat(16);
+        let mut clipboard = HarnessClipboard::new(original.clone());
+
+        let started = Instant::now();
+        for _ in 0..CYCLES {
+            clipboard.replace(std::hint::black_box(original.clone()));
+            let mut tx =
+                HarnessTx::publish(&mut clipboard, std::hint::black_box(transcript.clone()));
+
+            let target_read = Instant::now();
+            tx.state.record_receipt(target_read);
+            assert!(matches!(
+                evaluate(&tx.state, target_read + QUIET_PERIOD),
+                WaitDecision::Finish
+            ));
+            assert!(tx.settle(&mut clipboard, false));
+            std::hint::black_box(&clipboard.contents);
+        }
+        let total = started.elapsed();
+        let mean = total / CYCLES;
+
+        println!(
+            "windows clipboard normal transaction timing: cycles={CYCLES}, total={total:?}, mean={mean:?}, threshold={MAX_MEAN_TRANSACTION_TIME:?}; clipboard payloads omitted"
+        );
+        assert!(
+            mean <= MAX_MEAN_TRANSACTION_TIME,
+            "normal receipt-sequenced transaction mean {mean:?} exceeded {MAX_MEAN_TRANSACTION_TIME:?} regression budget"
+        );
+    }
+
+    #[test]
     fn format_preservation_bookkeeping_stays_below_normal_paste_regression_budget() {
         const CYCLES: u32 = 20_000;
         const MAX_ADDED_PER_TRANSACTION: std::time::Duration =

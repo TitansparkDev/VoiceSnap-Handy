@@ -55,12 +55,19 @@ Windows-specific tests cover:
 - actual `HGLOBAL` allocation/lock/copy materialization through the production byte-copy helper;
 - 1,000 normal paste/restore cycles and 1,000 forced newer-owner races;
 - normal restore versus explicit transcript preservation, including newer-owner-wins behavior;
+- delayed-render/clipboard-manager receipt races through the shared transaction state machine;
 - UIPI/input-failure restoration and actionable error text;
-- a timing regression guard for the additional format-preservation bookkeeping.
+- a normal receipt-sequenced transaction timing report plus a separate format-preservation bookkeeping regression guard.
 
-The timing guard compares the prior text-only transaction bookkeeping with representative rich-format snapshot bookkeeping over 20,000 cycles. The allowed added CPU budget is 500 microseconds per transaction. It intentionally excludes `SendInput`, the unchanged 100 ms chord hold, and receipt quiet-period timing, so it detects an accidental expensive preservation loop without pretending to benchmark target-application event-loop latency.
+### Automated timing method and threshold
 
-The normal path remains a clipboard paste chord (`Ctrl+V`, `Ctrl+Shift+V`, or `Shift+Insert`); no character-by-character Unicode typing was substituted.
+`normal_receipt_sequenced_transaction_timing_stays_below_regression_budget` runs 20,000 deterministic normal transactions through the Windows test harness. Each cycle executes the normal semantic path: snapshot/publish, a post-injection delayed-render receipt, the quiet-period decision, sequence-fenced settlement, and restoration of the prior clipboard. The receipt timestamp is advanced by `QUIET_PERIOD` instead of sleeping, so the measurement captures Handy's transaction CPU cost rather than scheduler or target-application event-loop latency.
+
+The test reports only cycle count, total elapsed time, mean elapsed harness time per transaction, and the threshold; it never prints clipboard fixture or transcript contents. The explicit material-regression threshold is **1 millisecond mean transaction time** across 20,000 cycles. This is intentionally much larger than the expected in-memory bookkeeping cost so shared-runner jitter does not make the guard flaky, while still catching a regression that adds millisecond-scale work to every normal paste transaction.
+
+The existing format-preservation guard remains separate. It compares the prior text-only transaction bookkeeping with representative rich-format snapshot bookkeeping over 20,000 cycles and permits at most 500 microseconds of added CPU work per transaction. Both timing checks intentionally exclude `SendInput`, the unchanged 100 ms chord hold, and real waiting during the receipt quiet period: those are unchanged/default-path behavior or external application scheduling, not preservation bookkeeping. The timing harness verifies the quiet-period branch using monotonic timestamps without changing the production constants.
+
+The normal path remains a clipboard paste chord (`Ctrl+V`, `Ctrl+Shift+V`, or `Shift+Insert`); no character-by-character Unicode typing was substituted and no default paste setting is changed by the benchmark.
 
 ## Manual gate
 
