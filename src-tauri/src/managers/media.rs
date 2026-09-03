@@ -336,8 +336,8 @@ impl RecordingMediaController {
             .replace(session);
 
         // A second recording generation can supersede an older token before its
-        // stop reaches us. Queueing the stale end is safe: the controller fences
-        // it against the newer active generation and transfers pause ownership.
+        // stop reaches us. Queueing the stale end is safe: the monotonic generation
+        // fence invalidates the older resume right instead of transferring it.
         if let Some(previous) = previous {
             self.controller.finish_session(previous);
         }
@@ -371,6 +371,7 @@ impl RecordingMediaController {
 
 struct ControllerInner {
     next_generation: AtomicU64,
+    latest_generation: Arc<AtomicU64>,
     active_generation: Arc<AtomicU64>,
     command_tx: mpsc::Sender<Command>,
 }
@@ -382,10 +383,31 @@ enum Command {
     Barrier(mpsc::Sender<()>),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PauseLease {
+    owner_generation: u64,
+    snapshot: MediaSnapshot,
+}
+
 #[derive(Default)]
 struct SessionLedger {
-    paused_owner: Option<u64>,
-    pause_snapshot: Option<MediaSnapshot>,
+    pause_lease: Option<PauseLease>,
+}
+
+impl SessionLedger {
+    fn invalidate_for_newer_generation(&mut self, generation: u64) {
+        if self
+            .pause_lease
+            .is_some_and(|lease| lease.owner_generation < generation)
+        {
+            self.pause_lease = None;
+            log_media_diagnostic(
+                "resume_right",
+                "invalidated_new_generation",
+                Some(generation),
+            );
+        }
+    }
 }
 
 impl MediaSessionController {
@@ -395,6 +417,8 @@ impl MediaSessionController {
 
     pub fn with_timeout(backend: Arc<dyn MediaBackend>, call_timeout: Duration) -> Self {
         let (command_tx, command_rx) = mpsc::channel();
+        let latest_generation = Arc::new(AtomicU64::new(NO_ACTIVE_GENERATION));
+        let worker_latest_generation = latest_generation.clone();
         let active_generation = Arc::new(AtomicU64::new(NO_ACTIVE_GENERATION));
         let worker_active_generation = active_generation.clone();
 
@@ -417,6 +441,7 @@ impl MediaSessionController {
                     match command {
                         Command::Begin(generation) => runtime.block_on(handle_begin(
                             generation,
+                            &worker_latest_generation,
                             &worker_active_generation,
                             backend.as_ref(),
                             call_timeout,
@@ -424,6 +449,7 @@ impl MediaSessionController {
                         )),
                         Command::End(generation) => runtime.block_on(handle_end(
                             generation,
+                            &worker_latest_generation,
                             &worker_active_generation,
                             backend.as_ref(),
                             call_timeout,
@@ -445,6 +471,7 @@ impl MediaSessionController {
         Self {
             inner: Arc::new(ControllerInner {
                 next_generation: AtomicU64::new(1),
+                latest_generation,
                 active_generation,
                 command_tx,
             }),
@@ -455,16 +482,22 @@ impl MediaSessionController {
     /// the caller. This is safe to invoke from the recording/hotkey path.
     pub fn begin_session(&self) -> MediaSession {
         let generation = self.inner.next_generation.fetch_add(1, Ordering::AcqRel);
+        // Keep a monotonic fence separate from active_generation. A newer session
+        // that starts and ends while an older media call is in flight must still
+        // permanently invalidate the older session's resume right.
+        self.inner
+            .latest_generation
+            .fetch_max(generation, Ordering::AcqRel);
         self.inner
             .active_generation
-            .store(generation, Ordering::Release);
+            .fetch_max(generation, Ordering::AcqRel);
         let _ = self.inner.command_tx.send(Command::Begin(generation));
         MediaSession { generation }
     }
 
     /// Finish a session. Only the currently active generation can make itself
-    /// inactive; stale finishes are still queued so the worker can fence them
-    /// against any transferred pause ownership.
+    /// inactive; stale finishes are still queued so the worker can discard any
+    /// pause lease invalidated by a newer generation.
     pub fn finish_session(&self, session: MediaSession) {
         let _ = self.inner.active_generation.compare_exchange(
             session.generation,
@@ -506,21 +539,19 @@ async fn call_with_timeout<T>(
 
 async fn handle_begin(
     generation: u64,
+    latest_generation: &AtomicU64,
     active_generation: &AtomicU64,
     backend: &dyn MediaBackend,
     timeout: Duration,
     ledger: &mut SessionLedger,
 ) {
-    // Process the generation fence even if this session has already ended by
-    // the time its queued begin reaches the worker. Otherwise an older session
-    // could retain pause ownership and later resume across a newer generation.
-    if ledger.paused_owner.is_some() {
-        ledger.paused_owner = Some(generation);
-        log::debug!("Transferred media pause ownership to generation {generation}");
-        return;
-    }
+    // A newer generation invalidates an older resume right; ownership is never
+    // transferred to a session that did not itself perform a successful pause.
+    ledger.invalidate_for_newer_generation(generation);
 
-    if active_generation.load(Ordering::Acquire) != generation {
+    if latest_generation.load(Ordering::Acquire) != generation
+        || active_generation.load(Ordering::Acquire) != generation
+    {
         return;
     }
 
@@ -532,7 +563,8 @@ async fn handle_begin(
         }
     };
 
-    if active_generation.load(Ordering::Acquire) != generation
+    if latest_generation.load(Ordering::Acquire) != generation
+        || active_generation.load(Ordering::Acquire) != generation
         || before.state != MediaPlaybackState::Playing
     {
         return;
@@ -550,54 +582,70 @@ async fn handle_begin(
         }
     };
 
-    let active_now = active_generation.load(Ordering::Acquire);
-    if active_now == NO_ACTIVE_GENERATION {
-        // The recording ended while the async pause was in flight. We caused
-        // the pause, so unwind it immediately, but only if state still matches
-        // the post-pause observation.
-        resume_if_unchanged(backend, timeout, generation, paused).await;
+    // The pause right belongs only to the generation that actually performed
+    // the pause. If any newer generation started while that async call was in
+    // flight, the older right is invalid even if the newer session already ended.
+    if latest_generation.load(Ordering::Acquire) != generation {
+        log_media_diagnostic(
+            "resume_right",
+            "invalidated_new_generation",
+            Some(generation),
+        );
         return;
     }
 
-    // An overlap may have become active while the pause future was running.
-    // Transfer ownership directly to that generation so the old session can
-    // never resume playback out from underneath the newer recording.
-    ledger.paused_owner = Some(active_now);
-    ledger.pause_snapshot = Some(paused);
-    log_media_diagnostic("pause", "success", Some(active_now));
+    // If the backend exposes a stable identity, losing or changing it between
+    // the pre-pause observation and the pause result is not safe ownership.
+    if before
+        .session_key
+        .is_some_and(|key| paused.session_key != Some(key))
+    {
+        log_media_diagnostic("pause", "session_changed", Some(generation));
+        return;
+    }
+
+    ledger.pause_lease = Some(PauseLease {
+        owner_generation: generation,
+        snapshot: paused,
+    });
+    log_media_diagnostic("pause", "success", Some(generation));
 }
 
 async fn handle_end(
     generation: u64,
+    latest_generation: &AtomicU64,
     active_generation: &AtomicU64,
     backend: &dyn MediaBackend,
     timeout: Duration,
     ledger: &mut SessionLedger,
 ) {
-    if ledger.paused_owner != Some(generation) {
+    let Some(lease) = ledger.pause_lease else {
+        return;
+    };
+    if lease.owner_generation != generation {
         return;
     }
 
-    let active_now = active_generation.load(Ordering::Acquire);
-    if active_now != NO_ACTIVE_GENERATION && active_now != generation {
-        // A newer generation is active even if its Begin command has not reached
-        // the worker yet. Transfer ownership now so this stale end cannot resume.
-        ledger.paused_owner = Some(active_now);
+    // The monotonic generation fence matters even when the newer session has
+    // already ended. Once superseded, an older pause right can never revive.
+    if latest_generation.load(Ordering::Acquire) != generation {
+        ledger.pause_lease = None;
+        log_media_diagnostic(
+            "resume_right",
+            "invalidated_new_generation",
+            Some(generation),
+        );
         return;
     }
 
     // If this generation somehow remains active, an end command raced ahead of
     // its caller-side generation fence. Do nothing rather than resume early.
-    if active_now == generation {
+    if active_generation.load(Ordering::Acquire) == generation {
         return;
     }
 
-    let paused = ledger.pause_snapshot.take();
-    ledger.paused_owner = None;
-
-    if let Some(paused) = paused {
-        resume_if_unchanged(backend, timeout, generation, paused).await;
-    }
+    ledger.pause_lease = None;
+    resume_if_unchanged(backend, timeout, generation, lease.snapshot).await;
 }
 
 async fn resume_if_unchanged(
@@ -627,18 +675,18 @@ async fn resume_if_unchanged(
 }
 
 fn media_state_was_changed(paused: MediaSnapshot, current: MediaSnapshot) -> bool {
-    if let (Some(paused_key), Some(current_key)) = (paused.session_key, current.session_key) {
-        if paused_key != current_key {
-            return true;
-        }
+    if paused
+        .session_key
+        .is_some_and(|paused_key| current.session_key != Some(paused_key))
+    {
+        return true;
     }
 
-    if let (Some(paused_revision), Some(current_revision)) =
-        (paused.state_revision, current.state_revision)
+    if paused
+        .state_revision
+        .is_some_and(|paused_revision| current.state_revision != Some(paused_revision))
     {
-        if paused_revision != current_revision {
-            return true;
-        }
+        return true;
     }
 
     false
@@ -679,6 +727,7 @@ mod tests {
     struct MockBackend {
         inner: Arc<Mutex<MockState>>,
         delay: Duration,
+        resume_delay: Duration,
     }
 
     struct MockState {
@@ -702,6 +751,7 @@ mod tests {
                     resume_calls: 0,
                 })),
                 delay: Duration::ZERO,
+                resume_delay: Duration::ZERO,
             }
         }
 
@@ -713,6 +763,11 @@ mod tests {
 
         fn with_delay(mut self, delay: Duration) -> Self {
             self.delay = delay;
+            self
+        }
+
+        fn with_resume_delay(mut self, delay: Duration) -> Self {
+            self.resume_delay = delay;
             self
         }
 
@@ -734,6 +789,17 @@ mod tests {
         async fn maybe_delay(&self) {
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
+            }
+        }
+
+        async fn maybe_resume_delay(&self) {
+            let delay = if self.resume_delay.is_zero() {
+                self.delay
+            } else {
+                self.resume_delay
+            };
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
             }
         }
     }
@@ -768,7 +834,7 @@ mod tests {
 
         fn resume(&self) -> MediaFuture<'_, MediaSnapshot> {
             Box::pin(async move {
-                self.maybe_delay().await;
+                self.maybe_resume_delay().await;
                 let mut inner = self.lock();
                 if inner.unavailable {
                     return Err(MediaControlError::Unavailable);
@@ -779,6 +845,22 @@ mod tests {
                     Some(inner.snapshot.state_revision.unwrap_or(0) + 1);
                 Ok(inner.snapshot)
             })
+        }
+    }
+
+    struct FailingBackend;
+
+    impl MediaBackend for FailingBackend {
+        fn snapshot(&self) -> MediaFuture<'_, MediaSnapshot> {
+            Box::pin(async { Err(MediaControlError::Failed("test failure".to_string())) })
+        }
+
+        fn pause(&self) -> MediaFuture<'_, MediaSnapshot> {
+            Box::pin(async { Err(MediaControlError::Failed("test failure".to_string())) })
+        }
+
+        fn resume(&self) -> MediaFuture<'_, MediaSnapshot> {
+            Box::pin(async { Err(MediaControlError::Failed("test failure".to_string())) })
         }
     }
 
@@ -858,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_session_takes_pause_ownership_from_older_generation() {
+    fn newer_generation_invalidates_older_resume_right_without_transfer() {
         let backend = Arc::new(MockBackend::new(MediaPlaybackState::Playing));
         let controller = MediaSessionController::new(backend.clone());
 
@@ -873,11 +955,13 @@ mod tests {
 
         controller.finish_session(second);
         controller.flush_for_test();
-        assert_eq!(backend.counts(), (1, 1));
+        // The second generation never paused media, so it never inherits the
+        // first generation's right to resume it.
+        assert_eq!(backend.counts(), (1, 0));
     }
 
     #[test]
-    fn ended_overlap_fences_older_owner_before_its_end_arrives() {
+    fn ended_overlap_still_invalidates_older_resume_right() {
         let backend = Arc::new(MockBackend::new(MediaPlaybackState::Playing));
         let controller = MediaSessionController::new(backend.clone());
 
@@ -887,11 +971,29 @@ mod tests {
         let second = controller.begin_session();
         controller.finish_session(second);
         controller.flush_for_test();
-        assert_eq!(backend.counts(), (1, 1));
+        assert_eq!(backend.counts(), (1, 0));
 
         controller.finish_session(first);
         controller.flush_for_test();
-        assert_eq!(backend.counts(), (1, 1));
+        assert_eq!(backend.counts(), (1, 0));
+    }
+
+    #[test]
+    fn cancelling_newer_generation_cannot_resume_an_older_pause() {
+        let backend = Arc::new(MockBackend::new(MediaPlaybackState::Playing));
+        let controller = MediaSessionController::new(backend.clone());
+
+        let first = controller.begin_session();
+        controller.flush_for_test();
+        let second = controller.begin_session();
+        controller.flush_for_test();
+
+        controller.cancel_session(second);
+        controller.flush_for_test();
+        controller.cancel_session(first);
+        controller.flush_for_test();
+
+        assert_eq!(backend.counts(), (1, 0));
     }
 
     #[test]
@@ -917,6 +1019,21 @@ mod tests {
         let session = controller.begin_session();
         controller.flush_for_test();
         backend.manual_state_change(MediaPlaybackState::Stopped);
+
+        controller.finish_session(session);
+        controller.flush_for_test();
+
+        assert_eq!(backend.counts(), (1, 0));
+    }
+
+    #[test]
+    fn losing_paused_session_identity_prevents_resume() {
+        let backend = Arc::new(MockBackend::new(MediaPlaybackState::Playing));
+        let controller = MediaSessionController::new(backend.clone());
+
+        let session = controller.begin_session();
+        controller.flush_for_test();
+        backend.lock().snapshot.session_key = None;
 
         controller.finish_session(session);
         controller.flush_for_test();
@@ -955,6 +1072,71 @@ mod tests {
         assert_eq!(backend.counts(), (0, 0));
 
         controller.cancel_session(session);
+        controller.flush_for_test();
+    }
+
+    #[test]
+    fn recording_manager_dispatch_does_not_wait_for_slow_media_service() {
+        let backend = Arc::new(
+            MockBackend::new(MediaPlaybackState::Playing).with_delay(Duration::from_secs(1)),
+        );
+        let controller =
+            MediaSessionController::with_timeout(backend.clone(), Duration::from_millis(20));
+        let recording_media = RecordingMediaController::new(controller.clone());
+
+        let begin_started = Instant::now();
+        recording_media.begin_recording(true);
+        assert!(begin_started.elapsed() < Duration::from_millis(50));
+
+        // Let the worker enter the deliberately slow platform future. Finishing
+        // the recording still only queues an ownership command and must return.
+        thread::sleep(Duration::from_millis(5));
+        let finish_started = Instant::now();
+        recording_media.finish_recording();
+        assert!(finish_started.elapsed() < Duration::from_millis(50));
+
+        controller.flush_for_test();
+        assert_eq!(backend.counts(), (0, 0));
+    }
+
+    #[test]
+    fn slow_resume_is_bounded_and_cannot_hold_post_capture_work() {
+        let backend = Arc::new(
+            MockBackend::new(MediaPlaybackState::Playing).with_resume_delay(Duration::from_secs(1)),
+        );
+        let controller =
+            MediaSessionController::with_timeout(backend.clone(), Duration::from_millis(20));
+        let recording_media = RecordingMediaController::new(controller.clone());
+
+        recording_media.begin_recording(true);
+        controller.flush_for_test();
+        assert_eq!(backend.counts(), (1, 0));
+
+        let finish_started = Instant::now();
+        recording_media.finish_recording();
+        assert!(finish_started.elapsed() < Duration::from_millis(50));
+
+        let worker_started = Instant::now();
+        controller.flush_for_test();
+        assert!(worker_started.elapsed() < Duration::from_millis(250));
+        assert_eq!(backend.counts(), (1, 0));
+    }
+
+    #[test]
+    fn media_service_failure_is_nonfatal_through_recording_manager_api() {
+        let controller = MediaSessionController::with_timeout(
+            Arc::new(FailingBackend),
+            Duration::from_millis(20),
+        );
+        let recording_media = RecordingMediaController::new(controller.clone());
+
+        let started = Instant::now();
+        recording_media.begin_recording(true);
+        recording_media.finish_recording();
+        assert!(started.elapsed() < Duration::from_millis(50));
+
+        // A backend failure is consumed by the optional worker; callers do not
+        // receive an error that could abort transcription-critical work.
         controller.flush_for_test();
     }
 }
