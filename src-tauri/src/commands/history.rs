@@ -167,12 +167,13 @@ pub async fn retry_history_entry_transcription(
     let language = (!language.is_empty()).then_some(language);
     let backend = transcription_manager.current_backend();
     let device = transcription_manager.current_device();
-    let cleanup_started = Instant::now();
-    let processed =
-        process_transcription_output(&app, &transcription, entry.post_process_requested).await;
-    let cleanup_total_ms = entry
-        .post_process_requested
-        .then(|| i64::try_from(cleanup_started.elapsed().as_millis()).unwrap_or(i64::MAX));
+    // Re-transcription is intentionally independent from re-cleanup. A retry
+    // replaces the raw ASR result and applies only the normal deterministic
+    // output transforms; an AI cleanup is a separate explicit user action.
+    // This also prevents a stale cleanup from surviving after the raw transcript
+    // changes underneath it.
+    let processed = process_transcription_output(&app, &transcription, false).await;
+    let cleanup_total_ms = None;
     history_manager
         .update_transcription(
             id,
