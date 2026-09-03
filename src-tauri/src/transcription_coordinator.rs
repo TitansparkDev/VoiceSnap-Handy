@@ -154,6 +154,17 @@ impl LiveInsertionLedger {
         self.final_tail_flushed
     }
 
+    pub(crate) fn has_speech_evidence(&self) -> bool {
+        self.speech_evidence
+    }
+
+    /// Once text may have escaped, or a safety boundary has fired, the normal
+    /// whole-transcript paste must not run: it would either duplicate the live
+    /// prefix or paste into a target the live session deliberately rejected.
+    pub(crate) fn blocks_final_paste(&self) -> bool {
+        self.is_live() && (!self.inserted_committed.is_empty() || self.stop_reason.is_some())
+    }
+
     fn is_live(&self) -> bool {
         self.mode == InsertionMode::LiveCommittedExperimental
     }
@@ -1224,6 +1235,29 @@ mod tests {
             .expect("speech latch makes existing committed text eligible");
         assert_eq!(first.text, "thank you for watching");
         confirm_inserted(&mut ledger, first);
+    }
+
+    #[test]
+    fn live_delivery_or_safety_stop_blocks_whole_transcript_repaste() {
+        let (mut ledger, target) = live_ledger();
+        assert!(!ledger.blocks_final_paste());
+        ledger.observe_speech_evidence(Some(&target));
+        let first = ledger
+            .observe_committed("hello", Some(&target))
+            .expect("initial delta");
+        confirm_inserted(&mut ledger, first);
+        assert!(ledger.blocks_final_paste());
+
+        let (mut focus_lost, target) = live_ledger();
+        let other = live_target("target-b");
+        focus_lost.observe_speech_evidence(Some(&target));
+        assert!(focus_lost
+            .observe_committed("hello", Some(&other))
+            .is_none());
+        assert!(focus_lost.blocks_final_paste());
+
+        let non_live = LiveInsertionLedger::new(InsertionMode::AtStop, Some(target));
+        assert!(!non_live.blocks_final_paste());
     }
 
     #[test]

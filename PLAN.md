@@ -332,39 +332,39 @@ started until Wave 0 and Wave 2 are complete.
 Deliverables:
 
 - Add `AtStop`, `PreviewOnly`, and `LiveCommittedExperimental` insertion modes. — done 2026-09-03
-- Capture the target window/focus identity at session start.
-- Maintain a per-session ledger:
+- Capture the target window/focus identity at session start. — done 2026-09-03
+- Maintain a per-session ledger: — done 2026-09-03
   - committed text already inserted;
   - pending text;
   - insertion attempts and results;
   - focus/ownership changes;
   - cancellation state.
-- Insert only the newly committed delta.
-- Never paste tentative text.
+- Insert only the newly committed delta. — done 2026-09-03
+- Never paste tentative text. — done 2026-09-03
 - Stop live insertion on foreground-window change, target loss, failed input,
-  or clipboard ownership loss.
-- Finalize and insert the remaining tail exactly once.
+  or clipboard ownership loss. — done 2026-09-03
+- Finalize and insert the remaining tail exactly once. — done 2026-09-03
 - Make the setting and warning explicit. Do not silently activate this mode. — done 2026-09-03
 - Keep AI cleanup disabled for live insertion sessions unless the behavior is
-  preview-only.
+  preview-only. — done 2026-09-03
 - Require a positive speech-evidence latch before the first live insertion. If
   the latch is absent, do not insert any live text even if the streaming model
-  emitted a committed-looking hallucination.
+  emitted a committed-looking hallucination. — done 2026-09-03
 - Do not apply a whole-transcript cleanup transform after live deltas have been
   inserted. Live mode must use either raw text or a separately specified,
   append-safe deterministic transform; AI cleanup remains preview-only or is
-  disabled for that session.
+  disabled for that session. — done 2026-09-03
 
 Acceptance:
 
-- No duplicate committed text across repeated stream events.
-- No full-transcript re-paste loop.
-- No insertion into a newly focused application.
-- No user clipboard clobber after a normal session or cancellation.
+- No duplicate committed text across repeated stream events. — done 2026-09-03
+- No full-transcript re-paste loop. — done 2026-09-03
+- No insertion into a newly focused application. — done 2026-09-03
+- No user clipboard clobber after a normal session or cancellation. — done 2026-09-03
 - Word, Notepad, browser text fields, terminal, and a Chromium/Electron field
   are manually tested.
 - Any revision of already inserted model text is recorded as a known limitation;
-  the app never attempts unsafe generic deletion/replacement.
+  the app never attempts unsafe generic deletion/replacement. — done 2026-09-03
 
 Stop condition: if a partial is inserted and then revised incorrectly, disable
 the feature behind its setting and return the default to final paste.

@@ -43,6 +43,40 @@ const STREAM_PERF_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const STREAM_FINALIZE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_WORKER_QUIESCE_TIMEOUT: Duration = Duration::from_secs(2);
 
+fn is_model_switch(current_model: Option<&str>, requested_model: &str) -> bool {
+    current_model.is_some_and(|current| current != requested_model)
+}
+
+fn clear_live_insertion_state(
+    active: &mut Option<LiveInsertionLedger>,
+    blocked_after_clear: &AtomicBool,
+) {
+    if active
+        .as_ref()
+        .is_some_and(LiveInsertionLedger::blocks_final_paste)
+    {
+        blocked_after_clear.store(true, Ordering::Release);
+    }
+    *active = None;
+}
+
+fn terminate_live_insertion_state(
+    active: &mut Option<LiveInsertionLedger>,
+    blocked_after_clear: &AtomicBool,
+) {
+    if let Some(ledger) = active.as_mut() {
+        ledger.cancel();
+    }
+    clear_live_insertion_state(active, blocked_after_clear);
+}
+
+fn live_insertion_state_blocks_final_paste(
+    active: Option<&LiveInsertionLedger>,
+    blocked_after_clear: bool,
+) -> bool {
+    blocked_after_clear || active.is_some_and(LiveInsertionLedger::blocks_final_paste)
+}
+
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -333,10 +367,14 @@ pub struct TranscriptionManager {
     /// fails during inference, later persisted loads use CPU for this app run
     /// without rewriting the user's saved accelerator preference.
     force_cpu_for_run: Arc<AtomicBool>,
-    /// Optional committed-only insertion ledger. Existing behavior is unchanged
-    /// until a steward explicitly begins a non-default insertion session; no
-    /// settings/UI path enables this core on its own.
+    /// Optional committed-only insertion ledger for the currently active session.
     live_insertion: Arc<Mutex<Option<LiveInsertionLedger>>>,
+    /// Sticky within one recording session. A model unload/cancel/engine failure
+    /// may need to clear the active ledger before the action reaches final-output
+    /// handling; remember whether that cleared ledger had already inserted text
+    /// or crossed a safety boundary so a whole-transcript paste cannot duplicate
+    /// or retarget it. Reset only when the next insertion session begins.
+    live_insertion_blocks_final_paste_after_clear: Arc<AtomicBool>,
 }
 
 impl TranscriptionManager {
@@ -360,6 +398,7 @@ impl TranscriptionManager {
             selection_plan: Arc::new(Mutex::new(None)),
             force_cpu_for_run: Arc::new(AtomicBool::new(false)),
             live_insertion: Arc::new(Mutex::new(None)),
+            live_insertion_blocks_final_paste_after_clear: Arc::new(AtomicBool::new(false)),
         };
 
         // Start the idle watcher
@@ -474,6 +513,10 @@ impl TranscriptionManager {
     }
 
     pub fn unload_model(&self) -> Result<()> {
+        // Model unload is a terminal lifecycle boundary for experimental live
+        // insertion. Quiesce the worker first so no late committed event can
+        // race the cleared session or retain the engine lease.
+        self.cancel_stream();
         let unload_start = std::time::Instant::now();
         debug!("Starting to unload model");
 
@@ -521,13 +564,30 @@ impl TranscriptionManager {
     /// Unloads the model immediately if the setting is enabled and the model is loaded
     pub fn maybe_unload_immediately(&self, context: &str) {
         let settings = get_settings(&self.app_handle);
-        if settings.model_unload_timeout == ModelUnloadTimeout::Immediately
-            && self.is_model_loaded()
+        if settings.model_unload_timeout != ModelUnloadTimeout::Immediately
+            || !self.is_model_loaded()
         {
-            info!("Immediately unloading model after {}", context);
-            if let Err(e) = self.unload_model() {
-                warn!("Failed to immediately unload model: {}", e);
-            }
+            return;
+        }
+
+        // Keep a live session's ledger until the action has made its final-paste
+        // decision. Manual unload still terminates it immediately via
+        // `unload_model`; this only defers the automatic post-transcription
+        // cleanup by the short remainder of the output pipeline.
+        let live_session_pending = self
+            .live_insertion
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ledger| ledger.mode() == InsertionMode::LiveCommittedExperimental);
+        if live_session_pending {
+            debug!("Deferring immediate model unload until live insertion session is closed");
+            return;
+        }
+
+        info!("Immediately unloading model after {}", context);
+        if let Err(e) = self.unload_model() {
+            warn!("Failed to immediately unload model: {}", e);
         }
     }
 
@@ -545,16 +605,29 @@ impl TranscriptionManager {
         model_id: &str,
         device_index: Option<usize>,
     ) -> Result<()> {
-        // A model transition must not race an old streaming worker that still
-        // owns the engine lease. Cancel any open route and wait boundedly for
-        // the worker guard to return/drop its engine before replacing the model.
-        if !self.quiesce_stream_worker(STREAM_WORKER_QUIESCE_TIMEOUT) {
-            return Err(anyhow::anyhow!(
-                "Timed out waiting {:?} for the previous streaming worker before loading model '{}'",
-                STREAM_WORKER_QUIESCE_TIMEOUT,
-                model_id
-            ));
+        let switching_model = is_model_switch(
+            self.current_model_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_deref(),
+            model_id,
+        );
+        if switching_model {
+            // A real model switch permanently ends the previous session's
+            // insertion contract and must not race its leased streaming engine.
+            self.cancel_live_insertion();
+            if !self.quiesce_stream_worker(STREAM_WORKER_QUIESCE_TIMEOUT) {
+                self.clear_live_insertion();
+                return Err(anyhow::anyhow!(
+                    "Timed out waiting {:?} for the previous streaming worker before loading model '{}'",
+                    STREAM_WORKER_QUIESCE_TIMEOUT,
+                    model_id
+                ));
+            }
+            self.clear_live_insertion();
         }
+        // Initial lazy loading is deliberately not treated as a switch: a newly
+        // opened streaming worker may already be waiting on this same load.
 
         apply_accelerator_settings(&self.app_handle);
 
@@ -948,11 +1021,12 @@ impl TranscriptionManager {
     /// intentionally separate opt-in from streaming preview: callers must choose
     /// `LiveCommittedExperimental` explicitly, so merely using a streaming model
     /// never changes Handy's existing final-paste behavior.
-    #[allow(dead_code)] // explicit opt-in hook; intentionally not enabled by this core task
     pub(crate) fn begin_insertion_session(&self, mode: InsertionMode) {
         let target = (mode == InsertionMode::LiveCommittedExperimental)
             .then(crate::paste_tx::capture_target_identity)
             .flatten();
+        self.live_insertion_blocks_final_paste_after_clear
+            .store(false, Ordering::Release);
         *self.live_insertion.lock().unwrap() = Some(LiveInsertionLedger::new(mode, target));
     }
 
@@ -991,18 +1065,29 @@ impl TranscriptionManager {
 
     /// Positive speech evidence is supplied separately from model text. This is
     /// the latch that prevents a committed-looking silence hallucination from
-    /// becoming the first external insertion.
-    #[allow(dead_code)] // steward hook: recording/VAD wiring supplies the positive latch
+    /// becoming the first external insertion. Capture foreground identity only
+    /// for the first positive frame; subsequent VAD-approved frames are a cheap
+    /// no-op rather than a per-frame OS focus query.
     pub(crate) fn observe_live_speech_evidence(&self) -> Option<LiveInsertionAttempt> {
+        let mut guard = self.live_insertion.lock().unwrap();
+        let ledger = guard.as_mut()?;
+        if ledger.mode() != InsertionMode::LiveCommittedExperimental || ledger.has_speech_evidence()
+        {
+            return None;
+        }
         let current_target = crate::paste_tx::capture_target_identity();
-        self.live_insertion
-            .lock()
-            .unwrap()
-            .as_mut()
-            .and_then(|ledger| ledger.observe_speech_evidence(current_target.as_ref()))
+        ledger.observe_speech_evidence(current_target.as_ref())
     }
 
-    #[allow(dead_code)] // steward hook: native input adapter records exact async outcome
+    /// Called by the recorder after the active VAD policy admits a speech frame.
+    /// If a model emitted committed text before the latch, this executes that
+    /// pending append-only delta immediately after the latch turns positive.
+    pub(crate) fn observe_and_execute_live_speech_evidence(&self) {
+        if let Some(attempt) = self.observe_live_speech_evidence() {
+            self.execute_live_insertion_attempt(attempt);
+        }
+    }
+
     pub(crate) fn record_live_insertion_result(
         &self,
         sequence: u64,
@@ -1017,7 +1102,6 @@ impl TranscriptionManager {
 
     /// Ask the live ledger for at most the still-uncommitted final raw tail.
     /// Callers must pass the raw streaming final, before whole-transcript cleanup.
-    #[allow(dead_code)] // steward hook: must be called before whole-transcript cleanup
     pub(crate) fn finalize_live_insertion_raw(
         &self,
         final_text: &str,
@@ -1036,9 +1120,76 @@ impl TranscriptionManager {
         }
     }
 
-    #[allow(dead_code)] // steward hook: clears the completed session after final action
     pub(crate) fn clear_live_insertion(&self) {
-        *self.live_insertion.lock().unwrap() = None;
+        let mut guard = self.live_insertion.lock().unwrap();
+        clear_live_insertion_state(
+            &mut guard,
+            self.live_insertion_blocks_final_paste_after_clear.as_ref(),
+        );
+    }
+
+    /// Whether the normal final paste is unsafe for the current session because
+    /// some live text escaped already or a focus/input safety boundary fired.
+    /// The sticky bit matters when model-unload policy clears the active ledger
+    /// during stream finalization before the action reaches its paste decision.
+    pub(crate) fn live_insertion_blocks_final_paste(&self) -> bool {
+        let guard = self.live_insertion.lock().unwrap();
+        live_insertion_state_blocks_final_paste(
+            guard.as_ref(),
+            self.live_insertion_blocks_final_paste_after_clear
+                .load(Ordering::Acquire),
+        )
+    }
+
+    /// Engine failure is terminal for committed insertion. Clear the active
+    /// session immediately so no later stream event can append, while preserving
+    /// any final-paste suppression state from text that may already have escaped.
+    fn terminate_live_insertion_after_engine_failure(&self) {
+        let mut guard = self.live_insertion.lock().unwrap();
+        terminate_live_insertion_state(
+            &mut guard,
+            self.live_insertion_blocks_final_paste_after_clear.as_ref(),
+        );
+    }
+
+    /// Execute one planned append on the main thread. The foreground identity is
+    /// re-checked immediately before injection, closing the race between ledger
+    /// planning and queued native input. The call waits for that exact attempt so
+    /// committed-prefix accounting cannot run ahead of uncertain delivery.
+    fn execute_live_insertion_attempt(&self, attempt: LiveInsertionAttempt) {
+        let sequence = attempt.sequence;
+        let expected_target = attempt.target;
+        let text = attempt.text;
+        let app_handle = self.app_handle.clone();
+        let app_for_input = app_handle.clone();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+
+        let schedule_result = app_handle.run_on_main_thread(move || {
+            let current_target = crate::paste_tx::capture_target_identity();
+            let outcome = match current_target {
+                None => LiveInsertionOutcome::TargetLost,
+                Some(current) if current != expected_target => LiveInsertionOutcome::TargetChanged,
+                Some(_) => match crate::clipboard::paste_live_delta(&text, &app_for_input) {
+                    Ok(()) => LiveInsertionOutcome::Inserted,
+                    Err(error) => {
+                        warn!("Live committed insertion failed: {error}");
+                        LiveInsertionOutcome::InputFailed
+                    }
+                },
+            };
+            let _ = result_tx.send(outcome);
+        });
+
+        let outcome = match schedule_result {
+            Ok(()) => result_rx
+                .recv()
+                .unwrap_or(LiveInsertionOutcome::InputFailed),
+            Err(error) => {
+                warn!("Failed to schedule live insertion on main thread: {error}");
+                LiveInsertionOutcome::InputFailed
+            }
+        };
+        let _ = self.record_live_insertion_result(sequence, outcome);
     }
 
     /// Begin a live streaming transcription on the held engine's session.
@@ -1227,6 +1378,7 @@ impl TranscriptionManager {
                 Ok(s) => s,
                 Err(e) => {
                     error!("Failed to begin stream: {}", e);
+                    self.terminate_live_insertion_after_engine_failure();
                     break 'stream false;
                 }
             };
@@ -1263,7 +1415,8 @@ impl TranscriptionManager {
                             }
                             Err(e) => {
                                 perf.record_compute(feed_start.elapsed());
-                                warn!("stream feed failed: {}", e);
+                                warn!("stream feed failed: {}; terminating live insertion", e);
+                                self.terminate_live_insertion_after_engine_failure();
                             }
                         }
                     }
@@ -1306,6 +1459,7 @@ impl TranscriptionManager {
                                     "stream finalize failed: {}; falling back to batch transcription",
                                     e
                                 );
+                                self.terminate_live_insertion_after_engine_failure();
                                 None
                             }
                         };
@@ -1422,6 +1576,13 @@ impl TranscriptionManager {
             }
         };
 
+        // Flush only the remaining raw append-safe tail before any whole-text
+        // normalization/correction. If a live prefix was revised or focus moved,
+        // the ledger fails closed and the action suppresses a generic re-paste.
+        if let Some(attempt) = self.finalize_live_insertion_raw(&finalized.text) {
+            self.execute_live_insertion_attempt(attempt);
+        }
+
         let settings = get_settings(&self.app_handle);
         // Streaming models do not receive a decode prompt, so custom words
         // always go through the shared fuzzy post-correction path.
@@ -1512,13 +1673,16 @@ impl TranscriptionManager {
 
     /// Abandon any active stream without producing text (e.g. on cancel).
     pub fn cancel_stream(&self) {
+        // Mark insertion cancelled before waiting so no newly observed text can
+        // plan another append while the streaming worker is winding down.
+        self.cancel_live_insertion();
         if !self.quiesce_stream_worker(STREAM_WORKER_QUIESCE_TIMEOUT) {
             warn!(
                 "Timed out waiting {:?} for cancelled streaming worker to release",
                 STREAM_WORKER_QUIESCE_TIMEOUT
             );
         }
-        self.cancel_live_insertion();
+        self.clear_live_insertion();
     }
 
     /// Emit a working-phase event to the streaming overlay (spinner + label).
@@ -1531,11 +1695,16 @@ impl TranscriptionManager {
     }
 
     fn emit_stream_text(&self, committed: &str, tentative: &str) {
-        let _ = StreamTextEvent {
+        let event = StreamTextEvent {
             committed: committed.to_string(),
             tentative: tentative.to_string(),
+        };
+        // Tentative text is intentionally absent from the ledger API. Only the
+        // append-safe committed prefix can reach the native input adapter.
+        if let Some(attempt) = self.observe_live_stream_text(&event) {
+            self.execute_live_insertion_attempt(attempt);
         }
-        .emit(&self.app_handle);
+        let _ = event.emit(&self.app_handle);
     }
 
     pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
@@ -2747,6 +2916,43 @@ mod tests {
     }
 
     #[test]
+    fn terminal_live_state_survives_active_ledger_clear_for_final_paste_guard() {
+        let blocked_after_clear = AtomicBool::new(false);
+        let mut active = Some(LiveInsertionLedger::new(
+            InsertionMode::LiveCommittedExperimental,
+            None,
+        ));
+        active.as_mut().unwrap().cancel();
+
+        clear_live_insertion_state(&mut active, &blocked_after_clear);
+
+        assert!(active.is_none());
+        assert!(blocked_after_clear.load(Ordering::Acquire));
+        assert!(live_insertion_state_blocks_final_paste(
+            active.as_ref(),
+            blocked_after_clear.load(Ordering::Acquire)
+        ));
+    }
+
+    #[test]
+    fn engine_failure_terminates_active_live_session_and_blocks_repaste() {
+        let blocked_after_clear = AtomicBool::new(false);
+        let mut active = Some(LiveInsertionLedger::new(
+            InsertionMode::LiveCommittedExperimental,
+            None,
+        ));
+
+        terminate_live_insertion_state(&mut active, &blocked_after_clear);
+
+        assert!(active.is_none());
+        assert!(blocked_after_clear.load(Ordering::Acquire));
+        assert!(live_insertion_state_blocks_final_paste(
+            active.as_ref(),
+            blocked_after_clear.load(Ordering::Acquire)
+        ));
+    }
+
+    #[test]
     fn stream_text_event_serializes_committed_and_tentative_as_distinct_fields() {
         let event = StreamTextEvent {
             committed: "stable prefix".to_string(),
@@ -2757,6 +2963,13 @@ mod tests {
         assert_eq!(value["committed"], "stable prefix");
         assert_eq!(value["tentative"], " volatile suffix");
         assert_ne!(value["committed"], value["tentative"]);
+    }
+
+    #[test]
+    fn initial_lazy_load_is_not_a_model_switch_but_changed_loaded_model_is() {
+        assert!(!is_model_switch(None, "moonshine-base"));
+        assert!(!is_model_switch(Some("moonshine-base"), "moonshine-base"));
+        assert!(is_model_switch(Some("moonshine-base"), "parakeet-tdt"));
     }
 
     #[test]

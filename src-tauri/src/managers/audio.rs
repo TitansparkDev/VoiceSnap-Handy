@@ -386,7 +386,17 @@ fn create_audio_recorder(
         })
         .with_audio_callback({
             let router = stream_router;
+            let app_handle = app_handle.clone();
             move |frame| {
+                // This callback receives frames only after the active VAD policy
+                // has admitted them. For a live-insertion session that is the
+                // independent positive speech-evidence latch; model text alone
+                // is never allowed to arm insertion.
+                if let Some(tm) = app_handle
+                    .try_state::<Arc<crate::managers::transcription::TranscriptionManager>>()
+                {
+                    tm.observe_and_execute_live_speech_evidence();
+                }
                 router.feed(frame);
             }
         });
