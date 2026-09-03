@@ -41,6 +41,12 @@ struct RecordingErrorEvent {
 struct FinishGuard(AppHandle);
 impl Drop for FinishGuard {
     fn drop(&mut self) {
+        // Every terminal pipeline path (success, cancellation, transcription
+        // error, output-handler error, or panic) ends the insertion session.
+        if let Some(tm) = self.0.try_state::<Arc<TranscriptionManager>>() {
+            tm.clear_live_insertion();
+            tm.maybe_unload_immediately("transcription pipeline completion");
+        }
         if let Some(c) = self.0.try_state::<TranscriptionCoordinator>() {
             c.notify_processing_finished();
         }
@@ -218,14 +224,27 @@ fn resolve_session_insertion_mode(
     experimental_enabled: bool,
     post_process: bool,
     model_supports_streaming: bool,
+    positive_speech_evidence_available: bool,
 ) -> InsertionMode {
     if !experimental_enabled || !model_supports_streaming {
         return InsertionMode::AtStop;
     }
-    if configured == InsertionMode::LiveCommittedExperimental && post_process {
+    if configured == InsertionMode::LiveCommittedExperimental
+        && (post_process || !positive_speech_evidence_available)
+    {
         return InsertionMode::PreviewOnly;
     }
     configured
+}
+
+fn should_paste_final_output(
+    final_text_is_empty: bool,
+    session_insertion_mode: InsertionMode,
+    live_insertion_blocks_final_paste: bool,
+) -> bool {
+    !final_text_is_empty
+        && !(session_insertion_mode == InsertionMode::LiveCommittedExperimental
+            && live_insertion_blocks_final_paste)
 }
 
 fn insertion_mode_history_value(mode: InsertionMode) -> &'static str {
@@ -726,11 +745,18 @@ impl ShortcutAction for TranscribeAction {
             settings.experimental_enabled,
             self.post_process,
             model_supports_streaming,
+            settings.vad_enabled,
         );
         if settings.insertion_mode == InsertionMode::LiveCommittedExperimental && self.post_process
         {
             warn!(
                 "Live committed insertion is incompatible with whole-transcript AI cleanup; using preview-only insertion for this session"
+            );
+        } else if settings.insertion_mode == InsertionMode::LiveCommittedExperimental
+            && !settings.vad_enabled
+        {
+            warn!(
+                "Live committed insertion requires positive VAD speech evidence; using preview-only insertion while VAD is disabled"
             );
         }
         tm.begin_insertion_session(insertion_mode);
@@ -1085,7 +1111,18 @@ impl ShortcutAction for TranscribeAction {
                                 }
                             }
 
-                            if processed.final_text.is_empty() {
+                            let block_whole_transcript_paste =
+                                tm.live_insertion_blocks_final_paste();
+                            if !should_paste_final_output(
+                                processed.final_text.is_empty(),
+                                session_insertion_mode,
+                                block_whole_transcript_paste,
+                            ) {
+                                if block_whole_transcript_paste {
+                                    debug!(
+                                        "Skipping whole-transcript paste after live insertion/safety stop"
+                                    );
+                                }
                                 utils::hide_recording_overlay(&ah);
                                 set_tray_state(&ah, TrayIconState::Idle);
                             } else {
@@ -1269,8 +1306,8 @@ mod tests {
         complete_unless_cancelled, insertion_mode_history_value, is_blank_transcription,
         normalize_cleanup_output, parse_structured_cleanup_output, resolve_history_cleanup_mode,
         resolve_history_compute_plan, resolve_session_insertion_mode, resolve_stream_or_batch,
-        should_use_streaming_overlay, strip_think_block, CLEANUP_MAX_OUTPUT_CHARS,
-        CLEANUP_OUTPUT_CONTRACT,
+        should_paste_final_output, should_use_streaming_overlay, strip_think_block,
+        CLEANUP_MAX_OUTPUT_CHARS, CLEANUP_OUTPUT_CONTRACT,
     };
     use crate::settings::{AppSettings, InsertionMode, OverlayStyle};
     use std::cell::Cell;
@@ -1523,6 +1560,7 @@ mod tests {
                 InsertionMode::LiveCommittedExperimental,
                 true,
                 true,
+                true,
                 true
             ),
             InsertionMode::PreviewOnly
@@ -1532,6 +1570,7 @@ mod tests {
                 InsertionMode::LiveCommittedExperimental,
                 true,
                 false,
+                true,
                 true
             ),
             InsertionMode::LiveCommittedExperimental
@@ -1545,13 +1584,32 @@ mod tests {
                 InsertionMode::LiveCommittedExperimental,
                 false,
                 false,
+                true,
                 true
             ),
             InsertionMode::AtStop
         );
         assert_eq!(
-            resolve_session_insertion_mode(InsertionMode::PreviewOnly, false, false, true),
+            resolve_session_insertion_mode(InsertionMode::PreviewOnly, false, false, true, true),
             InsertionMode::AtStop
+        );
+    }
+
+    #[test]
+    fn live_committed_mode_downgrades_to_preview_without_positive_vad_evidence() {
+        assert_eq!(
+            resolve_session_insertion_mode(
+                InsertionMode::LiveCommittedExperimental,
+                true,
+                false,
+                true,
+                false,
+            ),
+            InsertionMode::PreviewOnly
+        );
+        assert_eq!(
+            resolve_session_insertion_mode(InsertionMode::PreviewOnly, true, false, true, false),
+            InsertionMode::PreviewOnly
         );
     }
 
@@ -1563,10 +1621,34 @@ mod tests {
             InsertionMode::LiveCommittedExperimental,
         ] {
             assert_eq!(
-                resolve_session_insertion_mode(mode, true, false, false),
+                resolve_session_insertion_mode(mode, true, false, false, true),
                 InsertionMode::AtStop
             );
         }
+    }
+
+    #[test]
+    fn live_session_never_whole_repastes_after_delivery_or_safety_stop() {
+        assert!(!should_paste_final_output(
+            false,
+            InsertionMode::LiveCommittedExperimental,
+            true,
+        ));
+        assert!(should_paste_final_output(
+            false,
+            InsertionMode::LiveCommittedExperimental,
+            false,
+        ));
+        assert!(should_paste_final_output(
+            false,
+            InsertionMode::PreviewOnly,
+            true,
+        ));
+        assert!(!should_paste_final_output(
+            true,
+            InsertionMode::AtStop,
+            false,
+        ));
     }
 
     #[test]

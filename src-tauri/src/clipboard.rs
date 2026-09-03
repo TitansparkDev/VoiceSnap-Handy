@@ -771,6 +771,66 @@ fn should_send_auto_submit(auto_submit: bool, paste_method: PasteMethod) -> bool
     auto_submit && paste_method != PasteMethod::None
 }
 
+/// Insert one append-only live transcription delta without applying any of the
+/// whole-transcript output behaviors. In particular, a delta never receives a
+/// configured trailing space, never auto-submits, and never leaves itself on
+/// the user's clipboard. Those transformations are only safe once at final
+/// output, not once per growing committed prefix.
+pub(crate) fn paste_live_delta(text: &str, app_handle: &AppHandle) -> Result<(), String> {
+    let settings = get_settings(app_handle);
+    let paste_method = settings.paste_method;
+
+    match paste_method {
+        PasteMethod::None => Err("Live insertion requires an active paste method".to_string()),
+        PasteMethod::Direct => paste_direct(
+            text,
+            app_handle,
+            #[cfg(target_os = "linux")]
+            settings.typing_tool,
+        ),
+        PasteMethod::CtrlV | PasteMethod::CtrlShiftV | PasteMethod::ShiftInsert => {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            if settings.reliable_paste {
+                let reliable_result = with_enigo(app_handle, |enigo| {
+                    crate::paste_tx::try_reliable_paste(
+                        text,
+                        app_handle,
+                        &paste_method,
+                        enigo,
+                        false,
+                        settings.auto_submit_key,
+                        ClipboardHandling::DontModify,
+                    )
+                });
+                match reliable_result {
+                    Ok(()) => return Ok(()),
+                    Err(e) if e.allows_legacy_fallback() => {
+                        log::warn!(
+                            "Reliable live paste unavailable ({e}); falling back to legacy paste"
+                        )
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            paste_via_clipboard(
+                text,
+                app_handle,
+                &paste_method,
+                settings.paste_delay_ms,
+                settings.paste_delay_after_ms,
+            )
+        }
+        PasteMethod::ExternalScript => {
+            let script_path = settings
+                .external_script_path
+                .as_ref()
+                .filter(|p| !p.is_empty())
+                .ok_or("External script path is not configured")?;
+            paste_via_external_script(text, script_path)
+        }
+    }
+}
+
 pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
     let settings = get_settings(&app_handle);
     let paste_method = settings.paste_method;
