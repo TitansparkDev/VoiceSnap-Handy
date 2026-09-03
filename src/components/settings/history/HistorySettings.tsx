@@ -89,6 +89,29 @@ const formatHistoryEngine = (engineType: string | null): string | null => {
   return labels[engineType] ?? engineType;
 };
 
+const runtimeLabel = (
+  backend: string | null,
+  device: string | null,
+): string | null => [backend, device].filter(Boolean).join(" · ") || null;
+
+const runtimeRecoveryOccurred = (entry: HistoryEntry): boolean => {
+  const recommendedBackend = entry.recommended_backend?.trim().toLowerCase();
+  const actualBackend = entry.backend?.trim().toLowerCase();
+  const recommendedDevice = entry.recommended_device?.trim().toLowerCase();
+  const actualDevice = entry.device?.trim().toLowerCase();
+
+  const recoveredToCpu =
+    Boolean(recommendedBackend) &&
+    recommendedBackend !== "cpu" &&
+    actualBackend === "cpu";
+  const recoveredToDifferentDevice =
+    Boolean(recommendedDevice) &&
+    Boolean(actualDevice) &&
+    recommendedDevice !== actualDevice;
+
+  return recoveredToCpu || recoveredToDifferentDevice;
+};
+
 interface OpenRecordingsButtonProps {
   onClick: () => void;
   label: string;
@@ -634,7 +657,12 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
       ? t("settings.history.insertionModeAtStop", { defaultValue: "At stop" })
       : entry.insertion_mode
     : null;
-  const runtimeLabel = [entry.backend, entry.device].filter(Boolean).join(" · ") || null;
+  const actualRuntimeLabel = runtimeLabel(entry.backend, entry.device);
+  const recommendedRuntimeLabel = runtimeLabel(
+    entry.recommended_backend,
+    entry.recommended_device,
+  );
+  const recoveredRuntime = runtimeRecoveryOccurred(entry);
   const cleanupModeLabel = entry.cleanup_mode
     ? entry.cleanup_mode === "off"
       ? t("settings.history.cleanupNotRequested", {
@@ -703,14 +731,30 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
               {insertionModeLabel}
             </span>
           )}
-          {runtimeLabel && (
+          {recommendedRuntimeLabel && (
+            <span
+              className="rounded bg-mid-gray/10 px-1.5 py-0.5 text-[10px] text-text/50"
+              title={t("settings.history.recommendedRuntime", {
+                defaultValue: "Recommended backend and device before runtime fallback",
+              })}
+            >
+              {t("settings.history.recommendedRuntimeShort", {
+                defaultValue: "Plan: {{runtime}}",
+                runtime: recommendedRuntimeLabel,
+              })}
+            </span>
+          )}
+          {actualRuntimeLabel && (
             <span
               className="rounded bg-mid-gray/10 px-1.5 py-0.5 text-[10px] text-text/50"
               title={t("settings.history.runtime", {
-                defaultValue: "Runtime backend and device",
+                defaultValue: "Actual runtime backend and device",
               })}
             >
-              {runtimeLabel}
+              {t("settings.history.runtimeShort", {
+                defaultValue: "Used: {{runtime}}",
+                runtime: actualRuntimeLabel,
+              })}
             </span>
           )}
           {cleanupModeLabel && (
@@ -811,6 +855,17 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
           </IconButton>
         </div>
       </div>
+
+      {recoveredRuntime && recommendedRuntimeLabel && actualRuntimeLabel && (
+        <div className="rounded-md border border-logo-primary/20 bg-logo-primary/5 px-3 py-2 text-[11px] text-text/70">
+          {t("settings.history.hardwareRecovery", {
+            defaultValue:
+              "Hardware recovery: Handy planned {{planned}}, but this session used {{actual}}. Your saved accelerator preference was not changed.",
+            planned: recommendedRuntimeLabel,
+            actual: actualRuntimeLabel,
+          })}
+        </div>
+      )}
 
       {(!hasDistinctFinalText || retrying) && (
         <p
