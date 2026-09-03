@@ -243,6 +243,10 @@
         "average": "Gennemsnit af alle kanaler",
         "channel": "Kanal {{n}}"
       },
+      "pauseMediaWhileRecording": {
+        "label": "Pause media while recording",
+        "description": "Pause currently playing system media during dictation and resume it only when Handy paused it."
+      },
       "audioFeedback": {
         "label": "Lydfeedback",
         "description": "Afspil lyd, når optagelse starter og stopper"
@@ -273,6 +277,16 @@
       "lazyStreamClose": {
         "label": "Hold mikrofon åben mellem transskriptioner",
         "description": "Holder mikrofonstrømmen åben i 30 sekunder, efter at optagelsen stopper, hvilket reducerer ventetid ved transskriptioner lige efter hinanden. Kan forringe Bluetooth-lydkvaliteten, mens den er aktiv."
+      },
+      "insertionMode": {
+        "title": "Text Insertion",
+        "description": "Choose when transcription text is inserted. At stop keeps the stable final-paste behavior; Preview only shows live text without inserting it; Live committed inserts only committed streaming text as you speak.",
+        "options": {
+          "atStop": "At stop (default)",
+          "previewOnly": "Preview only",
+          "liveCommittedExperimental": "Live committed (experimental)"
+        },
+        "liveWarning": "Experimental: committed text is inserted into the target application while you speak and cannot be safely revised after insertion. Focus or target changes stop live insertion. Whole-transcript AI post-processing is not applied to live committed sessions; the post-processing shortcut uses preview-only insertion for that session."
       },
       "acceleration": {
         "transcribe": {
@@ -455,6 +469,38 @@
       }
     },
     "history": {
+      "noSearchResults": "No matching history entries.",
+      "search": "Search history",
+      "searchPlaceholder": "Search history...",
+      "fromDate": "From",
+      "toDate": "To",
+      "modelFilter": "Model",
+      "allModels": "All models",
+      "cleanupFilter": "Cleanup",
+      "allCleanupStates": "All cleanup states",
+      "cleanupRequested": "Cleanup requested",
+      "cleanupNotRequested": "No cleanup requested",
+      "outcomeFilter": "Outcome",
+      "allOutcomes": "All outcomes",
+      "successful": "Successful",
+      "failed": "Failed",
+      "retryCleanupError": "Cleanup could not be retried.",
+      "insertionModeAtStop": "At stop",
+      "transcriptionStage": "Transcription",
+      "cleanupStage": "Cleanup",
+      "duration": "Recording duration",
+      "engine": "Engine",
+      "insertionMode": "Insertion mode",
+      "recommendedRuntime": "Recommended backend and device before runtime fallback",
+      "recommendedRuntimeShort": "Plan: {{runtime}}",
+      "runtime": "Actual runtime backend and device",
+      "runtimeShort": "Used: {{runtime}}",
+      "cleanupMode": "Cleanup mode",
+      "stageTimings": "Stage timings",
+      "retryCleanup": "Retry cleanup",
+      "hardwareRecovery": "Hardware recovery: Handy planned {{planned}}, but this session used {{actual}}. Your saved accelerator preference was not changed.",
+      "rawTranscript": "Raw",
+      "finalTranscript": "Final",
       "title": "Historik",
       "openFolder": "Åbn optagelsesmappe",
       "loading": "Indlæser historik...",

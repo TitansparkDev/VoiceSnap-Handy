@@ -40,16 +40,8 @@ export const GeneralSettings: React.FC = () => {
             updateSetting("pause_media_while_recording", enabled)
           }
           isUpdating={isUpdating("pause_media_while_recording")}
-          label={t("settings.sound.pauseMediaWhileRecording.label", {
-            defaultValue: "Pause media while recording",
-          })}
-          description={t(
-            "settings.sound.pauseMediaWhileRecording.description",
-            {
-              defaultValue:
-                "Pause currently playing system media during dictation and resume it only when Handy paused it.",
-            },
-          )}
+          label={t("settings.sound.pauseMediaWhileRecording.label")}
+          description={t("settings.sound.pauseMediaWhileRecording.description")}
           descriptionMode="tooltip"
           grouped={true}
         />

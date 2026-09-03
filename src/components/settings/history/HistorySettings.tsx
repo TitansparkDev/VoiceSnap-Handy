@@ -455,7 +455,7 @@ export const HistorySettings: React.FC = () => {
               aria-label={t("settings.history.search", {
                 defaultValue: "Search history",
               })}
-              placeholder={t("settings.history.search", {
+              placeholder={t("settings.history.searchPlaceholder", {
                 defaultValue: "Search history...",
               })}
               className="mt-2 w-full rounded-md border border-mid-gray/20 bg-background px-3 py-1.5 text-sm text-text outline-none transition-colors placeholder:text-text/35 focus:border-logo-primary/60"

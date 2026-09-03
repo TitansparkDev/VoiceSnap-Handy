@@ -265,9 +265,9 @@ Deliverables:
   bundled local runtime rather than launching a new process per utterance. If a
   sidecar is used, it needs a dedicated supervisor with child/job lifetime,
   health checks, bounded startup, cancellation, crash cleanup, and CPU fallback;
-  it must not be an unmanaged process launched from the action handler.
+  it must not be an unmanaged process launched from the action handler. — done 2026-09-03
 - Use a small Q4 model first. Evaluate Qwen3-1.7B, Qwen3-4B, and the VoiceTypr
-  `s1-mini` candidate; do not select by model name alone.
+  `s1-mini` candidate; do not select by model name alone. — done 2026-09-03
 - Keep model loading separate from the ASR stream worker.
 - Disable reasoning/thinking and constrain output length.
 - Define a strict cleanup contract: output text only, no explanation, no quotes,
@@ -282,7 +282,7 @@ Deliverables:
 - Fail open to raw text on timeout, malformed output, engine failure, or
   cancellation.
 - Warm the local model only when local AI cleanup is enabled. Do not load it on
-  installations using `off` or `fast` mode.
+  installations using `off` or `fast` mode. — done 2026-09-03
 
 Acceptance:
 
@@ -301,17 +301,18 @@ Deliverables:
 
 - Preserve Handy's existing streaming worker and committed/tentative event
   contract.
-- Add explicit stream performance events to Wave 0's timing schema.
-- Add a benchmark command or test harness using fixed WAV fixtures and live
-  microphone sessions.
+- Add explicit stream performance events to Wave 0's timing schema. — done 2026-09-03
+- Add a benchmark command or test harness using fixed WAV fixtures. — done 2026-09-03
+- Add equivalent live-microphone benchmark sessions.
 - Compare:
   - Parakeet Unified;
   - Nemotron Streaming;
   - Moonshine Streaming Tiny;
   - Whisper Large v3 Turbo batch;
   - any other model already present in Handy's catalog.
-- Measure first partial, committed text cadence, finalization tail, total time,
-  and quality on short/medium/long utterances.
+- Measure first partial, committed text cadence, finalization tail, and total time
+  on short/medium/long fixed-WAV utterances. — done 2026-09-03
+- Compare transcription quality on short/medium/long utterances.
 - Make the overlay's committed/tentative distinction visually obvious.
 - Keep the overlay from stealing focus from the target application.
 - Ensure a non-streaming model cleanly falls back to final batch transcription. — done 2026-09-03
@@ -321,8 +322,8 @@ Acceptance:
 - Live-capable models show text before the user stops speaking.
 - Whisper Turbo remains reliable as a final-only model.
 - Stream cancellation and model switching do not leak a worker or wedge the next
-  session.
-- The app reports actual timing instead of claiming a fixed speed.
+  session. — done 2026-09-03
+- The app reports actual timing instead of claiming a fixed speed. — done 2026-09-03
 
 ### Wave 3 — experimental committed-only live insertion
 
@@ -415,22 +416,22 @@ cleanup fields.
 Deliverables:
 
 - Extend history metadata with model, engine, language, duration, cleanup mode,
-  insertion mode, device/backend, stage timings, and outcome.
-- Keep raw and final text side by side.
+  insertion mode, device/backend, stage timings, and outcome. — done 2026-09-03
+- Keep raw and final text side by side. — done 2026-09-03
 - Add search, saved/starred entries, date filters, model filters, cleanup filters,
-  and success/failure filters.
-- Add compare raw versus final.
-- Add retry transcription and retry cleanup independently.
-- Keep audio retention optional and bounded.
+  and success/failure filters. — done 2026-09-03
+- Add compare raw versus final. — done 2026-09-03
+- Add retry transcription and retry cleanup independently. — done 2026-09-03
+- Keep audio retention optional and bounded. — done 2026-09-03
 - Keep app identity coarse/opt-in if ever added later; do not persist window title
   or document name in this wave.
 
 Acceptance:
 
-- A user can answer “why was this dictation slow?” from its history row.
-- Re-cleaning does not require re-recording.
+- A user can answer “why was this dictation slow?” from its history row. — done 2026-09-03
+- Re-cleaning does not require re-recording. — done 2026-09-03
 - Deleting history removes associated retained audio according to the selected
-  retention policy.
+  retention policy. — done 2026-09-03
 
 ### Wave 6 — hardware, device, and runtime truth
 
@@ -450,15 +451,15 @@ Deliverables:
 - Audit selected microphone persistence and recovery. An automatic stream repair
   must retry the requested device rather than silently selecting another default. — done 2026-09-03
 - Add stable device identity where the platform provides it, while retaining a
-  readable device name for the UI.
+  readable device name for the UI. — done 2026-09-03
 - Add tests for GPU failure, integrated-vs-discrete selection, no-GPU startup,
-  device disappearance, recovery, and preference persistence.
+  device disappearance, recovery, and preference persistence. — done 2026-09-03
 
 Acceptance:
 
-- GPU fallback is visible and truthful.
-- CPU fallback works without changing saved settings.
-- A microphone recovery does not silently move dictation to a different mic.
+- GPU fallback is visible and truthful. — done 2026-09-03
+- CPU fallback works without changing saved settings. — done 2026-09-03
+- A microphone recovery does not silently move dictation to a different mic. — done 2026-09-03
 - The diagnostics page shows the actual backend used for each session.
 
 ### Wave 7 — optional media pause/resume
@@ -472,9 +473,9 @@ Deliverables:
 - Resume only if this session paused it. — done 2026-09-03
 - If the user manually pauses/stops media during dictation, do not resume it. — done 2026-09-03
 - Use a session/generation ledger so overlapping/cancelled sessions cannot resume
-  the wrong state.
+  the wrong state. — done 2026-09-03
 - Run platform media calls off the hotkey/start path. A media service timeout or
-  failure must never delay microphone capture or first partial text.
+  failure must never delay microphone capture or first partial text. — done 2026-09-03
 - Keep failures non-fatal: transcription continues if media control is absent. — done 2026-09-03
 - Show media action/failure in diagnostics without recording media identity. — done 2026-09-03
 
@@ -482,7 +483,7 @@ Acceptance:
 
 - Playback is paused during recording when enabled. — done 2026-09-03
 - Playback resumes after successful stop and after cancellation only when Handy
-  itself paused it.
+  itself paused it. — done 2026-09-03
 - Existing media state is unchanged when the setting is off. — done 2026-09-03
 
 ### Wave 8 — clipboard audit and tested merge
@@ -493,17 +494,17 @@ Owner: Windows/native clipboard agent. Independent, but must complete before Wav
 Deliverables:
 
 - Compare Handy's receipt-sequenced transaction with VoiceSnap's Windows
-  implementation.
+  implementation. — done 2026-09-03
 - Keep Handy's delayed-rendering, receipt, quiet-period, sequence-number, and
-  ownership-loss design if it remains correct.
+  ownership-loss design if it remains correct. — done 2026-09-03
 - Import only tested improvements:
-  - STGMEDIUM-aware format materialization;
-  - full-fidelity text/HTML/RTF/bitmap/file/custom format preservation where safe;
+  - STGMEDIUM-aware format materialization; — done 2026-09-03
+  - full-fidelity text/HTML/RTF/bitmap/file/custom format preservation where safe; — done 2026-09-03
   - newer-owner-wins behavior; — done 2026-09-03
   - delayed-rendering and clipboard-manager races; — done 2026-09-03
   - cancellation and app-exit cleanup; — done 2026-09-03
   - stress coverage over at least 1,000 paste/restore cycles. — done 2026-09-03
-- Do not replace clipboard paste with character-by-character Unicode typing.
+- Do not replace clipboard paste with character-by-character Unicode typing. — done 2026-09-03
 - Keep default paste behavior unchanged until Word, Notepad, browsers, Office,
   Electron, Qt, and elevated-window cases pass manual smoke.
 
@@ -511,7 +512,7 @@ Acceptance:
 
 - Normal paste remains as fast as the baseline after timing is measured.
 - The user's clipboard is restored unless they explicitly chose to preserve the
-  transcript.
+  transcript. — done 2026-09-03
 - A newer user copy is never overwritten. — done 2026-09-03
 - Higher-integrity/UIPI failure produces an actionable fallback message. — done 2026-09-03
 
