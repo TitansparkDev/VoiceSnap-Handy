@@ -6,8 +6,7 @@ use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::HistoryManager;
 use crate::managers::media::RecordingMediaController;
 use crate::managers::model::{EngineType, ModelManager};
-use crate::managers::transcription::StreamWorkKind;
-use crate::managers::transcription::TranscriptionManager;
+use crate::managers::transcription::{StreamWorkKind, TranscriptionManager, TranscriptionOutput};
 use crate::settings::{
     get_settings, AppSettings, InsertionMode, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID,
     LOCAL_CLEANUP_PROVIDER_ID,
@@ -256,14 +255,14 @@ fn insertion_mode_history_value(mode: InsertionMode) -> &'static str {
 }
 
 fn resolve_stream_or_batch<E, F>(
-    stream_result: Result<Option<String>, E>,
+    stream_result: Result<Option<TranscriptionOutput>, E>,
     batch_transcribe: F,
-) -> Result<String, E>
+) -> Result<TranscriptionOutput, E>
 where
-    F: FnOnce() -> Result<String, E>,
+    F: FnOnce() -> Result<TranscriptionOutput, E>,
 {
     match stream_result {
-        Ok(Some(text)) if !text.trim().is_empty() => Ok(text),
+        Ok(Some(output)) if !output.text.trim().is_empty() => Ok(output),
         Ok(_) => batch_transcribe(),
         Err(err) => Err(err),
     }
@@ -1016,8 +1015,10 @@ impl ShortcutAction for TranscribeAction {
                     // batch transcription of the same audio. A finalize timeout is
                     // surfaced instead — the worker may still hold the engine, so a
                     // batch fallback would contend with it.
-                    let transcription_result =
-                        resolve_stream_or_batch(tm.finalize_stream(), || tm.transcribe(samples));
+                    let transcription_result = resolve_stream_or_batch(
+                        tm.finalize_stream_with_vocabulary_metadata(),
+                        || tm.transcribe_with_vocabulary_metadata(samples),
+                    );
                     let history_transcription_total_ms =
                         i64::try_from(transcription_time.elapsed().as_millis()).unwrap_or(i64::MAX);
 
@@ -1070,8 +1071,10 @@ impl ShortcutAction for TranscribeAction {
                             debug!(
                                 "Transcription completed in {:?}: '{}'",
                                 transcription_time.elapsed(),
-                                utils::redact_text(&transcription)
+                                utils::redact_text(&transcription.text)
                             );
+                            let vocabulary_history = transcription.vocabulary.clone();
+                            let transcription = transcription.text;
 
                             if post_process {
                                 if use_streaming_overlay {
@@ -1146,6 +1149,18 @@ impl ShortcutAction for TranscribeAction {
                                     Some("success".to_string()),
                                     Some(history_transcription_total_ms),
                                     history_cleanup_total_ms,
+                                    Some(i64::from(vocabulary_history.version)),
+                                    Some(vocabulary_history.prompted),
+                                    Some(
+                                        i64::try_from(vocabulary_history.alias_replacements)
+                                            .unwrap_or(i64::MAX),
+                                    ),
+                                    Some(
+                                        i64::try_from(vocabulary_history.scoped_replacements)
+                                            .unwrap_or(i64::MAX),
+                                    ),
+                                    Some(vocabulary_history.fuzzy_applied),
+                                    Some(vocabulary_history.failed_open),
                                     history_duration_ms,
                                 ) {
                                     error!("Failed to save history entry: {}", err);
@@ -1258,6 +1273,12 @@ impl ShortcutAction for TranscribeAction {
                                     Some("failure".to_string()),
                                     Some(history_transcription_total_ms),
                                     None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
                                     history_duration_ms,
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);
@@ -1354,6 +1375,7 @@ mod tests {
         should_paste_final_output, should_use_streaming_overlay, strip_think_block,
         CLEANUP_MAX_OUTPUT_CHARS, CLEANUP_OUTPUT_CONTRACT,
     };
+    use crate::managers::transcription::TranscriptionOutput;
     use crate::settings::{AppSettings, InsertionMode, OverlayStyle};
     use std::cell::Cell;
     use std::future;
@@ -1710,12 +1732,16 @@ mod tests {
     #[test]
     fn non_streaming_session_falls_back_to_batch_transcription() {
         let batch_called = Cell::new(false);
-        let result: Result<String, &'static str> = resolve_stream_or_batch(Ok(None), || {
-            batch_called.set(true);
-            Ok("batch transcript".to_string())
-        });
+        let result: Result<TranscriptionOutput, &'static str> =
+            resolve_stream_or_batch(Ok(None), || {
+                batch_called.set(true);
+                Ok(TranscriptionOutput {
+                    text: "batch transcript".to_string(),
+                    ..Default::default()
+                })
+            });
 
-        assert_eq!(result.unwrap(), "batch transcript");
+        assert_eq!(result.unwrap().text, "batch transcript");
         assert!(batch_called.get());
     }
 }

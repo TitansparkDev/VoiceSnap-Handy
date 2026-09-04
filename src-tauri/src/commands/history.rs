@@ -151,14 +151,16 @@ pub async fn retry_history_entry_transcription(
 
     let tm = Arc::clone(&transcription_manager);
     let transcription_started = Instant::now();
-    let transcription = tauri::async_runtime::spawn_blocking(move || tm.transcribe(samples))
-        .await
-        .map_err(|e| format!("Transcription task panicked: {}", e))?
-        .map_err(|e| e.to_string())?;
+    let transcription = tauri::async_runtime::spawn_blocking(move || {
+        tm.transcribe_with_vocabulary_metadata(samples)
+    })
+    .await
+    .map_err(|e| format!("Transcription task panicked: {}", e))?
+    .map_err(|e| e.to_string())?;
     let transcription_total_ms =
         i64::try_from(transcription_started.elapsed().as_millis()).unwrap_or(i64::MAX);
 
-    ensure_retry_transcription_text(&transcription)?;
+    ensure_retry_transcription_text(&transcription.text)?;
 
     let history_settings = crate::settings::get_settings(&app);
     let model_id = transcription_manager.get_current_model().or_else(|| {
@@ -180,6 +182,8 @@ pub async fn retry_history_entry_transcription(
     // output transforms; an AI cleanup is a separate explicit user action.
     // This also prevents a stale cleanup from surviving after the raw transcript
     // changes underneath it.
+    let vocabulary_history = transcription.vocabulary;
+    let transcription = transcription.text;
     let processed = process_transcription_output(&app, &transcription, false).await;
     let cleanup_total_ms = None;
     history_manager
@@ -201,6 +205,12 @@ pub async fn retry_history_entry_transcription(
             Some(processed.cleanup_mode.clone()),
             Some(transcription_total_ms),
             cleanup_total_ms,
+            Some(i64::from(vocabulary_history.version)),
+            Some(vocabulary_history.prompted),
+            Some(i64::try_from(vocabulary_history.alias_replacements).unwrap_or(i64::MAX)),
+            Some(i64::try_from(vocabulary_history.scoped_replacements).unwrap_or(i64::MAX)),
+            Some(vocabulary_history.fuzzy_applied),
+            Some(vocabulary_history.failed_open),
         )
         .map(|_| ())
         .map_err(|e| e.to_string())

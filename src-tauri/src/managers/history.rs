@@ -50,6 +50,12 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN cleanup_prompt_id TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN cleanup_model_id TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN recovery_reason TEXT;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN vocabulary_version INTEGER;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN vocabulary_prompted BOOLEAN;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN vocabulary_alias_replacements INTEGER;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN vocabulary_scoped_replacements INTEGER;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN vocabulary_fuzzy_applied BOOLEAN;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN vocabulary_failed_open BOOLEAN;"),
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -119,6 +125,18 @@ pub struct HistoryEntry {
     pub transcription_total_ms: Option<i64>,
     /// Safe cleanup-stage timing summary when cleanup was requested for this row.
     pub cleanup_total_ms: Option<i64>,
+    /// Version of the rich vocabulary contract used for this ASR result.
+    pub vocabulary_version: Option<i64>,
+    /// Whether the ASR model received bounded canonical vocabulary context.
+    pub vocabulary_prompted: Option<bool>,
+    /// Number of deterministic spoken-alias substitutions applied after decode.
+    pub vocabulary_alias_replacements: Option<i64>,
+    /// Number of deterministic explicit replacement rules applied after decode.
+    pub vocabulary_scoped_replacements: Option<i64>,
+    /// Whether the conservative legacy fuzzy fallback changed the transcript.
+    pub vocabulary_fuzzy_applied: Option<bool>,
+    /// True when optional vocabulary/text normalization panicked and the raw ASR text was preserved.
+    pub vocabulary_failed_open: Option<bool>,
 }
 
 pub struct HistoryManager {
@@ -288,6 +306,12 @@ impl HistoryManager {
             outcome: row.get("outcome")?,
             transcription_total_ms: row.get("transcription_total_ms")?,
             cleanup_total_ms: row.get("cleanup_total_ms")?,
+            vocabulary_version: row.get("vocabulary_version")?,
+            vocabulary_prompted: row.get("vocabulary_prompted")?,
+            vocabulary_alias_replacements: row.get("vocabulary_alias_replacements")?,
+            vocabulary_scoped_replacements: row.get("vocabulary_scoped_replacements")?,
+            vocabulary_fuzzy_applied: row.get("vocabulary_fuzzy_applied")?,
+            vocabulary_failed_open: row.get("vocabulary_failed_open")?,
         })
     }
 
@@ -322,6 +346,12 @@ impl HistoryManager {
         outcome: Option<String>,
         transcription_total_ms: Option<i64>,
         cleanup_total_ms: Option<i64>,
+        vocabulary_version: Option<i64>,
+        vocabulary_prompted: Option<bool>,
+        vocabulary_alias_replacements: Option<i64>,
+        vocabulary_scoped_replacements: Option<i64>,
+        vocabulary_fuzzy_applied: Option<bool>,
+        vocabulary_failed_open: Option<bool>,
         duration_ms: i64,
     ) -> Result<HistoryEntry> {
         let timestamp = Utc::now().timestamp();
@@ -354,9 +384,15 @@ impl HistoryManager {
                 outcome,
                 transcription_total_ms,
                 cleanup_total_ms,
+                vocabulary_version,
+                vocabulary_prompted,
+                vocabulary_alias_replacements,
+                vocabulary_scoped_replacements,
+                vocabulary_fuzzy_applied,
+                vocabulary_failed_open,
                 duration_ms,
                 recovery_reason
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)",
             params![
                 &file_name,
                 timestamp,
@@ -382,6 +418,12 @@ impl HistoryManager {
                 &outcome,
                 transcription_total_ms,
                 cleanup_total_ms,
+                vocabulary_version,
+                vocabulary_prompted,
+                vocabulary_alias_replacements,
+                vocabulary_scoped_replacements,
+                vocabulary_fuzzy_applied,
+                vocabulary_failed_open,
                 duration_ms,
                 &recovery_reason,
             ],
@@ -415,6 +457,12 @@ impl HistoryManager {
             outcome,
             transcription_total_ms,
             cleanup_total_ms,
+            vocabulary_version,
+            vocabulary_prompted,
+            vocabulary_alias_replacements,
+            vocabulary_scoped_replacements,
+            vocabulary_fuzzy_applied,
+            vocabulary_failed_open,
         };
 
         debug!("Saved history entry with id {}", entry.id);
@@ -458,6 +506,12 @@ impl HistoryManager {
         cleanup_mode: Option<String>,
         transcription_total_ms: Option<i64>,
         cleanup_total_ms: Option<i64>,
+        vocabulary_version: Option<i64>,
+        vocabulary_prompted: Option<bool>,
+        vocabulary_alias_replacements: Option<i64>,
+        vocabulary_scoped_replacements: Option<i64>,
+        vocabulary_fuzzy_applied: Option<bool>,
+        vocabulary_failed_open: Option<bool>,
     ) -> Result<HistoryEntry> {
         let conn = self.get_connection()?;
         let updated = conn.execute(
@@ -480,8 +534,14 @@ impl HistoryManager {
                  transcription_total_ms = ?14,
                  cleanup_total_ms = ?15,
                  recovery_reason = ?16,
+                 vocabulary_version = ?17,
+                 vocabulary_prompted = ?18,
+                 vocabulary_alias_replacements = ?19,
+                 vocabulary_scoped_replacements = ?20,
+                 vocabulary_fuzzy_applied = ?21,
+                 vocabulary_failed_open = ?22,
                  outcome = 'success'
-             WHERE id = ?17",
+             WHERE id = ?23",
             params![
                 transcription_text,
                 post_processed_text,
@@ -499,6 +559,12 @@ impl HistoryManager {
                 transcription_total_ms,
                 cleanup_total_ms,
                 recovery_reason,
+                vocabulary_version,
+                vocabulary_prompted,
+                vocabulary_alias_replacements,
+                vocabulary_scoped_replacements,
+                vocabulary_fuzzy_applied,
+                vocabulary_failed_open,
                 id
             ],
         )?;
@@ -509,7 +575,7 @@ impl HistoryManager {
 
         let entry = conn
             .query_row(
-                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms, recovery_reason
+                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms, recovery_reason, vocabulary_version, vocabulary_prompted, vocabulary_alias_replacements, vocabulary_scoped_replacements, vocabulary_fuzzy_applied, vocabulary_failed_open
                  FROM transcription_history WHERE id = ?1",
                 params![id],
                 Self::map_history_entry,
@@ -601,7 +667,7 @@ impl HistoryManager {
         }
 
         conn.query_row(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms, recovery_reason
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms, recovery_reason, vocabulary_version, vocabulary_prompted, vocabulary_alias_replacements, vocabulary_scoped_replacements, vocabulary_fuzzy_applied, vocabulary_failed_open
              FROM transcription_history WHERE id = ?1",
             params![id],
             Self::map_history_entry,
@@ -887,7 +953,7 @@ impl HistoryManager {
         };
 
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms, recovery_reason
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, cleanup_prompt_id, cleanup_model_id, post_process_requested, model_id, engine_type, duration_ms, language, insertion_mode, backend, device, saved_accelerator, saved_gpu_device, recommended_backend, recommended_device, cleanup_mode, outcome, transcription_total_ms, cleanup_total_ms, recovery_reason, vocabulary_version, vocabulary_prompted, vocabulary_alias_replacements, vocabulary_scoped_replacements, vocabulary_fuzzy_applied, vocabulary_failed_open
              FROM transcription_history
              WHERE (?1 IS NULL OR id < ?1)
                AND (
@@ -979,7 +1045,13 @@ impl HistoryManager {
                 outcome,
                 transcription_total_ms,
                 cleanup_total_ms,
-                recovery_reason
+                recovery_reason,
+                vocabulary_version,
+                vocabulary_prompted,
+                vocabulary_alias_replacements,
+                vocabulary_scoped_replacements,
+                vocabulary_fuzzy_applied,
+                vocabulary_failed_open
              FROM transcription_history
              ORDER BY timestamp DESC
              LIMIT 1",
@@ -1024,7 +1096,13 @@ impl HistoryManager {
                 outcome,
                 transcription_total_ms,
                 cleanup_total_ms,
-                recovery_reason
+                recovery_reason,
+                vocabulary_version,
+                vocabulary_prompted,
+                vocabulary_alias_replacements,
+                vocabulary_scoped_replacements,
+                vocabulary_fuzzy_applied,
+                vocabulary_failed_open
              FROM transcription_history
              WHERE transcription_text != ''
              ORDER BY timestamp DESC
@@ -1101,7 +1179,13 @@ impl HistoryManager {
                 outcome,
                 transcription_total_ms,
                 cleanup_total_ms,
-                recovery_reason
+                recovery_reason,
+                vocabulary_version,
+                vocabulary_prompted,
+                vocabulary_alias_replacements,
+                vocabulary_scoped_replacements,
+                vocabulary_fuzzy_applied,
+                vocabulary_failed_open
              FROM transcription_history
              WHERE id = ?1",
         )?;
@@ -1208,7 +1292,13 @@ mod tests {
                 outcome TEXT,
                 transcription_total_ms INTEGER,
                 cleanup_total_ms INTEGER,
-                recovery_reason TEXT
+                recovery_reason TEXT,
+                vocabulary_version INTEGER,
+                vocabulary_prompted BOOLEAN,
+                vocabulary_alias_replacements INTEGER,
+                vocabulary_scoped_replacements INTEGER,
+                vocabulary_fuzzy_applied BOOLEAN,
+                vocabulary_failed_open BOOLEAN
             );",
         )
         .expect("create transcription_history table");
@@ -1335,6 +1425,12 @@ mod tests {
         assert!(entry.outcome.is_none());
         assert!(entry.transcription_total_ms.is_none());
         assert!(entry.cleanup_total_ms.is_none());
+        assert!(entry.vocabulary_version.is_none());
+        assert!(entry.vocabulary_prompted.is_none());
+        assert!(entry.vocabulary_alias_replacements.is_none());
+        assert!(entry.vocabulary_scoped_replacements.is_none());
+        assert!(entry.vocabulary_fuzzy_applied.is_none());
+        assert!(entry.vocabulary_failed_open.is_none());
     }
 
     #[test]
@@ -1473,6 +1569,27 @@ mod tests {
             .expect("fetch language-tagged entry")
             .expect("language-tagged entry exists");
         assert_eq!(entry.language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn history_entry_preserves_vocabulary_operation_metadata() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "vocabulary-tagged recording", None);
+        conn.execute(
+            "UPDATE transcription_history SET vocabulary_version = ?1, vocabulary_prompted = ?2, vocabulary_alias_replacements = ?3, vocabulary_scoped_replacements = ?4, vocabulary_fuzzy_applied = ?5, vocabulary_failed_open = ?6 WHERE timestamp = ?7",
+            params![1_i64, true, 2_i64, 1_i64, false, true, 100_i64],
+        )
+        .expect("store vocabulary operation metadata");
+
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch vocabulary-tagged entry")
+            .expect("vocabulary-tagged entry exists");
+        assert_eq!(entry.vocabulary_version, Some(1));
+        assert_eq!(entry.vocabulary_prompted, Some(true));
+        assert_eq!(entry.vocabulary_alias_replacements, Some(2));
+        assert_eq!(entry.vocabulary_scoped_replacements, Some(1));
+        assert_eq!(entry.vocabulary_fuzzy_applied, Some(false));
+        assert_eq!(entry.vocabulary_failed_open, Some(true));
     }
 
     #[test]

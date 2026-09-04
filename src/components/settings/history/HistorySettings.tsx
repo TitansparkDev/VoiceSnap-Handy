@@ -716,6 +716,20 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   ]
     .filter(Boolean)
     .join(" · ");
+  const vocabularyReplacementCount =
+    (entry.vocabulary_alias_replacements ?? 0) +
+    (entry.vocabulary_scoped_replacements ?? 0);
+  const vocabularyOperationLabel = entry.vocabulary_failed_open
+    ? t("settings.history.vocabularyFailedOpen", {
+        defaultValue: "Vocabulary failed open — original transcript kept",
+      })
+    : vocabularyReplacementCount > 0 || entry.vocabulary_fuzzy_applied
+      ? t("settings.history.vocabularyApplied", {
+          defaultValue: "Vocabulary: {{count}} replacements{{fuzzy}}",
+          count: vocabularyReplacementCount,
+          fuzzy: entry.vocabulary_fuzzy_applied ? " + fuzzy" : "",
+        })
+      : null;
 
   return (
     <div className="px-4 py-2 pb-5 flex flex-col gap-3">
@@ -762,7 +776,8 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
             <span
               className="rounded bg-mid-gray/10 px-1.5 py-0.5 text-[10px] text-text/50"
               title={t("settings.history.recommendedRuntime", {
-                defaultValue: "Recommended backend and device before runtime fallback",
+                defaultValue:
+                  "Recommended backend and device before runtime fallback",
               })}
             >
               {t("settings.history.recommendedRuntimeShort", {
@@ -812,6 +827,17 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
               })}
             >
               {stageTimingLabel}
+            </span>
+          )}
+          {vocabularyOperationLabel && (
+            <span
+              className="rounded bg-mid-gray/10 px-1.5 py-0.5 text-[10px] text-text/50"
+              title={t("settings.history.vocabularyOperation", {
+                defaultValue: "Vocabulary operation (schema v{{version}})",
+                version: entry.vocabulary_version ?? 1,
+              })}
+            >
+              {vocabularyOperationLabel}
             </span>
           )}
         </div>
