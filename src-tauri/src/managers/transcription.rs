@@ -1697,6 +1697,7 @@ impl TranscriptionManager {
     /// to batch transcription. `Err` means finalize itself failed or timed out.
     /// A timeout may still leave the worker holding the engine, so callers
     /// should surface it instead of immediately starting a batch fallback.
+    #[allow(dead_code)]
     pub fn finalize_stream(&self) -> Result<Option<String>> {
         Ok(self
             .finalize_stream_with_benchmark_timing()?
