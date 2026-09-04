@@ -195,29 +195,41 @@ export const PerformanceSettings: React.FC = () => {
 
             <div className="grid grid-cols-2 md:grid-cols-3 gap-2 text-sm">
               <div className="rounded-md bg-mid-gray/10 p-2">
-                <div className="text-xs text-mid-gray">Model</div>
+                <div className="text-xs text-mid-gray">
+                  {t("settings.performance.model", { defaultValue: "Model" })}
+                </div>
                 <div className="truncate" title={latest.model_id ?? undefined}>{latest.model_id ?? "—"}</div>
               </div>
               <div className="rounded-md bg-mid-gray/10 p-2">
-                <div className="text-xs text-mid-gray">Engine</div>
+                <div className="text-xs text-mid-gray">
+                  {t("settings.performance.engine", { defaultValue: "Engine" })}
+                </div>
                 <div>{latest.engine_type ?? "—"}</div>
               </div>
               <div className="rounded-md bg-mid-gray/10 p-2">
-                <div className="text-xs text-mid-gray">Backend / device</div>
+                <div className="text-xs text-mid-gray">
+                  {t("settings.performance.backendDevice", { defaultValue: "Backend / device" })}
+                </div>
                 <div className="truncate" title={[latest.backend, latest.device].filter(Boolean).join(" / ") || undefined}>
                   {[latest.backend, latest.device].filter(Boolean).join(" / ") || "—"}
                 </div>
               </div>
               <div className="rounded-md bg-mid-gray/10 p-2">
-                <div className="text-xs text-mid-gray">Recording</div>
+                <div className="text-xs text-mid-gray">
+                  {t("settings.performance.recording", { defaultValue: "Recording" })}
+                </div>
                 <div>{formatMs(latest.recording_ms)}</div>
               </div>
               <div className="rounded-md bg-mid-gray/10 p-2">
-                <div className="text-xs text-mid-gray">First partial</div>
+                <div className="text-xs text-mid-gray">
+                  {t("settings.performance.firstPartial", { defaultValue: "First partial" })}
+                </div>
                 <div>{formatMs(latest.first_partial_ms)}</div>
               </div>
               <div className="rounded-md bg-mid-gray/10 p-2">
-                <div className="text-xs text-mid-gray">Mode</div>
+                <div className="text-xs text-mid-gray">
+                  {t("settings.performance.mode", { defaultValue: "Mode" })}
+                </div>
                 <div className="truncate" title={`${latest.insertion_mode} / ${latest.cleanup_mode}`}>
                   {latest.insertion_mode} / {latest.cleanup_mode}
                 </div>
@@ -245,23 +257,42 @@ export const PerformanceSettings: React.FC = () => {
 
           <section className="rounded-lg border border-mid-gray/20 p-4 space-y-3">
             <div className="flex items-center justify-between">
-              <h3 className="font-medium">p50 / p95</h3>
-              <span className="text-xs text-mid-gray">{snapshot?.sample_count ?? 0} retained / 200 max</span>
+              <h3 className="font-medium">
+                {t("settings.performance.percentiles", { defaultValue: "p50 / p95" })}
+              </h3>
+              <span className="text-xs text-mid-gray">
+                {t("settings.performance.retainedSamples", {
+                  count: snapshot?.sample_count ?? 0,
+                  defaultValue: "{{count}} retained / 200 max",
+                })}
+              </span>
             </div>
             <div className="space-y-3">
               {snapshot?.windows.map((windowSummary) => (
                 <div key={windowSummary.window} className="rounded-md bg-mid-gray/5 p-3">
                   <div className="text-sm font-medium mb-2">
-                    Last {windowSummary.window} · {windowSummary.sample_count} sample{windowSummary.sample_count === 1 ? "" : "s"}
+                    {t("settings.performance.windowSamples", {
+                      window: windowSummary.window,
+                      count: windowSummary.sample_count,
+                      defaultValue: "Last {{window}} · {{count}} samples",
+                    })}
                   </div>
                   {windowSummary.stages.length === 0 ? (
-                    <div className="text-xs text-mid-gray">No stage timings yet.</div>
+                    <div className="text-xs text-mid-gray">
+                      {t("settings.performance.noStageTimings", { defaultValue: "No stage timings yet." })}
+                    </div>
                   ) : (
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-1 text-xs">
                       {windowSummary.stages.map((stage) => (
                         <div key={stage.stage} className="flex justify-between gap-3 border-b border-mid-gray/10 py-1">
                           <span className="truncate" title={formatStageName(stage.stage)}>{formatStageName(stage.stage)}</span>
-                          <span className="shrink-0">p50 {formatMs(stage.p50_ms)} · p95 {formatMs(stage.p95_ms)}</span>
+                          <span className="shrink-0">
+                            {t("settings.performance.stagePercentiles", {
+                              p50: formatMs(stage.p50_ms),
+                              p95: formatMs(stage.p95_ms),
+                              defaultValue: "p50 {{p50}} · p95 {{p95}}",
+                            })}
+                          </span>
                         </div>
                       ))}
                     </div>
