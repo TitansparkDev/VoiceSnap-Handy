@@ -6,6 +6,8 @@ import { existsSync, statSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
+export const SHORT_DICTATION_FIXTURE_ID = "punctuation";
+
 export const FIXTURES = Object.freeze([
   Object.freeze({
     id: "punctuation",
@@ -469,12 +471,29 @@ export async function runFixture(endpoint, model, fixture, timeoutMs, profile = 
   }
 }
 
-function summarizeCandidate(candidate, measurements, resources) {
+export function summarizeCandidate(candidate, measurements, resources) {
   const successfulLatencies = measurements.filter((item) => item.success).map((item) => item.latency_ms);
   const successful = measurements.filter((item) => item.success).length;
   const correct = measurements.filter((item) => item.correct).length;
   const fixtureCount = FIXTURES.length;
   const expectedRuns = fixtureCount * measurements.reduce((max, item) => Math.max(max, item.run), 0);
+  const fixtures = FIXTURES.map((fixture) => {
+    const rows = measurements.filter((item) => item.fixture === fixture.id);
+    const latencies = rows.filter((item) => item.success).map((item) => item.latency_ms);
+    return {
+      id: fixture.id,
+      success: rows.every((item) => item.success),
+      correct: rows.every((item) => item.correct),
+      cleanup_latency_ms: {
+        p50: percentile(latencies, 50),
+        p95: percentile(latencies, 95),
+        max: latencies.length ? Math.max(...latencies) : null,
+      },
+      latencies_ms: rows.map((item) => item.latency_ms),
+      errors: [...new Set(rows.map((item) => item.error).filter(Boolean))],
+    };
+  });
+  const shortDictation = fixtures.find((fixture) => fixture.id === SHORT_DICTATION_FIXTURE_ID);
   return {
     ...candidateIdentity(candidate),
     success: successful === expectedRuns,
@@ -488,16 +507,11 @@ function summarizeCandidate(candidate, measurements, resources) {
       max: successfulLatencies.length ? Math.max(...successfulLatencies) : null,
     },
     resource_observations: resources,
-    fixtures: FIXTURES.map((fixture) => {
-      const rows = measurements.filter((item) => item.fixture === fixture.id);
-      return {
-        id: fixture.id,
-        success: rows.every((item) => item.success),
-        correct: rows.every((item) => item.correct),
-        latencies_ms: rows.map((item) => item.latency_ms),
-        errors: [...new Set(rows.map((item) => item.error).filter(Boolean))],
-      };
-    }),
+    short_dictation_fixture: {
+      id: SHORT_DICTATION_FIXTURE_ID,
+      cleanup_latency_ms: shortDictation?.cleanup_latency_ms ?? { p50: null, p95: null, max: null },
+    },
+    fixtures,
   };
 }
 
@@ -611,6 +625,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     schema_version: 1,
     fixture_set: "wave1-cleanup-short-v1",
     runs_per_fixture: options.runs,
+    short_dictation_fixture_id: SHORT_DICTATION_FIXTURE_ID,
     request_timeout_ms: options.requestTimeoutMs,
     endpoint_scope: "loopback-only",
     offline_contract: {

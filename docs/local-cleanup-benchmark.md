@@ -50,7 +50,7 @@ Each candidate is loaded independently through the configured local runtime. Sto
 
 ## What is measured
 
-The fixed fixture set exercises short cleanup cases for punctuation, number words, spoken punctuation, filler removal, questions, and transcript text that looks like an instruction. The harness runs every fixture three times by default and records:
+The fixed fixture set exercises one-sentence cleanup cases for punctuation, number words, spoken punctuation, filler removal, questions, and transcript text that looks like an instruction. The `punctuation` case is the designated short-dictation fixture. The harness runs every fixture three times by default and reports a dedicated repeatable p50/p95/max for that fixture in addition to the aggregate candidate timing. It records:
 
 - candidate label and prompt profile;
 - local model asset file name, size, and not the full path;
@@ -58,6 +58,7 @@ The fixed fixture set exercises short cleanup cases for punctuation, number word
 - accepted-output correctness;
 - cleanup latency per fixture;
 - candidate p50, p95, and maximum cleanup latency;
+- designated short-dictation fixture p50, p95, and maximum cleanup latency, plus per-fixture timing summaries;
 - runtime startup time;
 - observed child-process RSS on Linux (startup and maximum sampled RSS).
 
@@ -65,7 +66,7 @@ Use `--runs N` to change the sample count. `--request-timeout-ms` defaults to 20
 
 The JSON result intentionally does **not** contain fixture input text, model output text, transcript history, audio, clipboard contents, window titles, API keys, or full local file paths. It includes an `offline_contract` block recording that external network dependency is disabled, model assets are local-only, model-hub lookups are disabled, and proxy use is bypassed. The committed fixture text is static test data and is only sent to the loopback runtime during the benchmark.
 
-The automated harness test also inspects the exact completion request shape: the local model receives only the cleanup system instruction plus transcript text and generation controls. No audio, clipboard contents, window title, foreground-application identity, or unrelated application data field exists in the request contract.
+The automated harness test also inspects the exact completion request shape: the local model receives only the cleanup system instruction plus transcript text and generation controls. No audio, clipboard contents, window title, foreground-application identity, or unrelated application data field exists in the request contract. A second test fixes three timing samples for the designated one-sentence dictation and proves the emitted p50/p95 are deterministic and contain no fixture text.
 
 A candidate should only be considered after checking both correctness and latency. A lower p50/p95 does not compensate for failed fixtures, malformed cleanup output, or repeated request failures. Linux RSS is sampled after startup and after each request; it is an observation, not a platform-independent peak-memory guarantee.
 

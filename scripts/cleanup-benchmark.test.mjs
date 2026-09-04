@@ -14,6 +14,8 @@ import {
   percentile,
   replaceModelPath,
   runFixture,
+  SHORT_DICTATION_FIXTURE_ID,
+  summarizeCandidate,
 } from "./cleanup-benchmark.mjs";
 
 test("candidate specs separate reporting labels from local asset paths", () => {
@@ -138,6 +140,32 @@ test("nearest-rank percentiles stay deterministic for small benchmark samples", 
   assert.equal(percentile([40, 10, 30, 20], 50), 20);
   assert.equal(percentile([40, 10, 30, 20], 95), 40);
   assert.equal(percentile([], 50), null);
+});
+
+test("short dictation evidence reports repeatable per-fixture p50 and p95", () => {
+  const measurements = [];
+  for (let run = 1; run <= 3; run += 1) {
+    for (const fixture of ["punctuation", "number_words", "spoken_punctuation", "filler_question", "instruction_text"]) {
+      measurements.push({
+        fixture,
+        run,
+        latency_ms: fixture === SHORT_DICTATION_FIXTURE_ID ? run * 10 : 5,
+        success: true,
+        correct: true,
+        error: null,
+      });
+    }
+  }
+  const summary = summarizeCandidate(
+    { label: "fixture-model", modelPath: "/models/fixture.gguf", profile: "generic-v1" },
+    measurements,
+    {},
+  );
+  assert.deepEqual(summary.short_dictation_fixture, {
+    id: "punctuation",
+    cleanup_latency_ms: { p50: 20, p95: 30, max: 30 },
+  });
+  assert.equal(JSON.stringify(summary.short_dictation_fixture).includes("please send"), false);
 });
 
 test("s1-mini profile uses its trained control contract and greedy decoding", async (t) => {
