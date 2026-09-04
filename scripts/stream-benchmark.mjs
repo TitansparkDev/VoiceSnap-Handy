@@ -9,19 +9,23 @@ import { pathToFileURL } from "node:url";
 
 export const WAVE2_MODEL_CONTRACT = Object.freeze([
   {
-    id: "handy-computer/parakeet-unified-en-0.6b-gguf",
+    id: "handy-computer/parakeet-unified-en-0.6b-gguf/parakeet-unified-en-0.6b-Q8_0.gguf",
+    catalog_id: "handy-computer/parakeet-unified-en-0.6b-gguf",
     catalog_path: "streaming_capable",
   },
   {
-    id: "handy-computer/nemotron-3.5-asr-streaming-0.6b-gguf",
+    id: "handy-computer/nemotron-3.5-asr-streaming-0.6b-gguf/nemotron-3.5-asr-streaming-0.6b-Q8_0.gguf",
+    catalog_id: "handy-computer/nemotron-3.5-asr-streaming-0.6b-gguf",
     catalog_path: "streaming_capable",
   },
   {
-    id: "handy-computer/moonshine-streaming-tiny-gguf",
+    id: "handy-computer/moonshine-streaming-tiny-gguf/moonshine-streaming-tiny-Q8_0.gguf",
+    catalog_id: "handy-computer/moonshine-streaming-tiny-gguf",
     catalog_path: "streaming_capable",
   },
   {
-    id: "handy-computer/whisper-large-v3-turbo-gguf",
+    id: "handy-computer/whisper-large-v3-turbo-gguf/whisper-large-v3-turbo-Q8_0.gguf",
+    catalog_id: "handy-computer/whisper-large-v3-turbo-gguf",
     catalog_path: "final_only",
   },
 ]);
@@ -154,7 +158,7 @@ export function parseArgs(argv, env = process.env) {
 }
 
 function helpText() {
-  return `VoiceSnap-Handy stream benchmark\n\nUsage:\n  npm run bench:stream -- --binary PATH --fixture short=short.wav --reference short=short.txt --model MODEL_ID\n  npm run bench:stream -- --binary PATH --live-seconds 10 --live-reference phrase.txt --model MODEL_ID\n\nOptions:\n  --binary PATH               Built Handy executable. May also use HANDY_BENCHMARK_BINARY.\n  --fixture LABEL=WAV_PATH    Fixed 16 kHz mono 16-bit PCM fixture. Repeat for short/medium/long WAVs.\n  --reference LABEL=TEXT_PATH Optional reference transcript for deterministic WER; label must match a fixture.\n  --live-seconds N            Record a real microphone session for N seconds through the same StreamRouter.\n  --live-label LABEL          Stable aggregate label for live sessions (default: live).\n  --live-reference TEXT_PATH  Optional phrase reference for deterministic live-session WER.\n  --model ID                  Installed local catalog/custom model ID. Repeat to compare models.\n  --wave2-models              Compare Parakeet Unified, Nemotron Streaming 3.5, Moonshine Streaming Tiny, and Whisper Large v3 Turbo.\n  --runs N                    Repetitions per model/input with one cold load (default: 3).\n  --frame-ms N                Fixed-WAV real-time feed frame size (default: 100 ms).\n  --device-index N            Optional transcribe-cpp device index from --list-devices.\n  --json PATH                 Write safe aggregate JSON. Transcript/reference text is never stored.\n  -h, --help                  Show this help.\n\nFixed WAV and live microphone modes use the same timing schema. Optional references add word-error-rate in thousandths (0 = exact, 1000 = 100%) without emitting recognized or expected text. Streaming runs report first partial, committed cadence, finalization tail, and total time. Final-only models intentionally report null first-partial/cadence metrics. Model assets must already be installed; this command performs no downloads.\n`;
+  return `VoiceSnap-Handy stream benchmark\n\nUsage:\n  npm run bench:stream -- --binary PATH --fixture short=short.wav --reference short=short.txt --model MODEL_ID\n  npm run bench:stream -- --binary PATH --live-seconds 10 --live-reference phrase.txt --model MODEL_ID\n\nOptions:\n  --binary PATH               Built Handy executable. May also use HANDY_BENCHMARK_BINARY.\n  --fixture LABEL=WAV_PATH    Fixed 16 kHz mono 16-bit PCM fixture. Repeat for short/medium/long WAVs.\n  --reference LABEL=TEXT_PATH Optional reference transcript for deterministic WER; label must match a fixture.\n  --live-seconds N            Record a real microphone session for N seconds through the same StreamRouter.\n  --live-label LABEL          Stable aggregate label for live sessions (default: live).\n  --live-reference TEXT_PATH  Optional phrase reference for deterministic live-session WER.\n  --model ID                  Installed local catalog/custom model ID. Repeat to compare models.\n  --wave2-models              Compare the default Q8 catalog entries for Parakeet Unified, Nemotron Streaming 3.5, Moonshine Streaming Tiny, and Whisper Large v3 Turbo.\n  --runs N                    Repetitions per model/input with one cold load (default: 3).\n  --frame-ms N                Fixed-WAV real-time feed frame size (default: 100 ms).\n  --device-index N            Optional transcribe-cpp device index from --list-devices.\n  --json PATH                 Write safe aggregate JSON. Transcript/reference text is never stored.\n  -h, --help                  Show this help.\n\nFixed WAV and live microphone modes use the same timing schema. Optional references add word-error-rate in thousandths (0 = exact, 1000 = 100%) without emitting recognized or expected text. Streaming runs report first partial, committed cadence, finalization tail, and total time. Final-only models intentionally report null first-partial/cadence metrics. Model assets must already be installed; this command performs no downloads.\n`;
 }
 
 function safeFileIdentity(path, kind) {
@@ -195,6 +199,48 @@ function runProcess(binary, args) {
     child.on("error", () => resolvePromise({ code: -1, stdout: "" }));
     child.on("close", (code) => resolvePromise({ code: code ?? -1, stdout }));
   });
+}
+
+export async function inspectModelAvailability(
+  options,
+  processRunner = runProcess,
+) {
+  const result = await processRunner(options.binary, [
+    "--list-models",
+    "--json",
+  ]);
+  if (result.code !== 0) return null;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(result.stdout.trim());
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+
+  const byId = new Map(parsed.map((model) => [model.id, model]));
+  return new Map(
+    options.models.map((model) => {
+      const listed = byId.get(model);
+      if (!listed) {
+        return [
+          model,
+          { availability: "unknown_model", supports_streaming: null },
+        ];
+      }
+      return [
+        model,
+        {
+          availability: listed.is_downloaded ? "installed" : "not_installed",
+          supports_streaming:
+            typeof listed.supports_streaming === "boolean"
+              ? listed.supports_streaming
+              : null,
+        },
+      ];
+    }),
+  );
 }
 
 export function summarizeSamples(samples) {
@@ -307,6 +353,7 @@ export async function evaluate(
     input_mode: "fixed_wav",
     model,
     catalog_path: contract?.catalog_path ?? "custom_or_unclassified",
+    availability: "installed",
     success: summary.worker_released,
     audio_secs: parsed.audio_secs,
     load_ms: parsed.load_ms,
@@ -377,6 +424,7 @@ export async function evaluateLive(options, model, processRunner = runProcess) {
     live_seconds: options.liveSeconds,
     model,
     catalog_path: contract?.catalog_path ?? "custom_or_unclassified",
+    availability: "installed",
     success: summary.worker_released,
     audio_secs: parsed.audio_secs,
     load_ms: parsed.load_ms,
@@ -385,18 +433,95 @@ export async function evaluateLive(options, model, processRunner = runProcess) {
   };
 }
 
+function unavailableBenchmarkResult(
+  options,
+  fixture,
+  model,
+  status,
+  inputMode,
+) {
+  const contract = WAVE2_MODEL_CONTRACT.find(
+    (candidate) => candidate.id === model,
+  );
+  const reference =
+    inputMode === "fixed_wav"
+      ? (options.references ?? []).find(
+          (candidate) => candidate.label === fixture.label,
+        )
+      : null;
+  const identity =
+    inputMode === "fixed_wav"
+      ? { ...fixtureIdentity(fixture), ...referenceIdentity(reference?.path) }
+      : {
+          fixture: options.liveLabel,
+          ...referenceIdentity(options.liveReference),
+        };
+  const error =
+    status.availability === "not_installed"
+      ? "model_not_installed"
+      : "model_not_listed";
+  return {
+    ...identity,
+    input_mode: inputMode,
+    model,
+    catalog_path: contract?.catalog_path ?? "custom_or_unclassified",
+    availability: status.availability,
+    success: false,
+    error,
+    mode: null,
+    worker_released: false,
+    first_partial_ms: { p50: null, p95: null },
+    committed_cadence_ms: { p50: null, p95: null, samples: 0 },
+    finalization_tail_ms: { p50: null, p95: null },
+    total_ms: { p50: null, p95: null },
+    quality: {
+      metric: "word_error_rate_milli",
+      p50: null,
+      p95: null,
+      samples: 0,
+    },
+  };
+}
+
 export async function evaluateBenchmarkMatrix(
   options,
   processRunner = runProcess,
+  availabilityByModel = null,
 ) {
   const results = [];
   for (const fixture of options.fixtures) {
     for (const model of options.models) {
+      const status = availabilityByModel?.get(model);
+      if (status && status.availability !== "installed") {
+        results.push(
+          unavailableBenchmarkResult(
+            options,
+            fixture,
+            model,
+            status,
+            "fixed_wav",
+          ),
+        );
+        continue;
+      }
       results.push(await evaluate(options, fixture, model, processRunner));
     }
   }
   if (options.liveSeconds !== null && options.liveSeconds !== undefined) {
     for (const model of options.models) {
+      const status = availabilityByModel?.get(model);
+      if (status && status.availability !== "installed") {
+        results.push(
+          unavailableBenchmarkResult(
+            options,
+            null,
+            model,
+            status,
+            "live_microphone",
+          ),
+        );
+        continue;
+      }
       results.push(await evaluateLive(options, model, processRunner));
     }
   }
@@ -405,7 +530,7 @@ export async function evaluateBenchmarkMatrix(
 
 function printResults(results) {
   console.log(
-    "input\tfixture\tmodel\tmode\tquality_wer_milli_p50\tfirst_p50\tcadence_p50\tfinalize_p50\ttotal_p50\tworker_released\tsuccess",
+    "input\tfixture\tmodel\tavailability\tmode\tquality_wer_milli_p50\tfirst_p50\tcadence_p50\tfinalize_p50\ttotal_p50\tworker_released\tsuccess",
   );
   for (const result of results.results) {
     console.log(
@@ -413,6 +538,7 @@ function printResults(results) {
         result.input_mode ?? "-",
         result.fixture,
         result.model,
+        result.availability ?? "unchecked",
         result.mode ?? "-",
         result.quality?.p50 ?? "-",
         result.first_partial_ms?.p50 ?? "-",
@@ -434,15 +560,17 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   }
   if (!existsSync(options.binary))
     throw new Error(`Benchmark binary not found: ${options.binary}`);
+  const availability = await inspectModelAvailability(options);
   const results = {
-    schema_version: 2,
+    schema_version: 3,
     fixture_set:
       options.liveSeconds === null
         ? "fixed-wav-sha256"
         : "fixed-wav-and-live-microphone",
     runs_per_fixture: options.runs,
     frame_ms: options.frameMs,
-    results: await evaluateBenchmarkMatrix(options),
+    availability_checked: availability !== null,
+    results: await evaluateBenchmarkMatrix(options, runProcess, availability),
   };
   printResults(results);
   if (options.jsonPath)

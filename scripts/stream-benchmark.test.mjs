@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   evaluateBenchmarkMatrix,
   fixtureIdentity,
+  inspectModelAvailability,
   parseArgs,
   parseFixture,
   parseReference,
@@ -75,11 +76,19 @@ test("Wave 2 catalog contract keeps streaming candidates and Whisper Turbo final
   );
   const byId = new Map(catalog.models.map((model) => [model.id, model]));
   for (const candidate of WAVE2_MODEL_CONTRACT) {
-    const catalogModel = byId.get(candidate.id);
-    assert.ok(catalogModel, `missing catalog model ${candidate.id}`);
+    const catalogModel = byId.get(candidate.catalog_id);
+    assert.ok(catalogModel, `missing catalog model ${candidate.catalog_id}`);
     assert.equal(
       candidate.catalog_path,
       catalogModel.capabilities.streaming ? "streaming_capable" : "final_only",
+    );
+    const defaultFile = catalogModel.files.find(
+      (file) => file.quant === catalogModel.default_quant,
+    );
+    assert.ok(defaultFile, `missing default quant for ${candidate.catalog_id}`);
+    assert.equal(
+      candidate.id,
+      `${candidate.catalog_id}/${defaultFile.filename}`,
     );
   }
   const whisper = WAVE2_MODEL_CONTRACT.find((candidate) =>
@@ -92,6 +101,113 @@ test("Wave 2 catalog contract keeps streaming candidates and Whisper Turbo final
     ).length,
     3,
   );
+});
+
+test("availability preflight distinguishes installed, missing, and unknown runtime IDs", async () => {
+  const options = {
+    binary: "/fake/handy",
+    models: [WAVE2_MODELS[0], WAVE2_MODELS[1], "custom/missing"],
+  };
+  const fakeRunner = async (_binary, args) => {
+    assert.deepEqual(args, ["--list-models", "--json"]);
+    return {
+      code: 0,
+      stdout: JSON.stringify([
+        {
+          id: WAVE2_MODELS[0],
+          is_downloaded: true,
+          supports_streaming: true,
+        },
+        {
+          id: WAVE2_MODELS[1],
+          is_downloaded: false,
+          supports_streaming: true,
+        },
+      ]),
+    };
+  };
+
+  const availability = await inspectModelAvailability(options, fakeRunner);
+  assert.deepEqual(availability.get(WAVE2_MODELS[0]), {
+    availability: "installed",
+    supports_streaming: true,
+  });
+  assert.deepEqual(availability.get(WAVE2_MODELS[1]), {
+    availability: "not_installed",
+    supports_streaming: true,
+  });
+  assert.deepEqual(availability.get("custom/missing"), {
+    availability: "unknown_model",
+    supports_streaming: null,
+  });
+});
+
+test("matrix reports unavailable models with null timing and quality instead of launching them", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "handy-stream-unavailable-"));
+  const wav = join(dir, "short.wav");
+  writeFileSync(wav, Buffer.from("fixture"));
+  const installed = WAVE2_MODELS[0];
+  const unavailable = WAVE2_MODELS[1];
+  const options = {
+    binary: "/fake/handy",
+    fixtures: [{ label: "short", path: wav }],
+    references: [],
+    models: [installed, unavailable],
+    runs: 1,
+    frameMs: 100,
+    liveSeconds: null,
+    deviceIndex: null,
+  };
+  const availability = new Map([
+    [installed, { availability: "installed", supports_streaming: true }],
+    [unavailable, { availability: "not_installed", supports_streaming: true }],
+  ]);
+  let benchmarkCalls = 0;
+  const fakeRunner = async (_binary, args) => {
+    benchmarkCalls += 1;
+    assert.equal(args[args.indexOf("--model") + 1], installed);
+    return {
+      code: 0,
+      stdout: JSON.stringify({
+        audio_secs: 1,
+        load_ms: 10,
+        samples: [
+          {
+            mode: "streaming",
+            first_partial_ms: 100,
+            committed_cadence_ms: [80],
+            finalization_tail_ms: 40,
+            total_ms: 1040,
+            worker_released: true,
+            word_error_rate_milli: 0,
+          },
+        ],
+      }),
+    };
+  };
+
+  const results = await evaluateBenchmarkMatrix(
+    options,
+    fakeRunner,
+    availability,
+  );
+  assert.equal(benchmarkCalls, 1);
+  const missing = results.find((result) => result.model === unavailable);
+  assert.equal(missing.success, false);
+  assert.equal(missing.availability, "not_installed");
+  assert.equal(missing.error, "model_not_installed");
+  assert.deepEqual(missing.first_partial_ms, { p50: null, p95: null });
+  assert.deepEqual(missing.committed_cadence_ms, {
+    p50: null,
+    p95: null,
+    samples: 0,
+  });
+  assert.deepEqual(missing.quality, {
+    metric: "word_error_rate_milli",
+    p50: null,
+    p95: null,
+    samples: 0,
+  });
 });
 
 test("final-only samples do not invent partial or cadence timing", () => {
