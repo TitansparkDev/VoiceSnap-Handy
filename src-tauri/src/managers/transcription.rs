@@ -444,6 +444,10 @@ pub struct TranscriptionManager {
     /// fails during inference, later persisted loads use CPU for this app run
     /// without rewriting the user's saved accelerator preference.
     force_cpu_for_run: Arc<AtomicBool>,
+    /// Monotonic token source for committed-only insertion sessions. Attempt
+    /// sequence numbers restart per recording, so queued native-input work also
+    /// carries this token to reject stale work after cancellation/model teardown.
+    next_live_insertion_session_id: Arc<AtomicU64>,
     /// Optional committed-only insertion ledger for the currently active session.
     live_insertion: Arc<Mutex<Option<LiveInsertionLedger>>>,
     /// Sticky within one recording session. A model unload/cancel/engine failure
@@ -475,6 +479,7 @@ impl TranscriptionManager {
             selection_plan: Arc::new(Mutex::new(None)),
             runtime_metadata: Arc::new(Mutex::new(None)),
             force_cpu_for_run: Arc::new(AtomicBool::new(false)),
+            next_live_insertion_session_id: Arc::new(AtomicU64::new(1)),
             live_insertion: Arc::new(Mutex::new(None)),
             live_insertion_blocks_final_paste_after_clear: Arc::new(AtomicBool::new(false)),
         };
@@ -1130,7 +1135,12 @@ impl TranscriptionManager {
             .flatten();
         self.live_insertion_blocks_final_paste_after_clear
             .store(false, Ordering::Release);
-        *self.live_insertion.lock().unwrap() = Some(LiveInsertionLedger::new(mode, target));
+        let session_id = self
+            .next_live_insertion_session_id
+            .fetch_add(1, Ordering::Relaxed);
+        *self.live_insertion.lock().unwrap() = Some(LiveInsertionLedger::with_session_id(
+            mode, target, session_id,
+        ));
     }
 
     /// Mode fixed at session start. Callers use this for history/final-output
@@ -1200,13 +1210,14 @@ impl TranscriptionManager {
 
     pub(crate) fn record_live_insertion_result(
         &self,
+        session_id: u64,
         sequence: u64,
         outcome: LiveInsertionOutcome,
     ) -> bool {
         let mut guard = self.live_insertion.lock().unwrap();
         let recorded = guard
             .as_mut()
-            .is_some_and(|ledger| ledger.record_attempt_result(sequence, outcome));
+            .is_some_and(|ledger| ledger.record_attempt_result(session_id, sequence, outcome));
         clear_terminal_live_insertion_state(
             &mut guard,
             self.live_insertion_blocks_final_paste_after_clear.as_ref(),
@@ -1275,14 +1286,29 @@ impl TranscriptionManager {
     /// planning and queued native input. The call waits for that exact attempt so
     /// committed-prefix accounting cannot run ahead of uncertain delivery.
     fn execute_live_insertion_attempt(&self, attempt: LiveInsertionAttempt) {
+        let session_id = attempt.session_id;
         let sequence = attempt.sequence;
+        let attempt_for_authorization = attempt.clone();
         let expected_target = attempt.target;
         let text = attempt.text;
         let app_handle = self.app_handle.clone();
         let app_for_input = app_handle.clone();
+        let live_insertion = Arc::clone(&self.live_insertion);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
 
         let schedule_result = app_handle.run_on_main_thread(move || {
+            // Serialize authorization with cancellation/model teardown. A task
+            // queued for an old recording must not become armed merely because a
+            // new recording reused the same per-session sequence number.
+            let guard = live_insertion.lock().unwrap();
+            if !guard
+                .as_ref()
+                .is_some_and(|ledger| ledger.authorizes_attempt(&attempt_for_authorization))
+            {
+                let _ = result_tx.send(None);
+                return;
+            }
+
             let current_target = crate::paste_tx::capture_target_identity();
             let outcome = match current_target {
                 None => LiveInsertionOutcome::TargetLost,
@@ -1295,19 +1321,20 @@ impl TranscriptionManager {
                     }
                 },
             };
-            let _ = result_tx.send(outcome);
+            drop(guard);
+            let _ = result_tx.send(Some(outcome));
         });
 
         let outcome = match schedule_result {
-            Ok(()) => result_rx
-                .recv()
-                .unwrap_or(LiveInsertionOutcome::InputFailed),
+            Ok(()) => result_rx.recv().ok().flatten(),
             Err(error) => {
                 warn!("Failed to schedule live insertion on main thread: {error}");
-                LiveInsertionOutcome::InputFailed
+                Some(LiveInsertionOutcome::InputFailed)
             }
         };
-        let _ = self.record_live_insertion_result(sequence, outcome);
+        if let Some(outcome) = outcome {
+            let _ = self.record_live_insertion_result(session_id, sequence, outcome);
+        }
     }
 
     /// Begin a live streaming transcription on the held engine's session.
@@ -3149,6 +3176,44 @@ mod tests {
 
         assert_eq!(event.committed_for_live_insertion(), "stable prefix");
         assert!(!event.committed_for_live_insertion().contains("volatile"));
+    }
+
+    #[test]
+    fn tentative_revisions_never_advance_the_committed_insertion_ledger() {
+        let target = crate::paste_tx::TargetIdentity::for_test("target-a");
+        let mut ledger = LiveInsertionLedger::with_session_id(
+            InsertionMode::LiveCommittedExperimental,
+            Some(target.clone()),
+            7,
+        );
+        assert!(ledger.observe_speech_evidence(Some(&target)).is_none());
+
+        let first = StreamTextEvent {
+            committed: "stable prefix".to_string(),
+            tentative: " first guess".to_string(),
+        };
+        let attempt = ledger
+            .observe_committed(first.committed_for_live_insertion(), Some(&target))
+            .expect("committed prefix should plan one insertion");
+        assert_eq!(attempt.text, "stable prefix");
+        assert!(ledger.record_attempt_result(
+            attempt.session_id,
+            attempt.sequence,
+            LiveInsertionOutcome::Inserted,
+        ));
+
+        let revised_tentative = StreamTextEvent {
+            committed: "stable prefix".to_string(),
+            tentative: " completely different guess".to_string(),
+        };
+        assert!(ledger
+            .observe_committed(
+                revised_tentative.committed_for_live_insertion(),
+                Some(&target),
+            )
+            .is_none());
+        assert_eq!(ledger.inserted_committed(), "stable prefix");
+        assert_eq!(ledger.attempts().len(), 1);
     }
 
     #[test]
