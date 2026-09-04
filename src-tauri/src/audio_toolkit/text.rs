@@ -1,4 +1,7 @@
-use crate::settings::{VocabularyEntry, VocabularyReplacement, VocabularySettingsV1};
+use crate::vocabulary::{
+    decode_vocabulary_v1, VocabularyEntryV1 as VocabularyEntry,
+    VocabularyReplacementV1 as VocabularyReplacement, VocabularySettingsV1,
+};
 use natural::phonetics::soundex;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -533,6 +536,35 @@ pub fn apply_vocabulary_corrections(
         text: current,
         metadata,
     }
+}
+
+/// Decode a persisted rich vocabulary at the correction boundary. Missing rich
+/// data migrates the legacy list losslessly; malformed or unsupported rich data
+/// fails open to the exact original transcript instead of applying a partial or
+/// guessed correction set.
+pub fn apply_vocabulary_corrections_from_raw(
+    text: &str,
+    raw_vocabulary: Option<&serde_json::Value>,
+    legacy_custom_words: &[String],
+    threshold: f64,
+    output_language: &OutputLanguageEvidence,
+    allow_fuzzy: bool,
+) -> VocabularyCorrectionResult {
+    let Ok(vocabulary) = decode_vocabulary_v1(raw_vocabulary, legacy_custom_words) else {
+        return VocabularyCorrectionResult {
+            text: text.to_string(),
+            metadata: VocabularyCorrectionMetadata::default(),
+        };
+    };
+
+    apply_vocabulary_corrections(
+        text,
+        &vocabulary,
+        legacy_custom_words,
+        threshold,
+        output_language,
+        allow_fuzzy,
+    )
 }
 
 /// Preserves the case pattern of the original word when applying a replacement
@@ -1261,6 +1293,47 @@ mod tests {
         assert_eq!(result.text, "Handee");
         assert!(!result.metadata.applied());
         assert!(build_vocabulary_prompt(&vocab, &["Handy".to_string()], None).is_none());
+    }
+
+    #[test]
+    fn malformed_rich_vocabulary_fails_open_to_exact_original_transcript() {
+        let malformed = serde_json::json!({
+            "version": 1,
+            "entries": [{ "written": 42, "spoken_alias": "hand ee" }]
+        });
+        let original = "Handee, keep this transcript exactly.";
+        let result = apply_vocabulary_corrections_from_raw(
+            original,
+            Some(&malformed),
+            &["Handy".to_string()],
+            1.0,
+            &OutputLanguageEvidence::UserSelected("en".to_string()),
+            true,
+        );
+
+        assert_eq!(result.text, original);
+        assert!(!result.metadata.applied());
+    }
+
+    #[test]
+    fn unsupported_vocabulary_version_fails_open_without_legacy_guessing() {
+        let future = serde_json::json!({
+            "version": 2,
+            "entries": [{ "written": "Handy", "spoken_alias": "hand ee" }],
+            "replacements": []
+        });
+        let original = "hand ee should remain untouched";
+        let result = apply_vocabulary_corrections_from_raw(
+            original,
+            Some(&future),
+            &["Handy".to_string()],
+            1.0,
+            &OutputLanguageEvidence::UserSelected("en".to_string()),
+            true,
+        );
+
+        assert_eq!(result.text, original);
+        assert!(!result.metadata.applied());
     }
 
     #[test]
