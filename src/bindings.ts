@@ -939,6 +939,20 @@ async updateRecordingRetentionPeriod(period: string) : Promise<Result<null, stri
     else return { status: "error", error: e  as any };
 }
 },
+async getPerformanceDiagnostics() : Promise<PerformanceSnapshot> {
+    return await TAURI_INVOKE("get_performance_diagnostics");
+},
+async exportPerformanceDiagnostics() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("export_performance_diagnostics") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async clearPerformanceDiagnostics() : Promise<void> {
+    await TAURI_INVOKE("clear_performance_diagnostics");
+},
 /**
  * Stub implementation for non-macOS platforms
  * Always returns false since laptop detection is macOS-specific
@@ -1022,7 +1036,12 @@ selected_channel?: number | null; clamshell_microphone?: string | null;
 /**
  * Stable CPAL identity paired with the clamshell microphone preference.
  */
-clamshell_microphone_id?: string | null; selected_output_device?: string | null; translate_to_english?: boolean; selected_language?: string; overlay_position?: OverlayPosition; debug_mode?: boolean; log_level?: LogLevel; custom_words?: string[]; vocabulary_v1?: VocabularySettingsV1; model_unload_timeout?: ModelUnloadTimeout; word_correction_threshold?: number; history_limit?: number; recording_retention_period?: RecordingRetentionPeriod; paste_method?: PasteMethod; clipboard_handling?: ClipboardHandling; auto_submit?: boolean; auto_submit_key?: AutoSubmitKey; post_process_enabled?: boolean; post_process_provider_id?: string; post_process_providers?: PostProcessProvider[]; post_process_api_keys?: SecretMap; post_process_models?: Partial<{ [key in string]: string }>; post_process_prompts?: LLMPrompt[]; post_process_selected_prompt_id?: string | null; mute_while_recording?: boolean; 
+clamshell_microphone_id?: string | null; selected_output_device?: string | null; translate_to_english?: boolean; selected_language?: string; overlay_position?: OverlayPosition; debug_mode?: boolean; log_level?: LogLevel; custom_words?: string[]; 
+/**
+ * Versioned rich vocabulary. Never replaces `custom_words` in place: the
+ * raw settings migration seeds this key from legacy values exactly once.
+ */
+vocabulary_v1?: VocabularySettingsV1; model_unload_timeout?: ModelUnloadTimeout; word_correction_threshold?: number; history_limit?: number; recording_retention_period?: RecordingRetentionPeriod; paste_method?: PasteMethod; clipboard_handling?: ClipboardHandling; auto_submit?: boolean; auto_submit_key?: AutoSubmitKey; post_process_enabled?: boolean; post_process_provider_id?: string; post_process_providers?: PostProcessProvider[]; post_process_api_keys?: SecretMap; post_process_models?: Partial<{ [key in string]: string }>; post_process_prompts?: LLMPrompt[]; post_process_selected_prompt_id?: string | null; mute_while_recording?: boolean; 
 /**
  * Optional system-media pause/resume while a recording is active. This is
  * deliberately opt-in so existing recording behavior remains unchanged.
@@ -1069,7 +1088,17 @@ export type EngineType =
  */
 "TranscribeCpp" | "Parakeet" | "Moonshine" | "MoonshineStreaming" | "SenseVoice" | "GigaAM" | "Canary" | "Cohere"
 export type GpuDeviceOption = { id: string; name: string; total_vram_mb: number }
-export type HistoryEntry = { id: number; file_name: string; timestamp: number; duration_ms: number | null; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; cleanup_prompt_id: string | null; cleanup_model_id: string | null; post_process_requested: boolean; model_id: string | null; 
+export type HistoryEntry = { id: number; file_name: string; timestamp: number; duration_ms: number | null; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; 
+/**
+ * Stable cleanup prompt identifier. Kept separate from the prompt body so
+ * history can identify the exact configured cleanup contract without
+ * duplicating transcript/application context.
+ */
+cleanup_prompt_id: string | null; 
+/**
+ * Cleanup model identifier; `model_id` below remains the ASR model.
+ */
+cleanup_model_id: string | null; post_process_requested: boolean; model_id: string | null; 
 /**
  * Stable engine family identifier for the model used by this run.
  */
@@ -1094,7 +1123,7 @@ device: string | null;
 /**
  * Stable reason code when acceleration was downgraded for this session/run.
  */
-recovery_reason: string | null;
+recovery_reason: string | null; 
 /**
  * Saved transcribe.cpp accelerator preference for this session.
  */
@@ -1188,6 +1217,10 @@ export type OverlayPosition = "top" | "bottom"
 export type OverlayStyle = "none" | "minimal" | "live"
 export type PaginatedHistory = { entries: HistoryEntry[]; has_more: boolean }
 export type PasteMethod = "ctrl_v" | "direct" | "none" | "shift_insert" | "ctrl_shift_v" | "external_script"
+export type PerformanceSample = { session_id: number; outcome: string; cold_start: boolean; model_id: string | null; engine_type: string | null; language: string | null; backend: string | null; device: string | null; cleanup_mode: string; insertion_mode: string; recording_ms: number | null; first_partial_ms: number | null; stages: PerformanceStage[] }
+export type PerformanceSnapshot = { sample_count: number; latest: PerformanceSample | null; windows: PerformanceWindowSummary[] }
+export type PerformanceStage = { name: string; duration_ms: number }
+export type PerformanceWindowSummary = { window: number; sample_count: number; stages: StagePercentiles[] }
 export type PermissionAccess = "allowed" | "denied" | "unknown"
 export type PostProcessProvider = { id: string; label: string; base_url: string; allow_base_url_edit?: boolean; models_endpoint?: string | null; supports_structured_output?: boolean }
 export type RecordingRetentionPeriod = "never" | "preserve_limit" | "days_3" | "weeks_2" | "months_3"
@@ -1244,6 +1277,7 @@ export type ShortcutActivation =
 "hold_or_toggle"
 export type ShortcutBinding = { id: string; name: string; description: string; default_binding: string; current_binding: string }
 export type SoundTheme = "marimba" | "pop" | "custom"
+export type StagePercentiles = { stage: string; sample_count: number; p50_ms: number; p95_ms: number }
 /**
  * Phase of the streaming overlay card, emitted to drive its UI state.
  */
@@ -1284,7 +1318,22 @@ export type Theme = "system" | "light" | "dark"
 export type TranscribeAcceleratorSetting = "auto" | "cpu" | "gpu"
 export type TypingTool = "auto" | "wtype" | "kwtype" | "dotool" | "ydotool" | "xdotool"
 export type VadBackend = "silero" | "earshot"
-export type VocabularyEntry = { written: string; spoken_alias?: string | null; language?: string | null; enabled?: boolean; case_sensitive?: boolean | null; preserve_punctuation?: boolean | null }
+/**
+ * Rich vocabulary entry stored separately from the legacy `custom_words` list.
+ * The legacy list remains `Vec<String>` on disk so older stores can always be
+ * salvaged before this richer representation is considered.
+ */
+export type VocabularyEntry = { written: string; spoken_alias?: string | null; language?: string | null; enabled?: boolean; 
+/**
+ * `true` requires exact case when matching aliases. `None`/`false` is
+ * Unicode case-insensitive.
+ */
+case_sensitive?: boolean | null; 
+/**
+ * `false` drops punctuation immediately surrounding a matched alias.
+ * The safe default (`None`/`true`) preserves it.
+ */
+preserve_punctuation?: boolean | null }
 export type VocabularyReplacement = { from: string; to: string; language?: string | null; enabled?: boolean; case_sensitive?: boolean | null; preserve_punctuation?: boolean | null }
 export type VocabularySettingsV1 = { version: number; entries?: VocabularyEntry[]; replacements?: VocabularyReplacement[] }
 export type WindowsMicrophonePermissionStatus = { supported: boolean; overall_access: PermissionAccess; device_access: PermissionAccess; app_access: PermissionAccess; desktop_app_access: PermissionAccess }
