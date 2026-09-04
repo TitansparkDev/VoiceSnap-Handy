@@ -270,14 +270,14 @@ Deliverables:
   `s1-mini` candidate; do not select by model name alone. — done 2026-09-03
 - Keep model loading separate from the ASR stream worker. — done 2026-09-04
 - Disable reasoning/thinking and constrain output length. — done 2026-09-03
-- Define a strict cleanup contract: output text only, no explanation, no quotes,
+- Define a strict cleanup contract: output text only, no explanation, no quotes, — done 2026-09-04
   no markdown wrapper, no invented content. — done 2026-09-04
 - Add cleanup modes: — done 2026-09-04
   - `off`: raw deterministic transcription output;
   - `fast`: code-only corrections and deterministic replacements;
   - `local_ai`: local model cleanup;
   - cloud providers remain optional and are not part of the default path.
-- Preserve `raw_text`, `cleaned_text`, cleanup mode, prompt ID, model ID, and
+- Preserve `raw_text`, `cleaned_text`, cleanup mode, prompt ID, model ID, and — done 2026-09-04
   cleanup timing in history. — done 2026-09-04
 - Fail open to raw text on timeout, malformed output, engine failure, or
   cancellation. — done 2026-09-04
