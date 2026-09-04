@@ -44,6 +44,10 @@ pub(crate) enum LiveInsertionStopReason {
 /// completion cannot advance a newer attempt's ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LiveInsertionAttempt {
+    /// Identifies the recording session that planned this attempt. Sequences are
+    /// per-session, so this token prevents a late completion from session N from
+    /// being accepted by a new session N+1 that happens to reuse sequence 1.
+    pub session_id: u64,
     pub sequence: u64,
     pub kind: LiveInsertionAttemptKind,
     pub text: String,
@@ -83,6 +87,7 @@ struct PendingLiveInsertion {
 #[derive(Debug, Clone)]
 pub(crate) struct LiveInsertionLedger {
     mode: InsertionMode,
+    session_id: u64,
     target: Option<crate::paste_tx::TargetIdentity>,
     inserted_committed: String,
     latest_committed: String,
@@ -104,8 +109,17 @@ impl LiveInsertionLedger {
         mode: InsertionMode,
         target: Option<crate::paste_tx::TargetIdentity>,
     ) -> Self {
+        Self::with_session_id(mode, target, 0)
+    }
+
+    pub(crate) fn with_session_id(
+        mode: InsertionMode,
+        target: Option<crate::paste_tx::TargetIdentity>,
+        session_id: u64,
+    ) -> Self {
         Self {
             mode,
+            session_id,
             target,
             inserted_committed: String::new(),
             latest_committed: String::new(),
@@ -235,6 +249,7 @@ impl LiveInsertionLedger {
         }
 
         let attempt = LiveInsertionAttempt {
+            session_id: self.session_id,
             sequence: self.next_sequence,
             kind,
             text: self.pending_text.clone(),
@@ -287,20 +302,35 @@ impl LiveInsertionLedger {
         self.plan_latest(LiveInsertionAttemptKind::CommittedDelta, current_target)
     }
 
+    /// Whether an exact planned attempt is still authorized to enter the native
+    /// input adapter. Callers must perform this check in the same critical section
+    /// as injection so cancellation/model teardown cannot leave queued text armed.
+    pub(crate) fn authorizes_attempt(&self, attempt: &LiveInsertionAttempt) -> bool {
+        self.is_live()
+            && !self.cancelled
+            && self.stop_reason.is_none()
+            && self.speech_evidence
+            && self
+                .pending_attempt
+                .as_ref()
+                .is_some_and(|pending| pending.attempt == *attempt)
+    }
+
     /// Record the result of the exact attempt returned by this ledger. Unknown,
-    /// duplicate, or stale sequence ids are ignored. A failed input attempt is
+    /// duplicate, or stale session/sequence ids are ignored. A failed input attempt is
     /// terminal because partial delivery cannot be ruled out safely; retrying
     /// could duplicate text. Clipboard ownership loss is terminal for the same
     /// reason and leaves the user's newer clipboard owner untouched.
     pub(crate) fn record_attempt_result(
         &mut self,
+        session_id: u64,
         sequence: u64,
         outcome: LiveInsertionOutcome,
     ) -> bool {
         let Some(pending) = self.pending_attempt.as_ref() else {
             return false;
         };
-        if pending.attempt.sequence != sequence {
+        if pending.attempt.session_id != session_id || pending.attempt.sequence != sequence {
             return false;
         }
 
@@ -1126,7 +1156,11 @@ mod tests {
     }
 
     fn confirm_inserted(ledger: &mut LiveInsertionLedger, attempt: LiveInsertionAttempt) {
-        assert!(ledger.record_attempt_result(attempt.sequence, LiveInsertionOutcome::Inserted));
+        assert!(ledger.record_attempt_result(
+            attempt.session_id,
+            attempt.sequence,
+            LiveInsertionOutcome::Inserted,
+        ));
     }
 
     #[test]
@@ -1165,6 +1199,46 @@ mod tests {
         assert_eq!(ledger.attempts().len(), 2);
         assert_eq!(ledger.attempts()[0].byte_len, 5);
         assert_eq!(ledger.attempts()[1].byte_len, 6);
+    }
+
+    #[test]
+    fn queued_attempt_authorization_is_scoped_to_one_live_session() {
+        let target = live_target("target-a");
+        let mut old = LiveInsertionLedger::with_session_id(
+            InsertionMode::LiveCommittedExperimental,
+            Some(target.clone()),
+            41,
+        );
+        old.observe_speech_evidence(Some(&target));
+        let stale = old
+            .observe_committed("hello", Some(&target))
+            .expect("old session plans its first delta");
+        assert!(old.authorizes_attempt(&stale));
+
+        old.cancel();
+        assert!(!old.authorizes_attempt(&stale));
+
+        let mut next = LiveInsertionLedger::with_session_id(
+            InsertionMode::LiveCommittedExperimental,
+            Some(target.clone()),
+            42,
+        );
+        next.observe_speech_evidence(Some(&target));
+        let current = next
+            .observe_committed("hello", Some(&target))
+            .expect("next session reuses sequence one safely");
+        assert_eq!(stale.sequence, current.sequence);
+        assert_ne!(stale.session_id, current.session_id);
+        assert!(!next.authorizes_attempt(&stale));
+        assert!(next.authorizes_attempt(&current));
+        assert!(!next.record_attempt_result(
+            stale.session_id,
+            stale.sequence,
+            LiveInsertionOutcome::Inserted,
+        ));
+        assert_eq!(next.inserted_committed(), "");
+        confirm_inserted(&mut next, current);
+        assert_eq!(next.inserted_committed(), "hello");
     }
 
     #[test]
@@ -1293,7 +1367,11 @@ mod tests {
             .expect("initial delta");
         assert_eq!(attempt.target, target);
 
-        assert!(ledger.record_attempt_result(attempt.sequence, LiveInsertionOutcome::TargetChanged));
+        assert!(ledger.record_attempt_result(
+            attempt.session_id,
+            attempt.sequence,
+            LiveInsertionOutcome::TargetChanged,
+        ));
         assert_eq!(
             ledger.stop_reason(),
             Some(LiveInsertionStopReason::TargetChanged)
@@ -1333,7 +1411,11 @@ mod tests {
         let attempt = ledger
             .observe_committed("hello", Some(&target))
             .expect("initial delta");
-        assert!(ledger.record_attempt_result(attempt.sequence, LiveInsertionOutcome::InputFailed));
+        assert!(ledger.record_attempt_result(
+            attempt.session_id,
+            attempt.sequence,
+            LiveInsertionOutcome::InputFailed,
+        ));
         assert_eq!(
             ledger.stop_reason(),
             Some(LiveInsertionStopReason::InputFailed)
@@ -1352,6 +1434,7 @@ mod tests {
             .observe_committed("hello", Some(&target))
             .expect("initial delta");
         assert!(ledger.record_attempt_result(
+            attempt.session_id,
             attempt.sequence,
             LiveInsertionOutcome::ClipboardOwnershipLost
         ));
