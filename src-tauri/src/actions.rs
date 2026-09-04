@@ -6,6 +6,7 @@ use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::HistoryManager;
 use crate::managers::media::RecordingMediaController;
 use crate::managers::model::{EngineType, ModelManager};
+use crate::managers::performance::{PerformanceManager, PerformanceSessionMetadata};
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::TranscriptionManager;
 use crate::settings::{
@@ -738,6 +739,8 @@ impl ShortcutAction for TranscribeAction {
         // Load model in the background
         let tm = app.state::<Arc<TranscriptionManager>>();
         let rm = app.state::<Arc<AudioRecordingManager>>();
+        let performance_manager = app.state::<Arc<PerformanceManager>>();
+        let cold_start = !tm.is_model_loaded();
 
         // Load ASR model and VAD model in parallel
         let kickoff_started = Instant::now();
@@ -797,6 +800,18 @@ impl ShortcutAction for TranscribeAction {
                 "Live committed insertion requires positive VAD speech evidence; using preview-only insertion while VAD is disabled"
             );
         }
+        let performance_session_id = performance_manager.begin_session(
+            start_time,
+            PerformanceSessionMetadata {
+                cold_start,
+                model_id: (!settings.selected_model.is_empty())
+                    .then_some(settings.selected_model.clone()),
+                engine_type: resolve_history_engine_type(app, Some(&settings.selected_model)),
+                language: Some(resolve_effective_language(app, &settings)),
+                cleanup_mode: resolve_history_cleanup_mode(&settings, self.post_process),
+                insertion_mode: insertion_mode_history_value(insertion_mode).to_string(),
+            },
+        );
         tm.begin_insertion_session(insertion_mode);
         if model_supports_streaming {
             tm.start_stream();
@@ -839,6 +854,7 @@ impl ShortcutAction for TranscribeAction {
                 let generation = readiness.generation();
                 let app_clone = app.clone();
                 let rm_clone = Arc::clone(&rm);
+                let performance_manager = Arc::clone(&performance_manager);
                 std::thread::spawn(move || {
                     if !readiness.wait() {
                         debug!("Microphone readiness wait ended without receiving samples");
@@ -866,6 +882,7 @@ impl ShortcutAction for TranscribeAction {
                     }
 
                     debug!("Microphone is receiving samples; recording is ready");
+                    performance_manager.mark_capture_ready(performance_session_id);
                     utils::emit_recording_ready(&app_clone);
 
                     // The start chime is a readiness cue, so it must follow the
@@ -893,6 +910,7 @@ impl ShortcutAction for TranscribeAction {
             // Starting failed (for example due to blocked microphone permissions).
             // Revert UI state so we don't stay stuck in the recording overlay.
             tm.cancel_stream();
+            performance_manager.finish_session(performance_session_id, "failure");
             utils::hide_recording_overlay(app);
             set_tray_state(app, TrayIconState::Idle);
             if let Some(err) = recording_error {
@@ -938,6 +956,11 @@ impl ShortcutAction for TranscribeAction {
         let rm = Arc::clone(&app.state::<Arc<AudioRecordingManager>>());
         let tm = Arc::clone(&app.state::<Arc<TranscriptionManager>>());
         let hm = Arc::clone(&app.state::<Arc<HistoryManager>>());
+        let performance_manager = Arc::clone(&app.state::<Arc<PerformanceManager>>());
+        let performance_session_id = performance_manager.active_session_id();
+        if let Some(session_id) = performance_session_id {
+            performance_manager.mark_stop_requested(session_id);
+        }
 
         set_tray_state(app, TrayIconState::Transcribing);
         // Stop should give immediate visual feedback. Live streaming can keep
@@ -984,6 +1007,9 @@ impl ShortcutAction for TranscribeAction {
                 if rm.was_cancelled_since(cancel_generation) {
                     debug!("Transcription operation cancelled after recording stop");
                     tm.cancel_stream();
+                    if let Some(session_id) = performance_session_id {
+                        performance_manager.finish_session(session_id, "cancelled");
+                    }
                     utils::hide_recording_overlay(&ah);
                     set_tray_state(&ah, TrayIconState::Idle);
                     return;
@@ -994,6 +1020,9 @@ impl ShortcutAction for TranscribeAction {
                     // Tear down any streaming worker so its channel doesn't leak
                     // and block the next start_stream.
                     tm.cancel_stream();
+                    if let Some(session_id) = performance_session_id {
+                        performance_manager.finish_session(session_id, "failure");
+                    }
                     utils::hide_recording_overlay(&ah);
                     set_tray_state(&ah, TrayIconState::Idle);
                 } else {
@@ -1011,15 +1040,41 @@ impl ShortcutAction for TranscribeAction {
                     // running, finalize it and use its text (all audio was already
                     // fed to the stream); otherwise batch-transcribe the samples.
                     let transcription_time = Instant::now();
-                    // A finalized stream with usable text wins. An empty result
-                    // (including the normal non-streaming path) falls back to a full
-                    // batch transcription of the same audio. A finalize timeout is
-                    // surfaced instead — the worker may still hold the engine, so a
-                    // batch fallback would contend with it.
-                    let transcription_result =
-                        resolve_stream_or_batch(tm.finalize_stream(), || tm.transcribe(samples));
+                    // Preserve the stream timing-only sample for diagnostics before
+                    // reducing the finalized stream to the text-or-batch contract.
+                    let stream_result = tm.finalize_stream_with_benchmark_timing();
+                    let stream_timing = stream_result
+                        .as_ref()
+                        .ok()
+                        .and_then(|result| result.as_ref().map(|(_, timing)| timing.clone()));
+                    let transcription_result = resolve_stream_or_batch(
+                        stream_result.map(|result| result.map(|(text, _)| text)),
+                        || tm.transcribe(samples),
+                    );
+                    let transcription_elapsed_ms = transcription_time.elapsed().as_millis() as u64;
                     let history_transcription_total_ms =
-                        i64::try_from(transcription_time.elapsed().as_millis()).unwrap_or(i64::MAX);
+                        i64::try_from(transcription_elapsed_ms).unwrap_or(i64::MAX);
+                    if let Some(session_id) = performance_session_id {
+                        performance_manager.record_stage(
+                            session_id,
+                            "transcription_total",
+                            transcription_elapsed_ms,
+                        );
+                        performance_manager.set_first_partial_ms(
+                            session_id,
+                            stream_timing
+                                .as_ref()
+                                .and_then(|timing| timing.first_partial_ms),
+                        );
+                        performance_manager.record_stage_since_stop(
+                            session_id,
+                            if stream_timing.is_some() {
+                                "capture_stop_to_stream_finalize"
+                            } else {
+                                "capture_stop_to_batch_transcription"
+                            },
+                        );
+                    }
 
                     // Await WAV save and verify
                     let wav_saved = match wav_handle.await {
@@ -1056,10 +1111,22 @@ impl ShortcutAction for TranscribeAction {
                             .unwrap_or(i64::MAX);
                     let (history_backend, history_device, history_recovery_reason) =
                         tm.runtime_metadata();
+                    if let Some(session_id) = performance_session_id {
+                        performance_manager
+                            .set_recording_ms(session_id, history_duration_ms.max(0) as u64);
+                        performance_manager.update_runtime_metadata(
+                            session_id,
+                            history_backend.clone(),
+                            history_device.clone(),
+                        );
+                    }
                     let history_selection_plan = tm.selection_plan_metadata();
 
                     if rm.was_cancelled_since(cancel_generation) {
                         debug!("Transcription operation cancelled before output handling");
+                        if let Some(session_id) = performance_session_id {
+                            performance_manager.finish_session(session_id, "cancelled");
+                        }
                         utils::hide_recording_overlay(&ah);
                         set_tray_state(&ah, TrayIconState::Idle);
                         return;
@@ -1088,6 +1155,9 @@ impl ShortcutAction for TranscribeAction {
                             .await
                             else {
                                 debug!("Transcription operation cancelled during output handling");
+                                if let Some(session_id) = performance_session_id {
+                                    performance_manager.finish_session(session_id, "cancelled");
+                                }
                                 utils::hide_recording_overlay(&ah);
                                 set_tray_state(&ah, TrayIconState::Idle);
                                 return;
@@ -1096,9 +1166,21 @@ impl ShortcutAction for TranscribeAction {
                                 i64::try_from(cleanup_time.elapsed().as_millis())
                                     .unwrap_or(i64::MAX)
                             });
+                            if let (Some(session_id), Some(cleanup_ms)) =
+                                (performance_session_id, history_cleanup_total_ms)
+                            {
+                                performance_manager.record_stage(
+                                    session_id,
+                                    "cleanup_total",
+                                    cleanup_ms.max(0) as u64,
+                                );
+                            }
 
                             if rm.was_cancelled_since(cancel_generation) {
                                 debug!("Transcription operation cancelled before paste");
+                                if let Some(session_id) = performance_session_id {
+                                    performance_manager.finish_session(session_id, "cancelled");
+                                }
                                 utils::hide_recording_overlay(&ah);
                                 set_tray_state(&ah, TrayIconState::Idle);
                                 return;
@@ -1164,6 +1246,12 @@ impl ShortcutAction for TranscribeAction {
                                         "Skipping whole-transcript paste after live insertion/safety stop"
                                     );
                                 }
+                                if let Some(session_id) = performance_session_id {
+                                    if !processed.final_text.is_empty() {
+                                        performance_manager.mark_visible_text(session_id);
+                                    }
+                                    performance_manager.finish_session(session_id, "success");
+                                }
                                 utils::hide_recording_overlay(&ah);
                                 set_tray_state(&ah, TrayIconState::Idle);
                             } else {
@@ -1171,29 +1259,52 @@ impl ShortcutAction for TranscribeAction {
                                 let paste_time = Instant::now();
                                 let final_text = processed.final_text;
                                 let rm_for_paste = Arc::clone(&rm);
+                                let performance_for_paste = Arc::clone(&performance_manager);
                                 ah.run_on_main_thread(move || {
                                     if rm_for_paste.was_cancelled_since(cancel_generation) {
                                         debug!("Transcription operation cancelled before paste");
+                                        if let Some(session_id) = performance_session_id {
+                                            performance_for_paste
+                                                .finish_session(session_id, "cancelled");
+                                        }
                                         utils::hide_recording_overlay(&ah_clone);
                                         set_tray_state(&ah_clone, TrayIconState::Idle);
                                         return;
                                     }
 
-                                    match utils::paste(final_text, ah_clone.clone()) {
-                                        Ok(()) => debug!(
-                                            "Text pasted successfully in {:?}",
-                                            paste_time.elapsed()
-                                        ),
-                                        Err(e) => {
-                                            error!("Failed to paste transcription: {}", e);
-                                            let _ = ah_clone.emit("paste-error", ());
-                                        }
+                                    let paste_outcome =
+                                        match utils::paste(final_text, ah_clone.clone()) {
+                                            Ok(()) => {
+                                                debug!(
+                                                    "Text pasted successfully in {:?}",
+                                                    paste_time.elapsed()
+                                                );
+                                                "success"
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to paste transcription: {}", e);
+                                                let _ = ah_clone.emit("paste-error", ());
+                                                "failure"
+                                            }
+                                        };
+                                    if let Some(session_id) = performance_session_id {
+                                        performance_for_paste.record_stage(
+                                            session_id,
+                                            "paste_total",
+                                            paste_time.elapsed().as_millis() as u64,
+                                        );
+                                        performance_for_paste.mark_visible_text(session_id);
+                                        performance_for_paste
+                                            .finish_session(session_id, paste_outcome);
                                     }
                                     utils::hide_recording_overlay(&ah_clone);
                                     set_tray_state(&ah_clone, TrayIconState::Idle);
                                 })
                                 .unwrap_or_else(|e| {
                                     error!("Failed to run paste on main thread: {:?}", e);
+                                    if let Some(session_id) = performance_session_id {
+                                        performance_manager.finish_session(session_id, "failure");
+                                    }
                                     utils::hide_recording_overlay(&ah);
                                     set_tray_state(&ah, TrayIconState::Idle);
                                 });
@@ -1204,6 +1315,9 @@ impl ShortcutAction for TranscribeAction {
                                 debug!(
                                     "Transcription operation cancelled after transcription error"
                                 );
+                                if let Some(session_id) = performance_session_id {
+                                    performance_manager.finish_session(session_id, "cancelled");
+                                }
                                 utils::hide_recording_overlay(&ah);
                                 set_tray_state(&ah, TrayIconState::Idle);
                                 return;
@@ -1263,6 +1377,9 @@ impl ShortcutAction for TranscribeAction {
                                     error!("Failed to save failed history entry: {}", save_err);
                                 }
                             }
+                            if let Some(session_id) = performance_session_id {
+                                performance_manager.finish_session(session_id, "failure");
+                            }
                             utils::hide_recording_overlay(&ah);
                             set_tray_state(&ah, TrayIconState::Idle);
                         }
@@ -1272,6 +1389,14 @@ impl ShortcutAction for TranscribeAction {
                 debug!("No samples retrieved from recording stop");
                 // Tear down any streaming worker so its channel doesn't leak.
                 tm.cancel_stream();
+                if let Some(session_id) = performance_session_id {
+                    let outcome = if rm.was_cancelled_since(cancel_generation) {
+                        "cancelled"
+                    } else {
+                        "failure"
+                    };
+                    performance_manager.finish_session(session_id, outcome);
+                }
                 utils::hide_recording_overlay(&ah);
                 set_tray_state(&ah, TrayIconState::Idle);
             }

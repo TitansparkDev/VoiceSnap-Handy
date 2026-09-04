@@ -105,6 +105,11 @@ pub fn cancel_current_operation(app: &AppHandle) {
     // Abandon any live streaming transcription
     let tm = app.state::<Arc<TranscriptionManager>>();
     tm.cancel_stream();
+    if let Some(performance_manager) =
+        app.try_state::<Arc<crate::managers::performance::PerformanceManager>>()
+    {
+        performance_manager.finish_active("cancelled");
+    }
 
     // Update tray icon and hide overlay
     set_tray_state(app, crate::tray::TrayIconState::Idle);
