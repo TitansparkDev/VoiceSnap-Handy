@@ -1047,6 +1047,11 @@ impl ShortcutAction for TranscribeAction {
                         .as_ref()
                         .ok()
                         .and_then(|result| result.as_ref().map(|(_, timing)| timing.clone()));
+                    let used_stream_result = stream_result
+                        .as_ref()
+                        .ok()
+                        .and_then(|result| result.as_ref())
+                        .is_some_and(|(text, _)| !text.trim().is_empty());
                     let transcription_result = resolve_stream_or_batch(
                         stream_result.map(|result| result.map(|(text, _)| text)),
                         || tm.transcribe(samples),
@@ -1068,7 +1073,7 @@ impl ShortcutAction for TranscribeAction {
                         );
                         performance_manager.record_stage_since_stop(
                             session_id,
-                            if stream_timing.is_some() {
+                            if used_stream_result {
                                 "capture_stop_to_stream_finalize"
                             } else {
                                 "capture_stop_to_batch_transcription"

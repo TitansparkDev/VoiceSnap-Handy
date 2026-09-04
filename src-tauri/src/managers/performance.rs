@@ -438,17 +438,39 @@ mod tests {
 
     #[test]
     fn export_schema_has_no_content_bearing_fields() {
+        fn collect_keys(value: &serde_json::Value, keys: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    for (key, value) in object {
+                        keys.push(key.to_ascii_lowercase());
+                        collect_keys(value, keys);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        collect_keys(value, keys);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let manager = PerformanceManager::new();
         let id = manager.begin_session(Instant::now(), metadata(true));
         manager.set_recording_ms(id, 1234);
         manager.set_first_partial_ms(id, Some(80));
+        manager.record_stage(id, "transcription_total", 410);
         manager.update_runtime_metadata(id, Some("vulkan".to_string()), Some("gpu-0".to_string()));
         assert!(manager.finish_session(id, "success"));
 
-        let export = manager.export_json().unwrap().to_ascii_lowercase();
+        let export = manager.export_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&export).unwrap();
+        let mut keys = Vec::new();
+        collect_keys(&value, &mut keys);
         for forbidden in [
             "transcript",
             "transcription_text",
+            "audio",
             "audio_data",
             "audio_path",
             "clipboard",
@@ -456,13 +478,14 @@ mod tests {
             "process_path",
         ] {
             assert!(
-                !export.contains(forbidden),
+                !keys.iter().any(|key| key == forbidden),
                 "export leaked forbidden field {forbidden}"
             );
         }
-        assert!(export.contains("first_partial_ms"));
-        assert!(export.contains("backend"));
-        assert!(export.contains("cold_start"));
+        assert!(keys.iter().any(|key| key == "first_partial_ms"));
+        assert!(keys.iter().any(|key| key == "backend"));
+        assert!(keys.iter().any(|key| key == "cold_start"));
+        assert!(export.contains("transcription_total"));
     }
 
     #[test]
