@@ -4,4 +4,5 @@ pub mod history;
 pub mod media;
 pub mod model;
 pub mod model_capabilities;
+pub mod performance;
 pub mod transcription;

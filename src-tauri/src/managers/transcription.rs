@@ -1703,7 +1703,7 @@ impl TranscriptionManager {
             .map(|(text, _)| text))
     }
 
-    fn finalize_stream_with_benchmark_timing(
+    pub(crate) fn finalize_stream_with_benchmark_timing(
         &self,
     ) -> Result<Option<(String, StreamBenchmarkTiming)>> {
         let Some(tx) = self.router.take() else {

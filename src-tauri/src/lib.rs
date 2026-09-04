@@ -36,6 +36,7 @@ use env_filter::Builder as EnvFilterBuilder;
 use managers::audio::AudioRecordingManager;
 use managers::history::HistoryManager;
 use managers::model::ModelManager;
+use managers::performance::PerformanceManager;
 use managers::transcription::TranscriptionManager;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -206,6 +207,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     let history_manager =
         Arc::new(HistoryManager::new(app_handle).expect("Failed to initialize history manager"));
     let recording_media_controller = managers::media::system_recording_media_controller();
+    let performance_manager = Arc::new(PerformanceManager::new());
 
     // Initialize the transcribe-cpp native backend (logging + backend module
     // registration) once, before any whisper model is loaded.
@@ -219,6 +221,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     app_handle.manage(model_manager.clone());
     app_handle.manage(transcription_manager.clone());
     app_handle.manage(history_manager.clone());
+    app_handle.manage(performance_manager);
     app_handle.manage(recording_media_controller);
     app_handle.manage(tray::TrayState::new());
 
@@ -993,6 +996,9 @@ pub fn run(cli_args: CliArgs) {
             commands::history::retry_history_entry_cleanup,
             commands::history::update_history_limit,
             commands::history::update_recording_retention_period,
+            commands::performance::get_performance_diagnostics,
+            commands::performance::export_performance_diagnostics,
+            commands::performance::clear_performance_diagnostics,
             helpers::clamshell::is_laptop,
         ])
         .events(collect_events![
