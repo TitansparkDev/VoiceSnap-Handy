@@ -207,8 +207,8 @@ parallel timing formats.
 
 Deliverables:
 
-- Define a monotonic `PerformanceSample` schema.
-- Instrument one session with stable stage names:
+- Define a monotonic `PerformanceSample` schema. — done 2026-09-04
+- Instrument one session with stable stage names: — done 2026-09-04
   - `hotkey_to_capture_ready`
   - `capture_duration`
   - `capture_stop_to_stream_finalize`
@@ -221,11 +221,11 @@ Deliverables:
   - `stop_to_visible_text`
   - `stop_to_idle`
   - `total_hotkey_to_idle`
-- Record model ID, engine family, language, CPU/GPU selection, actual device,
+- Record model ID, engine family, language, CPU/GPU selection, actual device, — done 2026-09-04
   recording length, cleanup mode, insertion mode, and success/failure outcome.
-- Store a bounded local ring buffer of recent samples. Do not store transcript,
+- Store a bounded local ring buffer of recent samples. Do not store transcript, — done 2026-09-04
   audio, clipboard, process path, or window title.
-- Add a Settings → Diagnostics/Performance page that shows:
+- Add a Settings → Diagnostics/Performance page that shows: — done 2026-09-04
   - the latest session as a stage bar;
   - the slowest stage highlighted;
   - p50/p95 for the last 10, 50, and 200 sessions;
@@ -234,11 +234,11 @@ Deliverables:
   - first-partial latency for streaming models;
   - a copy/export diagnostics button containing only safe metadata;
   - a clear history button.
-- Add a structured debug-log viewer or filtered log export for engine lifecycle,
+- Add a structured debug-log viewer or filtered log export for engine lifecycle, — done 2026-09-04
   stream state, audio recovery, cleanup, and paste outcomes.
-- Add tests for timing schema serialization, bounded retention, no transcript
+- Add tests for timing schema serialization, bounded retention, no transcript — done 2026-09-04
   leakage, and percentile calculations.
-- Keep the performance ring separate from SQLite history. If the UI needs a
+- Keep the performance ring separate from SQLite history. If the UI needs a — done 2026-09-04
   history link, store only a non-sensitive session identifier and safe summary
   fields in the history row.
 
@@ -246,8 +246,8 @@ Acceptance:
 
 - After a real dictation, the user can immediately see which stage consumed the
   time without opening a developer console.
-- A failed or cancelled session still records a useful stage outcome.
-- The diagnostics page makes it possible to compare Whisper Turbo against a
+- A failed or cancelled session still records a useful stage outcome. — done 2026-09-04
+- The diagnostics page makes it possible to compare Whisper Turbo against a — done 2026-09-04
   streaming model on the same machine.
 
 Suggested files: new `performance.rs` or `managers/performance.rs`, settings
@@ -261,12 +261,12 @@ branches if the command/event contract is written first.
 Deliverables:
 
 - Add a local cleanup provider to Handy's existing post-process abstraction. — done 2026-09-03
-- Prefer a resident local `llama.cpp`/`llama-server` process or equivalent
+- Prefer a resident local `llama.cpp`/`llama-server` process or equivalent — done 2026-09-04
   bundled local runtime rather than launching a new process per utterance. If a
   sidecar is used, it needs a dedicated supervisor with child/job lifetime,
   health checks, bounded startup, cancellation, crash cleanup, and CPU fallback;
   it must not be an unmanaged process launched from the action handler. — done 2026-09-03
-- Use a small Q4 model first. Evaluate Qwen3-1.7B, Qwen3-4B, and the VoiceTypr
+- Use a small Q4 model first. Evaluate Qwen3-1.7B, Qwen3-4B, and the VoiceTypr — done 2026-09-04
   `s1-mini` candidate; do not select by model name alone. — done 2026-09-03
 - Keep model loading separate from the ASR stream worker. — done 2026-09-04
 - Disable reasoning/thinking and constrain output length. — done 2026-09-03
@@ -279,18 +279,18 @@ Deliverables:
   - cloud providers remain optional and are not part of the default path.
 - Preserve `raw_text`, `cleaned_text`, cleanup mode, prompt ID, model ID, and — done 2026-09-04
   cleanup timing in history. — done 2026-09-04
-- Fail open to raw text on timeout, malformed output, engine failure, or
+- Fail open to raw text on timeout, malformed output, engine failure, or — done 2026-09-04
   cancellation. — done 2026-09-04
-- Warm the local model only when local AI cleanup is enabled. Do not load it on
+- Warm the local model only when local AI cleanup is enabled. Do not load it on — done 2026-09-04
   installations using `off` or `fast` mode. — done 2026-09-03
 
 Acceptance:
 
 - A normal dictation with cleanup disabled is not slower than the Handy baseline.
-- Local AI cleanup works with networking disabled.
+- Local AI cleanup works with networking disabled. — done 2026-09-04
 - Cleanup failure never loses the raw transcript. — done 2026-09-03
-- A 1–2 sentence dictation has a measured cleanup p50/p95 visible in Diagnostics.
-- The local model never receives audio, clipboard content, window titles, or
+- A 1–2 sentence dictation has a measured cleanup p50/p95 visible in Diagnostics. — done 2026-09-04
+- The local model never receives audio, clipboard content, window titles, or — done 2026-09-04
   unrelated application data.
 
 ### Wave 2 — live preview and stream benchmark
@@ -299,7 +299,7 @@ Owner: streaming agent.
 
 Deliverables:
 
-- Preserve Handy's existing streaming worker and committed/tentative event
+- Preserve Handy's existing streaming worker and committed/tentative event — done 2026-09-04
   contract.
 - Add explicit stream performance events to Wave 0's timing schema. — done 2026-09-03
 - Add a benchmark command or test harness using fixed WAV fixtures. — done 2026-09-03
@@ -310,7 +310,7 @@ Deliverables:
   - Moonshine Streaming Tiny;
   - Whisper Large v3 Turbo batch;
   - any other model already present in Handy's catalog.
-- Measure first partial, committed text cadence, finalization tail, and total time
+- Measure first partial, committed text cadence, finalization tail, and total time — done 2026-09-04
   on short/medium/long fixed-WAV utterances. — done 2026-09-03
 - Compare transcription quality on short/medium/long utterances.
 - Make the overlay's committed/tentative distinction visually obvious. — done 2026-09-03
@@ -321,7 +321,7 @@ Acceptance:
 
 - Live-capable models show text before the user stops speaking.
 - Whisper Turbo remains reliable as a final-only model.
-- Stream cancellation and model switching do not leak a worker or wedge the next
+- Stream cancellation and model switching do not leak a worker or wedge the next — done 2026-09-04
   session. — done 2026-09-03
 - The app reports actual timing instead of claiming a fixed speed. — done 2026-09-03
 
@@ -342,16 +342,16 @@ Deliverables:
   - cancellation state.
 - Insert only the newly committed delta. — done 2026-09-03
 - Never paste tentative text. — done 2026-09-03
-- Stop live insertion on foreground-window change, target loss, failed input,
+- Stop live insertion on foreground-window change, target loss, failed input, — done 2026-09-04
   or clipboard ownership loss. — done 2026-09-03
 - Finalize and insert the remaining tail exactly once. — done 2026-09-03
 - Make the setting and warning explicit. Do not silently activate this mode. — done 2026-09-03
-- Keep AI cleanup disabled for live insertion sessions unless the behavior is
+- Keep AI cleanup disabled for live insertion sessions unless the behavior is — done 2026-09-04
   preview-only. — done 2026-09-03
-- Require a positive speech-evidence latch before the first live insertion. If
+- Require a positive speech-evidence latch before the first live insertion. If — done 2026-09-04
   the latch is absent, do not insert any live text even if the streaming model
   emitted a committed-looking hallucination. — done 2026-09-03
-- Do not apply a whole-transcript cleanup transform after live deltas have been
+- Do not apply a whole-transcript cleanup transform after live deltas have been — done 2026-09-04
   inserted. Live mode must use either raw text or a separately specified,
   append-safe deterministic transform; AI cleanup remains preview-only or is
   disabled for that session. — done 2026-09-03
@@ -364,7 +364,7 @@ Acceptance:
 - No user clipboard clobber after a normal session or cancellation. — done 2026-09-03
 - Word, Notepad, browser text fields, terminal, and a Chromium/Electron field
   are manually tested.
-- Any revision of already inserted model text is recorded as a known limitation;
+- Any revision of already inserted model text is recorded as a known limitation; — done 2026-09-04
   the app never attempts unsafe generic deletion/replacement. — done 2026-09-03
 
 Stop condition: if a partial is inserted and then revised incorrectly, disable
@@ -376,37 +376,37 @@ Owner: text-processing agent.
 
 Deliverables:
 
-- Preserve Handy's current `custom_words: Vec<String>` through migration.
-- Do not change that field's serialized type in place. Handy's settings salvage
+- Preserve Handy's current `custom_words: Vec<String>` through migration. — done 2026-09-04
+- Do not change that field's serialized type in place. Handy's settings salvage — done 2026-09-04
   path can discard an invalid field before a normal serde migration sees it.
   Introduce a new versioned vocabulary key, or migrate the raw JSON value before
   typed deserialization, with tests proving old settings retain every word.
-- Extend entries to support:
+- Extend entries to support: — done 2026-09-04
   - written form;
   - spoken alias;
   - optional language scope;
   - enabled state;
   - optional case/punctuation policy.
-- Feed written vocabulary to model paths that support initial prompts or native
+- Feed written vocabulary to model paths that support initial prompts or native — done 2026-09-04
   vocabulary. Streaming models that do not accept prompts must use safe
   post-correction only.
-- Improve fuzzy correction with bounded, deterministic matching. Never replace
+- Improve fuzzy correction with bounded, deterministic matching. Never replace — done 2026-09-04
   a word solely because it is vaguely similar.
-- Add optional deterministic replacements (`from` → `to`) with language scope.
+- Add optional deterministic replacements (`from` → `to`) with language scope. — done 2026-09-04
 - Add optional snippets only if they can be implemented without changing the
   streaming insertion contract.
-- Sanitize control characters and bound all vocabulary context before it reaches
+- Sanitize control characters and bound all vocabulary context before it reaches — done 2026-09-04
   a model.
-- Add adversarial tests for short words, CJK text, punctuation, aliases,
+- Add adversarial tests for short words, CJK text, punctuation, aliases, — done 2026-09-04
   disabled entries, duplicate entries, and overmatching.
 
 Acceptance:
 
-- Existing users do not lose their current custom words.
-- A spoken alias fixes a known product/name pronunciation without changing
+- Existing users do not lose their current custom words. — done 2026-09-04
+- A spoken alias fixes a known product/name pronunciation without changing — done 2026-09-04
   unrelated words.
-- Vocabulary corrections are visible in history as deterministic operations.
-- Vocabulary failures fail open to the original transcript.
+- Vocabulary corrections are visible in history as deterministic operations. — done 2026-09-04
+- Vocabulary failures fail open to the original transcript. — done 2026-09-04
 
 ### Wave 5 — richer history
 
@@ -415,22 +415,22 @@ cleanup fields.
 
 Deliverables:
 
-- Extend history metadata with model, engine, language, duration, cleanup mode,
+- Extend history metadata with model, engine, language, duration, cleanup mode, — done 2026-09-04
   insertion mode, device/backend, stage timings, and outcome. — done 2026-09-03
 - Keep raw and final text side by side. — done 2026-09-03
-- Add search, saved/starred entries, date filters, model filters, cleanup filters,
+- Add search, saved/starred entries, date filters, model filters, cleanup filters, — done 2026-09-04
   and success/failure filters. — done 2026-09-03
 - Add compare raw versus final. — done 2026-09-03
 - Add retry transcription and retry cleanup independently. — done 2026-09-03
 - Keep audio retention optional and bounded. — done 2026-09-03
-- Keep app identity coarse/opt-in if ever added later; do not persist window title
+- Keep app identity coarse/opt-in if ever added later; do not persist window title — done 2026-09-04
   or document name in this wave.
 
 Acceptance:
 
 - A user can answer “why was this dictation slow?” from its history row. — done 2026-09-03
 - Re-cleaning does not require re-recording. — done 2026-09-03
-- Deleting history removes associated retained audio according to the selected
+- Deleting history removes associated retained audio according to the selected — done 2026-09-04
   retention policy. — done 2026-09-03
 
 ### Wave 6 — hardware, device, and runtime truth
@@ -439,20 +439,20 @@ Owner: runtime/hardware agent. Depends on Wave 0's runtime metadata contract.
 
 Deliverables:
 
-- Audit Handy's accelerator detection against actual Vulkan devices, not vendor
+- Audit Handy's accelerator detection against actual Vulkan devices, not vendor — done 2026-09-04
   name guesses. — done 2026-09-03
 - Prefer a usable discrete device over an integrated/shared-memory device. — done 2026-09-03
-- Record saved preference, recommended plan, and actual runtime backend/device
+- Record saved preference, recommended plan, and actual runtime backend/device — done 2026-09-04
   separately. — done 2026-09-03
-- If GPU startup fails or becomes unhealthy, downgrade for the current run only;
+- If GPU startup fails or becomes unhealthy, downgrade for the current run only; — done 2026-09-04
   do not rewrite the user's saved preference. — startup and runtime-health fallback done 2026-09-03.
 - Keep CPU fallback healthy on systems with no Vulkan runtime. — done 2026-09-03
 - Add selected-device diagnostics and a user-facing recovery explanation. — done 2026-09-03
-- Audit selected microphone persistence and recovery. An automatic stream repair
+- Audit selected microphone persistence and recovery. An automatic stream repair — done 2026-09-04
   must retry the requested device rather than silently selecting another default. — done 2026-09-03
-- Add stable device identity where the platform provides it, while retaining a
+- Add stable device identity where the platform provides it, while retaining a — done 2026-09-04
   readable device name for the UI. — done 2026-09-03
-- Add tests for GPU failure, integrated-vs-discrete selection, no-GPU startup,
+- Add tests for GPU failure, integrated-vs-discrete selection, no-GPU startup, — done 2026-09-04
   device disappearance, recovery, and preference persistence. — done 2026-09-03
 
 Acceptance:
@@ -472,9 +472,9 @@ Deliverables:
 - On recording start, pause only if media is currently playing. — done 2026-09-03
 - Resume only if this session paused it. — done 2026-09-03
 - If the user manually pauses/stops media during dictation, do not resume it. — done 2026-09-03
-- Use a session/generation ledger so overlapping/cancelled sessions cannot resume
+- Use a session/generation ledger so overlapping/cancelled sessions cannot resume — done 2026-09-04
   the wrong state. — done 2026-09-03
-- Run platform media calls off the hotkey/start path. A media service timeout or
+- Run platform media calls off the hotkey/start path. A media service timeout or — done 2026-09-04
   failure must never delay microphone capture or first partial text. — done 2026-09-03
 - Keep failures non-fatal: transcription continues if media control is absent. — done 2026-09-03
 - Show media action/failure in diagnostics without recording media identity. — done 2026-09-03
@@ -482,7 +482,7 @@ Deliverables:
 Acceptance:
 
 - Playback is paused during recording when enabled. — done 2026-09-03
-- Playback resumes after successful stop and after cancellation only when Handy
+- Playback resumes after successful stop and after cancellation only when Handy — done 2026-09-04
   itself paused it. — done 2026-09-03
 - Existing media state is unchanged when the setting is off. — done 2026-09-03
 
@@ -493,11 +493,11 @@ Owner: Windows/native clipboard agent. Independent, but must complete before Wav
 
 Deliverables:
 
-- Compare Handy's receipt-sequenced transaction with VoiceSnap's Windows
+- Compare Handy's receipt-sequenced transaction with VoiceSnap's Windows — done 2026-09-04
   implementation. — done 2026-09-03
-- Keep Handy's delayed-rendering, receipt, quiet-period, sequence-number, and
+- Keep Handy's delayed-rendering, receipt, quiet-period, sequence-number, and — done 2026-09-04
   ownership-loss design if it remains correct. — done 2026-09-03
-- Import only tested improvements:
+- Import only tested improvements: — done 2026-09-04
   - STGMEDIUM-aware format materialization; — done 2026-09-03
   - full-fidelity text/HTML/RTF/bitmap/file/custom format preservation where safe; — done 2026-09-03
   - newer-owner-wins behavior; — done 2026-09-03
@@ -511,7 +511,7 @@ Deliverables:
 Acceptance:
 
 - Normal paste remains as fast as the baseline after timing is measured.
-- The user's clipboard is restored unless they explicitly chose to preserve the
+- The user's clipboard is restored unless they explicitly chose to preserve the — done 2026-09-04
   transcript. — done 2026-09-03
 - A newer user copy is never overwritten. — done 2026-09-03
 - Higher-integrity/UIPI failure produces an actionable fallback message. — done 2026-09-03
