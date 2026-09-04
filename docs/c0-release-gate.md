@@ -1,25 +1,25 @@
 # C0 automated release gate
 
-Date: 2026-09-03
+Date: 2026-09-04
 
 This record covers the integrated remaining-wave trunk candidate exercised by the C0 automated gate.
 
 ## Final trunk verification
 
-The final post-C0 trunk candidate was re-verified on 2026-09-03 after all queued feature work had landed. The exact release commands passed on the available Linux host:
+The final post-C0 trunk candidate was re-verified on 2026-09-04 after all queued feature work had landed. This pass found and repaired two integrated trunk regressions before continuing: untranslated literal labels in the new Performance settings UI caused `bun run lint` to fail, and the diagnostics percentile helper triggered Rust 1.96's `manual_div_ceil` Clippy lint. After those repairs, the exact release commands passed on the available Linux host:
 
 - `bun run lint`
 - `bun run build`
 - `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`
 - `cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings`
 - `cargo build --manifest-path src-tauri/Cargo.toml --locked`
-- `cargo test --manifest-path src-tauri/Cargo.toml --locked` — 398 Rust unit tests passed, with no failures.
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked` — 413 Rust unit tests passed, with no failures.
 
 Focused final checks also passed:
 
-- `node --test scripts/cleanup-benchmark.test.mjs` — 12/12, including loopback-only/offline runtime policy, ambient-data exclusion, output non-persistence, and deterministic percentile coverage.
-- `node --test scripts/stream-benchmark.test.mjs` — 11/11, including the Wave 2 model matrix, fixed short/medium/long fixtures, live-microphone command/schema coverage, final-only fallback, timing aggregation, and text-free reference reporting.
-- focused Rust cleanup, stream, clipboard, diagnostics, live-insertion, speech-evidence/VAD, fallback, catalog and overlay-focus tests.
+- `node --test scripts/cleanup-benchmark.test.mjs` — 13/13, including loopback-only/offline runtime policy, ambient-data exclusion, output non-persistence, candidate prompt contracts, and deterministic percentile coverage.
+- `node --test scripts/stream-benchmark.test.mjs` — 13/13, including the Wave 2 model matrix, availability preflight, fixed short/medium/long fixtures, live-microphone command/schema coverage, final-only fallback, timing aggregation, and text-free reference reporting.
+- focused Rust suites: diagnostics/performance 5/5, cleanup 32/32, stream 10/10, live insertion 12/12, vocabulary 17/17, history 42/42, GPU fallback 10/10, audio-device recovery 4/4, media 17/17, clipboard 13/13, and paste transaction 11/11.
 - `bun run check:model-languages`.
 - `npx playwright test tests/app.spec.ts --grep "Recording overlay"`.
 
@@ -37,12 +37,28 @@ Passed on the available Linux host:
 - `bun run build`
 - `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`
 - `cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings`
-- `cargo test --manifest-path src-tauri/Cargo.toml --locked` (397 tests before the C0 privacy assertion was added; no failures)
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked` (413 tests; no failures)
 - `cargo build --manifest-path src-tauri/Cargo.toml --locked`
-- focused cleanup, output/final-paste, coordinator/live-insertion, streaming/hardware, history, media, audio-device and clipboard suites
-- `node --test scripts/cleanup-benchmark.test.mjs`
+- focused cleanup, output/final-paste, coordinator/live-insertion, streaming/hardware, vocabulary, history, media, audio-device and clipboard suites
+- `node --test scripts/cleanup-benchmark.test.mjs` (13/13)
+- `node --test scripts/stream-benchmark.test.mjs` (13/13)
+- `bun run check:model-languages`
+- `npx playwright test tests/app.spec.ts --grep "Recording overlay"` (1/1)
 
-After the C0 fixes, focused privacy assertions also pass for release-log redaction, stream timing serialization, cleanup request schema and categorical media diagnostics. The authoritative landing verification is expected to rerun the repository-wide test gate with the added privacy assertion.
+Focused privacy assertions pass for release-log redaction, stream timing serialization, cleanup request schema, performance export schema and categorical media diagnostics. The authoritative landing verification reruns the repository-wide gate after rebasing onto the latest trunk.
+
+## PLAN reconciliation boundaries
+
+The 2026-09-04 C0 pass reconciles AI-executable PLAN items only where current code and automated evidence directly satisfy them. The following items intentionally remain unclaimed rather than being converted into automated passes:
+
+- packaged-build Diagnostics visibility and real-dictation UI behavior, which require installing/running a packaged application;
+- the Wave 2 real-model timing/quality matrix and live-model acceptance, because the audited host has none of the four Wave 2 model assets installed and the repository has no valid short/medium/long 16 kHz mono speech/reference fixture set;
+- the Wave 8 Windows-only STGMEDIUM/timing binary tests on this Linux host, plus Word/Office/browser/Electron/Qt/elevated-window smoke;
+- real-device/no-GPU/NVIDIA/AMD/Intel, microphone-disappearance, media-player and cross-platform application smoke;
+- the cleanup-disabled versus historical Handy baseline timing comparison, which needs equivalent real dictation runs rather than a code-path assertion;
+- quiet-speech/no-speech manual validation. The automated safety claim is limited to the positive speech-evidence latch, conservative preview downgrade and VAD tests.
+
+These are environment/manual validation requirements, not hidden repository implementation work. No model timing, native application result or platform-specific test is inferred from catalog metadata or from a Linux-only run.
 
 ## Privacy assertions
 
