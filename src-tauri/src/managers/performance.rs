@@ -352,7 +352,7 @@ fn percentile(values: &[u64], percentile: usize) -> Option<u64> {
     }
     let mut sorted = values.to_vec();
     sorted.sort_unstable();
-    let rank = (percentile.saturating_mul(sorted.len()) + 99) / 100;
+    let rank = percentile.saturating_mul(sorted.len()).div_ceil(100);
     Some(sorted[rank.saturating_sub(1).min(sorted.len() - 1)])
 }
 
