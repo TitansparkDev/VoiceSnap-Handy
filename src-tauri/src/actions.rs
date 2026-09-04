@@ -808,7 +808,7 @@ impl ShortcutAction for TranscribeAction {
                     .then_some(settings.selected_model.clone()),
                 engine_type: resolve_history_engine_type(app, Some(&settings.selected_model)),
                 language: Some(resolve_effective_language(app, &settings)),
-                cleanup_mode: resolve_history_cleanup_mode(&settings, self.post_process),
+                cleanup_mode: resolve_history_cleanup_mode(&settings, self.post_process, false),
                 insertion_mode: insertion_mode_history_value(insertion_mode).to_string(),
             },
         );
