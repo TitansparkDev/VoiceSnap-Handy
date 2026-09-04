@@ -57,8 +57,9 @@ The 2026-09-04 C0 pass reconciles AI-executable PLAN items only where current co
 - real-device/no-GPU/NVIDIA/AMD/Intel, microphone-disappearance, media-player and cross-platform application smoke;
 - the cleanup-disabled versus historical Handy baseline timing comparison, which needs equivalent real dictation runs rather than a code-path assertion;
 - quiet-speech/no-speech manual validation. The automated safety claim is limited to the positive speech-evidence latch, conservative preview downgrade and VAD tests.
+- Wave 4's optional snippets clause was not selected for this track. The vocabulary contract, aliases and deterministic replacements are complete without adding a snippet feature that could alter the streaming insertion contract.
 
-These are environment/manual validation requirements, not hidden repository implementation work. No model timing, native application result or platform-specific test is inferred from catalog metadata or from a Linux-only run.
+These are environment/manual/conditional validation boundaries, not hidden repository implementation work. No model timing, native application result or platform-specific test is inferred from catalog metadata or from a Linux-only run.
 
 ## Privacy assertions
 
