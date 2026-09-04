@@ -1155,7 +1155,31 @@ transcription_total_ms: number | null;
 /**
  * Safe cleanup-stage timing summary when cleanup was requested for this row.
  */
-cleanup_total_ms: number | null }
+cleanup_total_ms: number | null;
+/**
+ * Version of the rich vocabulary contract used for this ASR result.
+ */
+vocabulary_version: number | null;
+/**
+ * Whether the ASR model received bounded canonical vocabulary context.
+ */
+vocabulary_prompted: boolean | null;
+/**
+ * Number of deterministic spoken-alias substitutions applied after decode.
+ */
+vocabulary_alias_replacements: number | null;
+/**
+ * Number of deterministic explicit replacement rules applied after decode.
+ */
+vocabulary_scoped_replacements: number | null;
+/**
+ * Whether the conservative legacy fuzzy fallback changed the transcript.
+ */
+vocabulary_fuzzy_applied: boolean | null;
+/**
+ * True when optional vocabulary/text normalization panicked and the raw ASR text was preserved.
+ */
+vocabulary_failed_open: boolean | null }
 export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number }
 /**
  * Result of changing keyboard implementation

@@ -43,6 +43,24 @@ const STREAM_PERF_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const STREAM_FINALIZE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_WORKER_QUIESCE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Count-only vocabulary attribution that can be persisted safely without
+/// storing prompt terms, aliases, or replacement contents in history.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VocabularyOperationMetadata {
+    pub version: u32,
+    pub prompted: bool,
+    pub alias_replacements: usize,
+    pub scoped_replacements: usize,
+    pub fuzzy_applied: bool,
+    pub failed_open: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TranscriptionOutput {
+    pub text: String,
+    pub vocabulary: VocabularyOperationMetadata,
+}
+
 fn is_model_switch(current_model: Option<&str>, requested_model: &str) -> bool {
     current_model.is_some_and(|current| current != requested_model)
 }
@@ -1700,13 +1718,19 @@ impl TranscriptionManager {
     #[allow(dead_code)]
     pub fn finalize_stream(&self) -> Result<Option<String>> {
         Ok(self
+            .finalize_stream_with_vocabulary_metadata()?
+            .map(|output| output.text))
+    }
+
+    pub fn finalize_stream_with_vocabulary_metadata(&self) -> Result<Option<TranscriptionOutput>> {
+        Ok(self
             .finalize_stream_with_benchmark_timing()?
-            .map(|(text, _)| text))
+            .map(|(output, _)| output))
     }
 
     pub(crate) fn finalize_stream_with_benchmark_timing(
         &self,
-    ) -> Result<Option<(String, StreamBenchmarkTiming)>> {
+    ) -> Result<Option<(TranscriptionOutput, StreamBenchmarkTiming)>> {
         let Some(tx) = self.router.take() else {
             return Ok(None);
         };
@@ -1817,7 +1841,7 @@ impl TranscriptionManager {
     ) -> Result<TranscriptionBenchmarkSample> {
         let audio_ms = ((audio.len() as u64) * 1_000) / 16_000;
         let finalize_started = Instant::now();
-        if let Some((text, mut timing)) = self.finalize_stream_with_benchmark_timing()? {
+        if let Some((output, mut timing)) = self.finalize_stream_with_benchmark_timing()? {
             timing.finalization_tail_ms = finalize_started.elapsed().as_millis() as u64;
             timing.total_ms = total_started.elapsed().as_millis() as u64;
             let worker_released = self.wait_for_stream_worker_release(Duration::from_secs(1));
@@ -1830,7 +1854,7 @@ impl TranscriptionManager {
                 total_ms: timing.total_ms,
                 worker_released,
                 word_error_rate_milli: reference
-                    .map(|expected| benchmark_word_error_rate_milli(expected, &text)),
+                    .map(|expected| benchmark_word_error_rate_milli(expected, &output.text)),
             });
         }
 
@@ -1888,6 +1912,14 @@ impl TranscriptionManager {
     }
 
     pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
+        self.transcribe_with_vocabulary_metadata(audio)
+            .map(|output| output.text)
+    }
+
+    pub fn transcribe_with_vocabulary_metadata(
+        &self,
+        audio: Vec<f32>,
+    ) -> Result<TranscriptionOutput> {
         #[cfg(debug_assertions)]
         if std::env::var("HANDY_FORCE_TRANSCRIPTION_FAILURE").is_ok() {
             return Err(anyhow::anyhow!(
@@ -1906,7 +1938,7 @@ impl TranscriptionManager {
         if audio.is_empty() {
             debug!("Empty audio vector");
             self.maybe_unload_immediately("empty audio");
-            return Ok(String::new());
+            return Ok(TranscriptionOutput::default());
         }
 
         // Check if model is loaded, if not try to load it
@@ -2265,12 +2297,12 @@ impl TranscriptionManager {
 
         let final_result = filtered_result;
 
-        if final_result.is_empty() {
+        if final_result.text.is_empty() {
             info!("Transcription result is empty");
         } else {
             info!(
                 "Transcription result: {}",
-                crate::utils::redact_text(&final_result)
+                crate::utils::redact_text(&final_result.text)
             );
         }
 
@@ -2542,8 +2574,10 @@ fn post_process_transcription_text(
     custom_words_already_prompted: bool,
     output_language: &OutputLanguageEvidence,
     supported_languages: &[String],
-) -> String {
-    fail_open_text_transform(raw, |raw| {
+) -> TranscriptionOutput {
+    let fallback = raw.clone();
+    let vocabulary_version = settings.vocabulary_v1.version;
+    match catch_unwind(AssertUnwindSafe(|| {
         let vocabulary_result = apply_vocabulary_corrections(
             &raw,
             &settings.vocabulary_v1,
@@ -2562,6 +2596,14 @@ fn post_process_transcription_text(
                 vocabulary_result.metadata.fuzzy_applied
             );
         }
+        let vocabulary = VocabularyOperationMetadata {
+            version: vocabulary_version,
+            prompted: custom_words_already_prompted,
+            alias_replacements: vocabulary_result.metadata.alias_replacements,
+            scoped_replacements: vocabulary_result.metadata.scoped_replacements,
+            fuzzy_applied: vocabulary_result.metadata.fuzzy_applied,
+            failed_open: false,
+        };
         let corrected = vocabulary_result.text;
 
         // Last-resort language evidence: confidence-gated detection from the
@@ -2590,13 +2632,34 @@ fn post_process_transcription_text(
             settings.filler_word_removal_enabled,
         );
 
-        normalize_transcription_output(&without_fillers)
-    })
+        TranscriptionOutput {
+            text: normalize_transcription_output(&without_fillers),
+            vocabulary,
+        }
+    })) {
+        Ok(output) => output,
+        Err(payload) => {
+            error!(
+                "Optional transcription text post-processing panicked: {}; using the raw transcription",
+                panic_payload_message(payload.as_ref())
+            );
+            TranscriptionOutput {
+                text: fallback,
+                vocabulary: VocabularyOperationMetadata {
+                    version: vocabulary_version,
+                    prompted: custom_words_already_prompted,
+                    failed_open: true,
+                    ..Default::default()
+                },
+            }
+        }
+    }
 }
 
 /// Optional text cleanup must never discard a successful model result. The
 /// transform is pure and owns its input, so recovering the untouched text is
 /// safe even if a bug in custom-word or filler filtering unwinds.
+#[cfg(test)]
 fn fail_open_text_transform<F>(raw: String, transform: F) -> String
 where
     F: FnOnce(String) -> String,
@@ -3765,7 +3828,7 @@ mod tests {
             evidence,
             OutputLanguageEvidence::UserSelected("pt".to_string())
         );
-        assert_eq!(result, "eu vi um carro");
+        assert_eq!(result.text, "eu vi um carro");
     }
 
     #[test]
@@ -3804,7 +3867,7 @@ mod tests {
         );
 
         assert_eq!(evidence, OutputLanguageEvidence::Unknown);
-        assert_eq!(result, "um ok");
+        assert_eq!(result.text, "um ok");
     }
 
     #[test]
@@ -3824,7 +3887,7 @@ mod tests {
         );
 
         assert_eq!(
-            result,
+            result.text,
             "so the weather forecast said it would probably rain throughout the whole weekend"
         );
     }
@@ -3845,7 +3908,7 @@ mod tests {
         );
 
         assert_eq!(
-            result,
+            result.text,
             "eu vi um carro na rua ontem de manhã quando fui ao mercado"
         );
     }
@@ -3929,7 +3992,7 @@ mod tests {
             &evidence,
             &supported,
         );
-        assert_eq!(result, "eu vi um carro");
+        assert_eq!(result.text, "eu vi um carro");
     }
 
     #[test]

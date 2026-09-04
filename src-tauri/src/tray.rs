@@ -700,6 +700,12 @@ mod tests {
             outcome: None,
             transcription_total_ms: None,
             cleanup_total_ms: None,
+            vocabulary_version: None,
+            vocabulary_prompted: None,
+            vocabulary_alias_replacements: None,
+            vocabulary_scoped_replacements: None,
+            vocabulary_fuzzy_applied: None,
+            vocabulary_failed_open: None,
         }
     }
 
