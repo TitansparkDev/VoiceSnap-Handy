@@ -570,13 +570,26 @@ fn apply_cleanup_fail_open(
 }
 
 /// Describe the cleanup path requested for a history row without persisting
-/// transcript content or provider secrets. Provider-backed cleanup remains
-/// distinguishable until the dedicated fast/local cleanup modes are added.
-pub(crate) fn resolve_history_cleanup_mode(settings: &AppSettings, post_process: bool) -> String {
-    if post_process {
-        format!("provider:{}", settings.post_process_provider_id)
+/// transcript content or provider secrets. `off`, deterministic `fast`, and
+/// resident `local_ai` are stable product values; optional cloud providers keep
+/// their provider-qualified value so history never confuses them with local AI.
+pub(crate) fn resolve_history_cleanup_mode(
+    settings: &AppSettings,
+    post_process: bool,
+    deterministic_cleanup_applied: bool,
+) -> String {
+    if !post_process {
+        return if deterministic_cleanup_applied {
+            "fast".to_string()
+        } else {
+            "off".to_string()
+        };
+    }
+
+    if settings.post_process_provider_id == LOCAL_CLEANUP_PROVIDER_ID {
+        "local_ai".to_string()
     } else {
-        "off".to_string()
+        format!("provider:{}", settings.post_process_provider_id)
     }
 }
 
@@ -656,7 +669,6 @@ pub(crate) async fn process_transcription_output(
     post_process: bool,
 ) -> ProcessedTranscription {
     let settings = get_settings(app);
-    let cleanup_mode = resolve_history_cleanup_mode(&settings, post_process);
     let cleanup_prompt_id = post_process
         .then(|| settings.post_process_selected_prompt_id.clone())
         .flatten();
@@ -672,6 +684,7 @@ pub(crate) async fn process_transcription_output(
     let mut final_text = transcription.to_string();
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
+    let mut deterministic_cleanup_applied = false;
 
     // Resolve the language the transcription actually ran in (the persisted
     // intent coerced against the loaded model's capabilities) so OpenCC keys off
@@ -680,6 +693,7 @@ pub(crate) async fn process_transcription_output(
     if let Some(converted_text) =
         maybe_convert_chinese_variant(&effective_language, transcription).await
     {
+        deterministic_cleanup_applied = converted_text != transcription;
         final_text = converted_text;
     }
 
@@ -702,6 +716,9 @@ pub(crate) async fn process_transcription_output(
     } else if final_text != transcription {
         post_processed_text = Some(final_text.clone());
     }
+
+    let cleanup_mode =
+        resolve_history_cleanup_mode(&settings, post_process, deterministic_cleanup_applied);
 
     ProcessedTranscription {
         final_text,
@@ -1236,6 +1253,7 @@ impl ShortcutAction for TranscribeAction {
                                     Some(resolve_history_cleanup_mode(
                                         &history_settings,
                                         post_process,
+                                        false,
                                     )),
                                     Some("failure".to_string()),
                                     Some(history_transcription_total_ms),
@@ -1358,15 +1376,24 @@ mod tests {
     }
 
     #[test]
-    fn history_cleanup_mode_records_off_or_selected_provider() {
-        let settings = AppSettings {
+    fn history_cleanup_mode_preserves_off_fast_local_ai_and_cloud_semantics() {
+        let cloud = AppSettings {
             post_process_provider_id: "openrouter".to_string(),
             ..Default::default()
         };
+        let local = AppSettings {
+            post_process_provider_id: crate::settings::LOCAL_CLEANUP_PROVIDER_ID.to_string(),
+            ..Default::default()
+        };
 
-        assert_eq!(resolve_history_cleanup_mode(&settings, false), "off");
+        assert_eq!(resolve_history_cleanup_mode(&cloud, false, false), "off");
+        assert_eq!(resolve_history_cleanup_mode(&cloud, false, true), "fast");
         assert_eq!(
-            resolve_history_cleanup_mode(&settings, true),
+            resolve_history_cleanup_mode(&local, true, false),
+            "local_ai"
+        );
+        assert_eq!(
+            resolve_history_cleanup_mode(&cloud, true, false),
             "provider:openrouter"
         );
     }

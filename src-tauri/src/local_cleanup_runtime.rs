@@ -241,6 +241,7 @@ pub(crate) async fn acquire_for_mode(
     if !mode.requires_local_runtime() || provider.id != LOCAL_CLEANUP_PROVIDER_ID {
         return Ok(None);
     }
+    ensure_loopback_provider(provider)?;
 
     let runtime = supervisor();
     let request_guard = Arc::clone(&runtime.request_gate).lock_owned().await;
@@ -250,6 +251,25 @@ pub(crate) async fn acquire_for_mode(
         _request_guard: request_guard,
         finished: false,
     }))
+}
+
+fn ensure_loopback_provider(provider: &PostProcessProvider) -> Result<(), String> {
+    let url = reqwest::Url::parse(&provider.base_url)
+        .map_err(|_| "Local cleanup endpoint must be a valid loopback URL".to_string())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "Local cleanup endpoint must include a loopback host".to_string())?;
+    let host_without_ipv6_brackets = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host_without_ipv6_brackets
+            .parse::<std::net::IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false);
+    if loopback {
+        Ok(())
+    } else {
+        Err("Local cleanup endpoint must be loopback-only".to_string())
+    }
 }
 
 pub struct LocalRuntimeLease {
@@ -512,6 +532,19 @@ mod tests {
         assert!(!CleanupExecutionMode::Off.requires_local_runtime());
         assert!(!CleanupExecutionMode::Fast.requires_local_runtime());
         assert!(CleanupExecutionMode::LocalAi.requires_local_runtime());
+    }
+
+    #[test]
+    fn local_ai_endpoint_is_loopback_only_for_offline_operation() {
+        for base_url in [
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:8080/v1",
+            "http://[::1]:8080/v1",
+        ] {
+            assert!(ensure_loopback_provider(&test_provider(base_url)).is_ok());
+        }
+        assert!(ensure_loopback_provider(&test_provider("https://example.com/v1")).is_err());
+        assert!(ensure_loopback_provider(&test_provider("http://192.168.1.10:8080/v1")).is_err());
     }
 
     #[tokio::test]

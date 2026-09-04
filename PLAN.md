@@ -268,19 +268,19 @@ Deliverables:
   it must not be an unmanaged process launched from the action handler. — done 2026-09-03
 - Use a small Q4 model first. Evaluate Qwen3-1.7B, Qwen3-4B, and the VoiceTypr
   `s1-mini` candidate; do not select by model name alone. — done 2026-09-03
-- Keep model loading separate from the ASR stream worker.
+- Keep model loading separate from the ASR stream worker. — done 2026-09-04
 - Disable reasoning/thinking and constrain output length. — done 2026-09-03
 - Define a strict cleanup contract: output text only, no explanation, no quotes,
-  no markdown wrapper, no invented content.
-- Add cleanup modes:
+  no markdown wrapper, no invented content. — done 2026-09-04
+- Add cleanup modes: — done 2026-09-04
   - `off`: raw deterministic transcription output;
   - `fast`: code-only corrections and deterministic replacements;
   - `local_ai`: local model cleanup;
   - cloud providers remain optional and are not part of the default path.
 - Preserve `raw_text`, `cleaned_text`, cleanup mode, prompt ID, model ID, and
-  cleanup timing in history.
+  cleanup timing in history. — done 2026-09-04
 - Fail open to raw text on timeout, malformed output, engine failure, or
-  cancellation.
+  cancellation. — done 2026-09-04
 - Warm the local model only when local AI cleanup is enabled. Do not load it on
   installations using `off` or `fast` mode. — done 2026-09-03
 
