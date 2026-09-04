@@ -67,16 +67,31 @@ npm run bench:stream -- \
   --json stream-benchmark.json
 ```
 
-`--wave2-models` expands to the current catalog IDs for:
+`--wave2-models` expands to the exact runtime IDs for each catalog model's default Q8 quant:
 
 - Parakeet Unified EN 0.6B;
 - Nemotron Streaming 3.5;
 - Moonshine Streaming Tiny;
 - Whisper Large v3 Turbo.
 
-You can instead repeat `--model MODEL_ID` for any installed catalog/custom model. Use `handy --list-models` to inspect local IDs and `handy --list-devices` plus `--device-index N` when an exact transcribe-cpp device must be compared.
+You can instead repeat `--model MODEL_ID` for any installed catalog/custom model. Use `handy --list-models --json` to inspect the exact runtime IDs and installation state, and `handy --list-devices` plus `--device-index N` when an exact transcribe-cpp device must be compared.
 
-The aggregate report records p50/p95 for first partial, committed cadence, finalization tail, total time, and optional WER. It also records load time, bound backend, fixture/reference basename and SHA-256, catalog-path classification, success/failure, and worker-release state. `--wave2-models` is checked against the live catalog in automated tests: Parakeet, Nemotron, and Moonshine are catalog streaming candidates, while Whisper Large v3 Turbo is explicitly final-only. A result is not successful if the worker/lease remains active after finalization.
+Before launching matrix runs, the aggregate harness preflights `--list-models --json`. Installed models are benchmarked normally. A selected model that is listed but not downloaded is reported as `availability: "not_installed"`; an ID absent from the binary's model registry is `availability: "unknown_model"`. Those rows contain null first-partial, cadence, finalization, total, and WER aggregates rather than fabricated measurements, and the aggregate command exits non-zero while any requested row is unavailable or otherwise unsuccessful. If the availability preflight itself cannot be read, the harness falls back to attempting the requested models so compatibility with older/custom binaries is preserved.
+
+The aggregate report records p50/p95 for first partial, committed cadence, finalization tail, total time, and optional WER. It also records load time, bound backend, availability, fixture/reference basename and SHA-256, catalog-path classification, success/failure, and worker-release state. `--wave2-models` is checked against the live catalog in automated tests: Parakeet, Nemotron, and Moonshine are catalog streaming candidates, while Whisper Large v3 Turbo is explicitly final-only. A result is not successful if the worker/lease remains active after finalization.
+
+### Recorded availability audit — 4 September 2026
+
+The current checkout was audited with the freshly built debug binary rather than with catalog speed scores. `--list-models --json` reported all four Wave 2 default-Q8 runtime entries as present in the catalog but **not installed**. Backend startup also registered CPU only on this host because no Vulkan device was available. The repository itself contains only UI cue WAVs (44.1 kHz stereo) and no valid 16 kHz mono speech/reference fixture set, so there is no honest short/medium/long transcription measurement to publish from this machine.
+
+| Candidate                   | Catalog path      | Installed in audit | Measured timing / WER |
+| --------------------------- | ----------------- | ------------------ | --------------------- |
+| Parakeet Unified EN 0.6B Q8 | streaming-capable | No                 | Not measured          |
+| Nemotron Streaming 3.5 Q8   | streaming-capable | No                 | Not measured          |
+| Moonshine Streaming Tiny Q8 | streaming-capable | No                 | Not measured          |
+| Whisper Large v3 Turbo Q8   | final-only        | No                 | Not measured          |
+
+A harness smoke run against the same binary confirmed that each candidate produces an explicit `not_installed` row with empty timing/quality fields and does not launch transcription. Therefore this audit has **zero measured model/fixture cells** and makes no speed or quality ranking. Real timing and WER values require those models to be installed locally plus stable short, medium, and long 16 kHz mono speech fixtures with matching reference transcripts; the harness performs no downloads and does not substitute catalog `speed_score`/`accuracy_score` values for measurements.
 
 The aggregate harness can also run a live session for each selected candidate in the same invocation:
 
