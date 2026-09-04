@@ -3807,6 +3807,41 @@ mod tests {
     }
 
     #[test]
+    fn streaming_style_post_process_reports_deterministic_vocabulary_metadata() {
+        let settings = AppSettings {
+            vocabulary_v1: crate::settings::VocabularySettingsV1 {
+                version: 1,
+                entries: vec![crate::settings::VocabularyEntry {
+                    written: "VoiceSnap".to_string(),
+                    spoken_alias: Some("voice snap".to_string()),
+                    language: Some("en".to_string()),
+                    enabled: true,
+                    case_sensitive: None,
+                    preserve_punctuation: None,
+                }],
+                replacements: Vec::new(),
+            },
+            ..Default::default()
+        };
+        let supported = languages(&["en"]);
+
+        let result = post_process_transcription_text(
+            "voice snap works".to_string(),
+            &settings,
+            false,
+            &OutputLanguageEvidence::UserSelected("en".to_string()),
+            &supported,
+        );
+
+        assert_eq!(result.text, "VoiceSnap works");
+        assert_eq!(result.vocabulary.version, 1);
+        assert!(!result.vocabulary.prompted);
+        assert_eq!(result.vocabulary.alias_replacements, 1);
+        assert_eq!(result.vocabulary.scoped_replacements, 0);
+        assert!(!result.vocabulary.failed_open);
+    }
+
+    #[test]
     fn portuguese_transcription_does_not_use_english_ui_filler_words() {
         let settings = AppSettings {
             app_language: "en".to_string(),
