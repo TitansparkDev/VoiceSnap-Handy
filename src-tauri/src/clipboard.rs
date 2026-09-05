@@ -14,17 +14,20 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 #[cfg(target_os = "linux")]
 use crate::utils::{is_gnome_wayland, is_kde_wayland, is_wayland};
 
-fn with_enigo<T>(
+fn with_enigo<T, E>(
     app_handle: &AppHandle,
-    f: impl FnOnce(&mut Enigo) -> Result<T, String>,
-) -> Result<T, String> {
+    f: impl FnOnce(&mut Enigo) -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<String>,
+{
     let enigo_state = app_handle
         .try_state::<EnigoState>()
-        .ok_or("Enigo state not initialized")?;
+        .ok_or_else(|| E::from("Enigo state not initialized".to_string()))?;
     let mut enigo = enigo_state
         .0
         .lock()
-        .map_err(|e| format!("Failed to lock Enigo: {}", e))?;
+        .map_err(|e| E::from(format!("Failed to lock Enigo: {}", e)))?;
     f(&mut enigo)
 }
 

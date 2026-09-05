@@ -68,7 +68,7 @@ pub(crate) fn capture_target_identity() -> Option<TargetIdentity> {
 
 #[cfg(target_os = "windows")]
 fn capture_target_identity_impl() -> Option<TargetIdentity> {
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    use ::windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
     // SAFETY: both functions are read-only foreground-window queries. The HWND
     // is used only as an opaque token and the process id is written to local
@@ -177,6 +177,18 @@ pub(crate) enum ReliablePasteError {
 impl ReliablePasteError {
     pub(crate) fn allows_legacy_fallback(&self) -> bool {
         matches!(self, Self::Unavailable(_))
+    }
+}
+
+impl From<String> for ReliablePasteError {
+    fn from(error: String) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
+impl From<&str> for ReliablePasteError {
+    fn from(error: &str) -> Self {
+        Self::Unavailable(error.to_string())
     }
 }
 

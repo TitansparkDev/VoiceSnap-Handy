@@ -457,10 +457,10 @@ unsafe fn copy_hglobal_medium(data_object: &IDataObject, format: u32) -> Option<
         ptd: std::ptr::null_mut(),
         dwAspect: DVASPECT_CONTENT.0,
         lindex: -1,
-        tymed: TYMED_HGLOBAL.0,
+        tymed: TYMED_HGLOBAL.0 as u32,
     };
     let mut medium = data_object.GetData(&request).ok()?;
-    let data = if medium.tymed == TYMED_HGLOBAL.0 {
+    let data = if medium.tymed == TYMED_HGLOBAL.0 as u32 {
         copy_hglobal_bytes(medium.u.hGlobal)
     } else {
         None
@@ -475,10 +475,10 @@ unsafe fn copy_bitmap_medium(data_object: &IDataObject) -> Option<usize> {
         ptd: std::ptr::null_mut(),
         dwAspect: DVASPECT_CONTENT.0,
         lindex: -1,
-        tymed: TYMED_GDI.0,
+        tymed: TYMED_GDI.0 as u32,
     };
     let mut medium = data_object.GetData(&request).ok()?;
-    let copy = if medium.tymed == TYMED_GDI.0 {
+    let copy = if medium.tymed == TYMED_GDI.0 as u32 {
         CopyImage(
             HANDLE(medium.u.hBitmap.0),
             IMAGE_BITMAP_TYPE,
