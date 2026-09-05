@@ -216,3 +216,9 @@ See the [Troubleshooting](README.md#troubleshooting) section in README.md.
 - **Full contributor workflow:** [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **Commits:** Use conventional commit prefixes (`feat:`, `fix:`, `docs:`, `refactor:`, `chore:`). Focus the message on _why_, not _what_.
+
+## Recent requests
+
+- 2026-09-05: Published the Windows x64 installers for version 0.9.6.
+- 2026-09-05: Fixed Windows compilation in paste transaction and clipboard handling.
+- 2026-09-05: Repaired the Windows installer workflow dependencies and syntax.
