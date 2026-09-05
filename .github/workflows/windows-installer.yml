@@ -1,0 +1,162 @@
+name: "Windows Installer"
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Create/update GitHub Release with installer"
+        required: true
+        type: boolean
+        default: true
+      release_tag:
+        description: "Release tag name (default: v<version> from tauri.conf.json)"
+        required: false
+        type: string
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'package.json'
+      - 'bun.lockb'
+      - '.github/workflows/windows-installer.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x64 Installer
+    runs-on: windows-latest
+
+    steps:
+      - name: Enable long paths
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+            -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+          git config --system core.longpaths true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+
+      - name: Install frontend dependencies
+        run: bun install
+
+      - name: Locate VC++ runtime redist for app-local bundling
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * -property installationPath
+          if (-not $vsRoot) { throw "vswhere found no Visual Studio installation" }
+          $versionFile = Join-Path $vsRoot "VC\Auxiliary\Build\Microsoft.VCRedistVersion.default.txt"
+          $redistVersion = (Get-Content $versionFile).Trim()
+          $arch = "x64"
+          $archDir = Join-Path $vsRoot "VC\Redist\MSVC\$redistVersion\$arch"
+          if (-not (Test-Path $archDir)) { throw "VC++ redist arch dir not found: $archDir" }
+          $crt = Get-ChildItem $archDir -Directory -Filter "Microsoft.VC*.CRT" |
+            Sort-Object Name | Select-Object -Last 1
+          if (-not $crt -or -not (Test-Path (Join-Path $crt.FullName "msvcp140.dll"))) {
+            throw "VC++ CRT redist dir not found or incomplete under: $archDir"
+          }
+          $omp = Get-ChildItem $archDir -Directory -Filter "Microsoft.VC*.OpenMP" |
+            Sort-Object Name | Select-Object -Last 1
+          if (-not $omp -or -not (Test-Path (Join-Path $omp.FullName "vcomp140.dll"))) {
+            throw "VC++ OpenMP redist dir not found or incomplete under: $archDir"
+          }
+          $dirs = "$($crt.FullName);$($omp.FullName)"
+          Write-Host "HANDY_VC_REDIST_DIRS=$dirs"
+          Add-Content -Path $env:GITHUB_ENV -Value "HANDY_VC_REDIST_DIRS=$dirs"
+
+      - name: Prepare tauri.conf.json for unsigned build
+        shell: pwsh
+        run: |
+          $configPath = "src-tauri/tauri.conf.json"
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+          if ($config.bundle.windows.signCommand) {
+            $config.bundle.windows.PSObject.Properties.Remove('signCommand')
+            Write-Host "Removed signCommand from tauri.conf.json"
+          }
+          $config.bundle.createUpdaterArtifacts = $false
+          $config | ConvertTo-Json -Depth 20 | Set-Content $configPath
+
+      - name: Build frontend
+        run: bun run build
+
+      - name: Build Tauri Windows Bundle
+        run: bun run tauri build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Handy-Windows-x64-Installer
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+
+      - name: Create or Update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $version = $config.version
+          $tag = "${{ inputs.release_tag }}"
+          if (-not $tag) {
+            $tag = "v$version"
+          }
+          Write-Host "Target tag: $tag"
+
+          $assets = @()
+          $nsis = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue
+          if ($nsis) {
+            $assets += $nsis.FullName
+          }
+          $msi = Get-ChildItem -Path "src-tauri/target/release/bundle/msi/*.msi" -ErrorAction SilentlyContinue
+          if ($msi) {
+            $assets += $msi.FullName
+          }
+
+          if ($assets.Count -eq 0) {
+            throw "No installer executables found in bundle outputs!"
+          }
+
+          Write-Host "Found release assets:"
+          $assets | ForEach-Object { Write-Host " - $_" }
+
+          $releaseExists = $false
+          try {
+            gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null
+            if ($LASTEXITCODE -eq 0) { $releaseExists = $true }
+          } catch {
+            $releaseExists = $false
+          }
+
+          if ($releaseExists) {
+            Write-Host "Uploading assets to existing release $tag..."
+            gh release upload $tag @assets --repo $env:GITHUB_REPOSITORY --clobber
+          } else {
+            Write-Host "Creating release $tag..."
+            gh release create $tag @assets `
+              --repo $env:GITHUB_REPOSITORY `
+              --title "VoiceSnap-Handy $tag" `
+              --notes "VoiceSnap-Handy Windows Installer ($tag)`n`nIncludes all Wave 0 through Wave 8 improvements: live preview and streaming transcription, committed live insertion, local offline AI cleanup, latency diagnostics, custom vocabulary preservation with spoken aliases, richer history, hardware/device fallback, media pause/resume, and Windows clipboard hardening."
+          }

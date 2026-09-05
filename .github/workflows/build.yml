@@ -511,6 +511,22 @@ jobs:
           chmod +x "$tools_dir/linuxdeploy-${arch}.AppImage"
           "$tools_dir/linuxdeploy-${arch}.AppImage" --appimage-extract-and-run --version
 
+      - name: Prepare tauri.conf.json for uncredentialed or unsigned build (Windows)
+        if: contains(inputs.platform, 'windows') && (secrets.AZURE_CLIENT_ID == '' || !inputs.sign-binaries)
+        shell: pwsh
+        run: |
+          $configPath = "src-tauri/tauri.conf.json"
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+          if ($config.bundle.windows.signCommand) {
+            $config.bundle.windows.PSObject.Properties.Remove('signCommand')
+            Write-Host "Removed signCommand from tauri.conf.json because no Azure signing credentials are present"
+          }
+          if (-not "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}") {
+            $config.bundle.createUpdaterArtifacts = $false
+            Write-Host "Disabled createUpdaterArtifacts because TAURI_SIGNING_PRIVATE_KEY is not set"
+          }
+          $config | ConvertTo-Json -Depth 20 | Set-Content $configPath
+
       - name: Build with Tauri
         uses: tauri-apps/tauri-action@v0
         env:
